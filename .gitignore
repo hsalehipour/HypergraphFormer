@@ -1,0 +1,55 @@
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+
+# data folder
+data/
+
+# File type
+*.zip
+*.npy
+*.npz
+*.pickle
+*.pyc
+*.png
+*.txt
+*.log
+*.json
+*.tar
+*.tar.gz
+*.pkl
+events.out.tfevents*
+*.csv
+*.pdf
+*.jsonl
+*.pth
+
+# directories
+checkpoints/
+
+dataset/hypergraph/*
+!dataset/hypergraph/train.json
+!dataset/hypergraph/validation.json
+!dataset/hypergraph/test.json
+*.code-workspace
