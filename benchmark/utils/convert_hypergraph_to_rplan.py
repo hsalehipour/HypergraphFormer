@@ -25,6 +25,25 @@ clr.AddReference("System.Collections")
 from System.Collections.Generic import List as DotNetList
 
 
+def _areas_to_ratios(node: dict) -> None:
+    """Convert absolute areas to parent-relative ratios in-place (recursive)."""
+    parent_area = node.get("area", 0)
+    for child in node.get("children", []):
+        _areas_to_ratios(child)
+        if parent_area > 0:
+            child["area"] = child["area"] / parent_area
+    if node.get("name") == "root":
+        node["area"] = 1.0
+
+
+def _deserialize_as_ratio(hypergraph_json_str: str):
+    """Deserialize a hypergraph JSON string, converting to ratio-based areas."""
+    import copy
+    tree = json.loads(hypergraph_json_str)
+    _areas_to_ratios(tree)
+    return RGL.DataNode.deserializeDataNode(json.dumps(tree))
+
+
 def calculate_polygon_center(poly_vertices: List[List[Tuple[float, float]]]) -> Tuple[float, float]:
     """
     Calculate the center of the bounding box that wraps all polygons.
@@ -161,13 +180,12 @@ def extract_polygons_and_room_types(data: dict) -> Tuple[List[List[Tuple[float, 
     nface_list.Add(face_bounds)
     boundary_mesh = RGL.NMesh(nface_list)
     
-    # Step 5: Load data_node from hypergraph split
+    # Step 5: Load data_node from hypergraph split (ratio-based for numerical stability)
     hypergraph_json_str = data['split']
-    data_node = RGL.DataNode.deserializeDataNode(hypergraph_json_str)
+    data_node = _deserialize_as_ratio(hypergraph_json_str)
     
     # Step 6: Subdivide the boundary mesh using the hypergraph structure
-    # Use subdivideWithMesh (not subdivideWithMeshRatio) to get actual room geometries
-    generated_mesh = RGL.DataNode.subdivideWithMesh(data_node, boundary_mesh)
+    generated_mesh = RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
     
     # Step 7: Extract polygon vertices and room types from generated_mesh
     polygons = []
@@ -227,10 +245,10 @@ def extract_adjacency_triples(data: dict) -> List[List[int]]:
     nface_list.Add(face_bounds)
     boundary_mesh = RGL.NMesh(nface_list)
     
-    # Step 2: Load and subdivide
+    # Step 2: Load and subdivide (ratio-based for numerical stability)
     hypergraph_json_str = data['split']
-    data_node = RGL.DataNode.deserializeDataNode(hypergraph_json_str)
-    generated_mesh = RGL.DataNode.subdivideWithMesh(data_node, boundary_mesh)
+    data_node = _deserialize_as_ratio(hypergraph_json_str)
+    generated_mesh = RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
     
     # Step 3: Update adjacency matrix to populate neighborNFace
     generated_mesh.UpdateAdjacencyMatrix()
@@ -305,10 +323,10 @@ def extract_adjacency_triples_with_doors(data: dict, num_doors: int) -> List[Lis
     nface_list.Add(face_bounds)
     boundary_mesh = RGL.NMesh(nface_list)
     
-    # Step 2: Load and subdivide
+    # Step 2: Load and subdivide (ratio-based for numerical stability)
     hypergraph_json_str = data['split']
-    data_node = RGL.DataNode.deserializeDataNode(hypergraph_json_str)
-    generated_mesh = RGL.DataNode.subdivideWithMesh(data_node, boundary_mesh)
+    data_node = _deserialize_as_ratio(hypergraph_json_str)
+    generated_mesh = RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
     
     # Step 3: Update adjacency matrix to populate neighborNFace
     generated_mesh.UpdateAdjacencyMatrix()
@@ -431,10 +449,10 @@ def extract_doors(data: dict, door_width: float = 0.8, door_thickness: float = 0
     nface_list.Add(face_bounds)
     boundary_mesh = RGL.NMesh(nface_list)
     
-    # Step 2: Load and subdivide
+    # Step 2: Load and subdivide (ratio-based for numerical stability)
     hypergraph_json_str = data['split']
-    data_node = RGL.DataNode.deserializeDataNode(hypergraph_json_str)
-    generated_mesh = RGL.DataNode.subdivideWithMesh(data_node, boundary_mesh)
+    data_node = _deserialize_as_ratio(hypergraph_json_str)
+    generated_mesh = RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
     
     # Step 3: Build room name to index mapping
     all_children = RGL.DataNode.GetAllChildren(data_node)
