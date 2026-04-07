@@ -45,6 +45,9 @@ events.out.tfevents*
 *.jsonl
 *.pth
 
+# exclude requirements.txt
+!requirements.txt
+
 # directories
 checkpoints/
 

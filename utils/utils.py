@@ -547,6 +547,17 @@ def filter_hypergraphs_by_connectivity(
 
 
 
+def _convert_areas_to_ratios(node: dict) -> None:
+    """Convert absolute areas to parent-relative ratios in-place (recursive)."""
+    parent_area = node.get("area", 0)
+    for child in node.get("children", []):
+        _convert_areas_to_ratios(child)
+        if parent_area > 0:
+            child["area"] = child["area"] / parent_area
+    if node.get("name") == "root":
+        node["area"] = 1.0
+
+
 def has_corner_only_connections(data: Dict) -> bool:
     """
     Check if a hypergraph has connections between rooms that only share a corner.
@@ -589,10 +600,12 @@ def has_corner_only_connections(data: Dict) -> bool:
         nface_list.Add(face_bounds)
         boundary_mesh = RGL.NMesh(nface_list)
         
-        # Load and subdivide hypergraph
+        # Load and subdivide hypergraph (ratio-based for numerical stability)
         hypergraph_json_str = data['split']
-        data_node = RGL.DataNode.deserializeDataNode(hypergraph_json_str)
-        generated_mesh = RGL.DataNode.subdivideWithMesh(data_node, boundary_mesh)
+        tree = json.loads(hypergraph_json_str)
+        _convert_areas_to_ratios(tree)
+        data_node = RGL.DataNode.deserializeDataNode(json.dumps(tree))
+        generated_mesh = RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
         
         # Build room name to index mapping
         all_children = RGL.DataNode.GetAllChildren(data_node)

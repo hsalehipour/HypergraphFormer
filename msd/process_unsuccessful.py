@@ -3,24 +3,24 @@
 Process Unsuccessful Apartments
 
 This script processes N random pickle files that were not successfully converted to hypergraphs
-by save_successful_hypergraphs.py. It reuses functionality from msd_to_hypergraph.py to:
+by msd_to_hypergraph.py (batch mode). It reuses functionality from msd_to_hypergraph.py to:
 - Load MSD graph data
 - Extract subgraphs
 - Rotate subgraphs to align with x-axis
 - Save PNG plots and JSON files of the rotated apartments
 
 Usage:
-    python process_unsuccessful_apartments.py [--count N] [--output-dir DIR] [--data-dir DIR]
+    python -m msd.process_unsuccessful [--count N] [--output-dir DIR] [--data-dir DIR]
 
 Author: Generated from msd_to_hypergraph.py
 """
 
 import argparse
-import random
 import json
+import random
 from pathlib import Path
 
-from msd.graph import MSDGraph
+from .graph import MSDGraph
 
 
 class UnsuccessfulApartmentProcessor:
