@@ -144,9 +144,16 @@ def main():
                 fontsize=11, fontweight="bold",
             )
 
+            distinct = plotter.make_distinct_labels(ag)
+            face_labels = [
+                distinct.get(str(i + 1), f"room{i + 1}")
+                for i in range(n_nodes)
+            ]
+
             plotter.plot_access_graph_on_axis(
                 ag, ax_left, title="Access Graph",
                 components=components,
+                node_labels=distinct,
             )
 
             bounds = item.get("bounds")
@@ -159,6 +166,7 @@ def main():
                         mesh, ax_right,
                         boundary_polygon=polygon,
                         title="Floor Plan",
+                        face_labels=face_labels,
                     )
                 except Exception as exc:
                     logger.warning("  Could not render mesh for %s: %s",

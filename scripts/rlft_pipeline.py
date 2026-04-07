@@ -46,7 +46,7 @@ DEBUG_DIR = _PROJECT_ROOT / "checkpoints/retrain_grpo_hypergraph_2/debug_rewards
 
 
 # ===========================================================================
-# Boundary-mesh helper  (was geometry_validation_utils.sample_to_boundary_mesh)
+# Boundary-mesh helper
 # ===========================================================================
 
 def sample_to_boundary_mesh(sample):
@@ -69,13 +69,12 @@ def sample_to_boundary_mesh(sample):
     polygon_array = np.array(polygon)
 
     boundary_mesh = Hypergraph._polygon_to_boundary_mesh(polygon, RGL, Collections)
-    boundary_face = boundary_mesh.faceList[0]
 
-    return boundary_mesh, boundary_face, polygon_array
+    return boundary_mesh, polygon_array
 
 
 # ===========================================================================
-# Reward module  (was rl_reward.py)
+# Reward module
 # ===========================================================================
 
 GROUND_TRUTH_TRAIN = None
@@ -190,7 +189,7 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                 gt_entry = gt_data[idx]
                 apt_id = gt_entry.get("id", f"idx_{idx}")
 
-                boundary_mesh, _, polygon_array = sample_to_boundary_mesh(gt_entry)
+                boundary_mesh, polygon_array = sample_to_boundary_mesh(gt_entry)
                 polygon = polygon_array.tolist()
 
                 try:
@@ -386,7 +385,7 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
 
 
 # ===========================================================================
-# Data helpers  (was in fine_tune_rl_qwen.py)
+# Data helpers
 # ===========================================================================
 
 def load_ground_truth_data():
