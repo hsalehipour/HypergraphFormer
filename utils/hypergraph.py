@@ -115,6 +115,25 @@ class Hypergraph:
 
         return {"nodes": nodes, "edges": edges}
 
+    def access_graph_components(self) -> list:
+        """Connected components of the access graph.
+
+        Returns a list of sets, each containing node-id strings that
+        belong to the same connected component.  A fully connected
+        access graph returns a single-element list.
+        """
+        import networkx as nx
+        from .metrics import accessgraph_dict_to_nx
+
+        g = accessgraph_dict_to_nx(self.access_graph)
+        if g.number_of_nodes() == 0:
+            return []
+        return list(nx.connected_components(g))
+
+    def is_access_graph_connected(self) -> bool:
+        """True if the access graph is a single connected component."""
+        return len(self.access_graph_components()) <= 1
+
     # -- validation ----------------------------------------------------------
 
     def validate(self, accessgraph=None, debug=False, quick=False):
@@ -631,9 +650,11 @@ class Hypergraph:
                      RGL=None, Collections=None, verbose=False):
         """Convert this hypergraph + polygon boundary to an RGL Apartment.
 
-        Fixes area consistency (parent = sum of children) and scales
-        absolute areas to match the polygon's actual area before handing
-        the data to the RGL apartment loader.
+        Builds the Apartment shell via ``ReadApartmentsFromJson`` (which
+        populates bounds, facade, circulation, adjacency, and metadata),
+        then **replaces** the room mesh with the output of :meth:`to_mesh`
+        so that the geometry is identical regardless of whether the caller
+        uses ``to_mesh`` or ``to_apartment``.
 
         Args:
             polygon: list of ``(x, y)`` tuples defining the apartment boundary.
@@ -651,37 +672,6 @@ class Hypergraph:
         if RGL is None or Collections is None:
             RGL, Collections = self._init_rgl()
 
-        def _fix_areas(node):
-            node = copy.deepcopy(node)
-            children = node.get("children", [])
-            if not children:
-                return node
-            fixed = [_fix_areas(c) for c in children]
-            node["children"] = fixed
-            node["area"] = sum(c.get("area", 0) for c in fixed)
-            return node
-
-        def _scale_areas(node, scale):
-            node = copy.deepcopy(node)
-            node["area"] = node.get("area", 0) * scale
-            node["children"] = [_scale_areas(c, scale) for c in node.get("children", [])]
-            return node
-
-        def _count_rooms(node, room_type):
-            count = 1 if node.get("mergeid") == room_type and node.get("final") else 0
-            return count + sum(_count_rooms(c, room_type) for c in node.get("children", []))
-
-        n = len(polygon)
-        total_area = abs(sum(
-            polygon[i][0] * polygon[(i + 1) % n][1]
-            - polygon[(i + 1) % n][0] * polygon[i][1]
-            for i in range(n)
-        )) / 2
-
-        fixed_hg = _fix_areas(self._data)
-        root_area = fixed_hg.get("area", 1)
-        fixed_hg = _scale_areas(fixed_hg, total_area / root_area if root_area > 0 else 1)
-
         corners = [
             {"X": float(x), "Y": float(y), "Z": 0, "Mag": math.sqrt(x * x + y * y)}
             for x, y in polygon
@@ -693,13 +683,13 @@ class Hypergraph:
         entry = {
             "database": "generated",
             "id": apt_id,
-            "area": total_area,
-            "bedrooms": _count_rooms(self._data, "bed"),
-            "bathrooms": _count_rooms(self._data, "bath"),
+            "area": 0,
+            "bedrooms": 0,
+            "bathrooms": 0,
             "bounds": json.dumps({"corners": corners}),
             "facade": json.dumps(facade),
             "circulation": "[]",
-            "split": json.dumps(fixed_hg),
+            "split": json.dumps(self._data),
             "country": "None",
             "city": "None",
             "name": apt_id,
@@ -712,9 +702,14 @@ class Hypergraph:
         os.unlink(tmp_path)
 
         apt = apartments[0]
+
+        rooms_mesh = self.to_mesh(polygon=polygon, RGL=RGL, Collections=Collections)
+        apt.rooms = rooms_mesh
+        apt.rooms.UpdateAdjacencyListWithFaceStrings()
+
         if verbose:
-            print(f"🏠 Loaded: {apt_id} - {apt.rooms.faceList.Count} rooms, "
-                  f"{apt.bounds.Area:.1f}m²")
+            print(f"Loaded: {apt_id} - {apt.rooms.faceList.Count} rooms, "
+                  f"{apt.bounds.Area:.1f}m\u00b2")
         return apt, apt_id
 
     # -- class methods (constructors) ----------------------------------------
@@ -1043,6 +1038,104 @@ class HypergraphPlotter:
         plt.show()
         return graph
 
+    @staticmethod
+    def _layout_by_component(g, components):
+        """Lay out each connected component independently, then tile them.
+
+        Produces much cleaner results than a single global layout because
+        disconnected components no longer compete for the same space.
+        """
+        import networkx as nx
+
+        def _layout_one(sub):
+            if sub.number_of_nodes() == 1:
+                n = list(sub.nodes())[0]
+                return {n: (0.0, 0.0)}
+            return nx.kamada_kawai_layout(sub, scale=2.0)
+
+        if len(components) <= 1:
+            return _layout_one(g)
+
+        pos = {}
+        comp_boxes = []
+        for comp in sorted(components, key=len, reverse=True):
+            sub = g.subgraph(comp)
+            sub_pos = _layout_one(sub)
+
+            if len(sub_pos) > 1:
+                xs = [p[0] for p in sub_pos.values()]
+                ys = [p[1] for p in sub_pos.values()]
+                w = max(xs) - min(xs)
+                h = max(ys) - min(ys)
+                cx = (max(xs) + min(xs)) / 2
+                cy = (max(ys) + min(ys)) / 2
+            else:
+                w, h, cx, cy = 0.0, 0.0, 0.0, 0.0
+
+            centred = {n: (p[0] - cx, p[1] - cy) for n, p in sub_pos.items()}
+            comp_boxes.append((centred, w, h))
+
+        gap = 1.0
+        x_cursor = 0.0
+        for centred, w, h in comp_boxes:
+            offset_x = x_cursor + max(w, 0.5) / 2
+            for n, (px, py) in centred.items():
+                pos[n] = (px + offset_x, py)
+            x_cursor += max(w, 0.5) + gap
+
+        return pos
+
+    def plot_access_graph_on_axis(self, ag_dict, ax, title=None,
+                                  components=None):
+        """Plot an access graph on a specific *ax*.
+
+        Styling follows the conventions established in
+        ``benchmark/utils/visualize_hypergraph_pickle.py``
+        (``draw_access_graph_from_pickle``) and
+        ``benchmark/src/evaluate_houseganpp.py`` (``visualize_comparison``).
+
+        Args:
+            ag_dict: Access-graph dict with ``nodes`` and ``edges`` keys
+                     (as returned by :pyattr:`Hypergraph.access_graph`).
+            ax: Matplotlib axis to draw on.
+            title: Optional axis title.
+            components: Optional list of node-id sets (connected
+                        components).  Used to lay out each component
+                        independently for a cleaner graph.
+        """
+        import networkx as nx
+        from .metrics import accessgraph_dict_to_nx
+
+        g = accessgraph_dict_to_nx(ag_dict)
+        if g.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "No nodes", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=14)
+            ax.axis("off")
+            return
+
+        if components is None:
+            components = list(nx.connected_components(g))
+
+        node_fill = [
+            self.ROOM_COLORS.get(g.nodes[n].get("label", ""), "#CCCCCC")
+            for n in g.nodes()
+        ]
+
+        pos = self._layout_by_component(g, components)
+
+        nx.draw_networkx_edges(
+            g, pos, edge_color='#b8b5b4', width=4.0,
+            style='dotted', ax=ax)
+
+        nx.draw_networkx_nodes(
+            g, pos, node_color=node_fill,
+            edgecolors='blue', linewidths=0.0,
+            node_size=1000, ax=ax)
+
+        if title:
+            ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.axis("off")
+
     def display_single_graph(self, dfX, i):
         """Display a single graph from a DataFrame row."""
         import matplotlib.pyplot as plt
@@ -1267,3 +1360,49 @@ class HypergraphPlotter:
         plt.tight_layout()
         plt.show()
         return fig, ax
+
+    def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
+                          title="Floor Plan"):
+        """Plot a generated mesh on a specific *ax* (for subplots).
+
+        Same visual style as :meth:`simple_plot_generated_mesh` and
+        :meth:`plot_complex_apartment_on_axis` but renders onto an
+        existing Matplotlib axis.
+
+        Args:
+            mesh: RGL NMesh with room faces.
+            ax: Matplotlib axis to draw on.
+            boundary_polygon: Optional list of (x, y) tuples for the
+                apartment boundary outline.
+            title: Optional axis title.
+        """
+        import numpy as np
+        from shapely.geometry import Polygon
+
+        if boundary_polygon:
+            bx = [p[0] for p in boundary_polygon] + [boundary_polygon[0][0]]
+            by = [p[1] for p in boundary_polygon] + [boundary_polygon[0][1]]
+            ax.plot(bx, by, 'k-', linewidth=2)
+
+        total_area = 0
+        for i in range(mesh.faceList.Count):
+            face = mesh.faceList[i]
+            room_type = getattr(face, 'merge_id', 'unknown')
+            area_val = getattr(face, 'Area', 0)
+            total_area += area_val
+            points = face.getPoints()
+            corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
+            if len(corners) < 3:
+                continue
+            poly = Polygon(corners)
+            x, y = poly.exterior.xy
+            color = self.color_map.get(room_type, '#D3D3D3')
+            ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
+            ax.text(np.mean(list(x)), np.mean(list(y)), room_type,
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+
+        ax.set_aspect('equal')
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.text(0.02, 0.98, f"Area: {total_area:.1f}m\u00b2",
+                transform=ax.transAxes, verticalalignment='top', fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow'))
