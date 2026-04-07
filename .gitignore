@@ -44,6 +44,8 @@ events.out.tfevents*
 *.pdf
 *.jsonl
 *.pth
+*.xlsx
+*.mat
 
 # exclude requirements.txt
 !requirements.txt
@@ -55,4 +57,5 @@ dataset/hypergraph/*
 !dataset/hypergraph/train.json
 !dataset/hypergraph/validation.json
 !dataset/hypergraph/test.json
+!dataset/hypergraph/*.py
 *.code-workspace
