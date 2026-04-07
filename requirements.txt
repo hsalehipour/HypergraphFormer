@@ -1,0 +1,34 @@
+# ── Core ML / LLM ────────────────────────────────────────────────
+torch
+transformers
+accelerate              # Multi-GPU distributed training & evaluation
+peft                    # LoRA fine-tuning
+datasets                # HuggingFace dataset loading (JSONL)
+trl                     # GRPO reinforcement-learning fine-tuning
+tqdm
+tensorboard
+
+# ── API-based generation (GPT) ──────────────────────────────────
+openai
+
+# ── Geometry & graph analysis ────────────────────────────────────
+networkx
+numpy
+scipy
+shapely
+pythonnet               # C# interop for hypergraph geometry library
+
+# ── Image processing & evaluation ────────────────────────────────
+Pillow
+opencv-python
+webcolors
+joblib
+
+# ── Data analysis & visualisation ────────────────────────────────
+matplotlib
+pandas
+
+# ── Jupyter notebook support ─────────────────────────────────────
+jupyter
+ipykernel
+ipywidgets

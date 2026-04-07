@@ -792,7 +792,7 @@ class MSDGraph:
             bool: True if successful, False otherwise
         """
         try:
-            from plotter import MSDPlotter
+            from .plotter import MSDPlotter
             plotter = MSDPlotter()
             
             # Create figure
