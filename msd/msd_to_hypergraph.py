@@ -76,7 +76,7 @@ class MSDHypergraph(MSDGraph):
         """Serialize and plot the hypergraph tree."""
         assert hypergraph is not None, "No hypergraph data to plot."
         serialized_data = RGL.DataNode.serializeDataNode(hypergraph)
-        fig = self.hypergraph_plotter.plot_hypergraph(serialized_data)
+        fig = self.hypergraph_plotter.plot_hypergraph(serialized_data, node_scale=2000)
         out = f"{prefix}_hypergraph.png"
         plt.savefig(out, dpi=300, bbox_inches='tight')
         plt.close()

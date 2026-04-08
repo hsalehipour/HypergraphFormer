@@ -972,7 +972,8 @@ class HypergraphPlotter:
 
     # -- main plotting methods -----------------------------------------------
 
-    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8)):
+    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8),
+                        node_scale=1):
         """Plot a hypergraph from JSON data. Returns the NetworkX graph."""
         import networkx as nx
         import matplotlib.pyplot as plt
@@ -1019,7 +1020,7 @@ class HypergraphPlotter:
                     nx.draw_networkx_edges(graph, pos=layout, edgelist=[(u, v)],
                                            edge_color='black', width=1.5, style='dotted')
 
-        node_sizes = [nd.get('area', 0.5) * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd.get('area', 0.5) * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5, node_size=node_sizes)
 
@@ -1085,8 +1086,38 @@ class HypergraphPlotter:
 
         return pos
 
+    @staticmethod
+    def make_distinct_labels(ag_dict: dict) -> dict[str, str]:
+        """Build distinct labels like ``foyer1``, ``foyer2`` for each node.
+
+        When a room type appears only once, the label is just the type
+        (e.g. ``living``).  When it appears more than once, a 1-based
+        index is appended (e.g. ``bed1``, ``bed2``).
+
+        Args:
+            ag_dict: Access-graph dict with ``nodes`` mapping
+                     node-id -> room-type.
+
+        Returns:
+            Dict mapping node-id -> distinct label string.
+        """
+        from collections import Counter
+
+        nodes = ag_dict.get("nodes", {})
+        type_counts: Counter = Counter(nodes.values())
+        type_seen: dict[str, int] = {}
+        labels: dict[str, str] = {}
+        for nid in sorted(nodes, key=lambda x: int(x)):
+            rtype = nodes[nid]
+            if type_counts[rtype] > 1:
+                type_seen[rtype] = type_seen.get(rtype, 0) + 1
+                labels[nid] = f"{rtype}{type_seen[rtype]}"
+            else:
+                labels[nid] = rtype
+        return labels
+
     def plot_access_graph_on_axis(self, ag_dict, ax, title=None,
-                                  components=None):
+                                  components=None, node_labels=None):
         """Plot an access graph on a specific *ax*.
 
         Styling follows the conventions established in
@@ -1102,6 +1133,8 @@ class HypergraphPlotter:
             components: Optional list of node-id sets (connected
                         components).  Used to lay out each component
                         independently for a cleaner graph.
+            node_labels: Optional dict mapping node-id -> label string.
+                         When provided, labels are drawn on the nodes.
         """
         import networkx as nx
         from .metrics import accessgraph_dict_to_nx
@@ -1132,6 +1165,11 @@ class HypergraphPlotter:
             edgecolors='blue', linewidths=0.0,
             node_size=1000, ax=ax)
 
+        if node_labels is not None:
+            nx.draw_networkx_labels(
+                g, pos, labels=node_labels,
+                font_size=7, font_weight="bold", ax=ax)
+
         if title:
             ax.set_title(title, fontsize=12, fontweight="bold")
         ax.axis("off")
@@ -1148,7 +1186,8 @@ class HypergraphPlotter:
         )
         plt.show()
 
-    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax):
+    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax,
+                      node_scale=1):
         """Display a graph with detailed information on *ax*."""
         import networkx as nx
 
@@ -1179,7 +1218,7 @@ class HypergraphPlotter:
                                            edge_color='black', width=1.5,
                                            style='dotted', ax=ax)
 
-        node_sizes = [nd['area'] * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd['area'] * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5,
                                node_size=node_sizes, ax=ax)
@@ -1362,7 +1401,7 @@ class HypergraphPlotter:
         return fig, ax
 
     def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
-                          title="Floor Plan"):
+                          title="Floor Plan", face_labels=None):
         """Plot a generated mesh on a specific *ax* (for subplots).
 
         Same visual style as :meth:`simple_plot_generated_mesh` and
@@ -1375,6 +1414,9 @@ class HypergraphPlotter:
             boundary_polygon: Optional list of (x, y) tuples for the
                 apartment boundary outline.
             title: Optional axis title.
+            face_labels: Optional list of label strings, one per face
+                (indexed same as ``mesh.faceList``).  When provided,
+                these labels are drawn instead of the raw room type.
         """
         import numpy as np
         from shapely.geometry import Polygon
@@ -1398,7 +1440,9 @@ class HypergraphPlotter:
             x, y = poly.exterior.xy
             color = self.color_map.get(room_type, '#D3D3D3')
             ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
-            ax.text(np.mean(list(x)), np.mean(list(y)), room_type,
+            label = (face_labels[i] if face_labels is not None and i < len(face_labels)
+                     else room_type)
+            ax.text(np.mean(list(x)), np.mean(list(y)), label,
                     ha='center', va='center', fontsize=8, fontweight='bold')
 
         ax.set_aspect('equal')
