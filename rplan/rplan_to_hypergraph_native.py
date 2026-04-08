@@ -146,6 +146,50 @@ def compute_boundary(rooms: dict) -> Polygon:
     return union
 
 
+def find_entrance_room(sample: dict, leaves: dict) -> int | None:
+    """Return the leaf room_id whose polygon best overlaps the entrance.
+
+    *leaves* maps ``room_id -> {"polygon": Polygon, ...}`` for every BSP leaf.
+    The entrance rectangle is taken from ``sample["entrance_expand"]``.
+    """
+    entrance = sample.get("entrance_expand")
+    if not entrance or len(entrance) < 3:
+        return None
+    entrance_poly = Polygon(entrance)
+    if not entrance_poly.is_valid or entrance_poly.is_empty:
+        return None
+
+    best_id = None
+    best_overlap = 0.0
+    for rid, rinfo in leaves.items():
+        poly = rinfo.get("polygon")
+        if poly is None:
+            continue
+        overlap = poly.intersection(entrance_poly).area
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_id = rid
+
+    if best_id is not None:
+        return best_id
+
+    # Fallback: nearest leaf centroid to entrance centroid
+    ec = entrance_poly.centroid
+    best_dist = float("inf")
+    for rid, rinfo in leaves.items():
+        poly = rinfo.get("polygon")
+        if poly is None:
+            continue
+        d = poly.centroid.distance(ec)
+        if d < best_dist:
+            best_dist = d
+            best_id = rid
+    return best_id
+
+
+OUTSIDE_ROOM_ID = -1
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
@@ -759,8 +803,13 @@ def visualise_bsp_tree(tree, rooms, boundary, output_path):
     plt.close(fig)
 
 
-def _plot_bsp_result_panel(ax, room_dict, boundary, access_edges, title):
-    """Draw BSP result rooms with access edges on *ax*."""
+def _plot_bsp_result_panel(ax, room_dict, boundary, access_edges, title,
+                           entrance_info=None):
+    """Draw BSP result rooms with access edges on *ax*.
+
+    *entrance_info*, when provided, is ``(entrance_room_id, entrance_poly)``
+    and draws the Outside node and its edge to the entrance room.
+    """
     for rid, rinfo in room_dict.items():
         poly = rinfo["polygon"]
         coords = np.array(list(poly.exterior.coords))
@@ -789,14 +838,50 @@ def _plot_bsp_result_panel(ax, room_dict, boundary, access_edges, title):
             ax.plot([xu, xv], [yu, yv], color="#555555", linewidth=0.8,
                     linestyle="--", zorder=3, alpha=0.6)
 
+    if entrance_info is not None:
+        ent_rid, ent_poly = entrance_info
+        ecx, ecy = ent_poly.centroid.x, ent_poly.centroid.y
+        ax.plot(ecx, ecy, marker="s", color="#D32F2F", markersize=7, zorder=7)
+        ax.text(ecx, ecy - 6, "Outside", ha="center", va="bottom",
+                fontsize=6, fontweight="bold", color="#D32F2F", zorder=7)
+        if ent_rid in centroids:
+            rx, ry = centroids[ent_rid]
+            ax.plot([ecx, rx], [ecy, ry], color="#D32F2F", linewidth=1.2,
+                    linestyle="--", zorder=6, alpha=0.8)
+
     ax.set_aspect("equal")
     ax.autoscale_view()
     ax.invert_yaxis()
     ax.set_title(title, fontsize=10)
 
 
+def _draw_entrance_on_axis(ax, sample: dict):
+    """Draw the Outside marker and access edge on an axis showing original rooms."""
+    entrance = sample.get("entrance_expand")
+    if not entrance or len(entrance) < 3:
+        return
+    ent_poly = Polygon(entrance)
+    if not ent_poly.is_valid or ent_poly.is_empty:
+        return
+
+    rooms_dict = sample_to_rooms(sample)
+    ent_rid = find_entrance_room(sample, rooms_dict)
+    if ent_rid is None:
+        return
+
+    ecx, ecy = ent_poly.centroid.x, ent_poly.centroid.y
+    ax.plot(ecx, ecy, marker="s", color="#D32F2F", markersize=7, zorder=7)
+    ax.text(ecx, ecy - 6, "Outside", ha="center", va="bottom",
+            fontsize=6, fontweight="bold", color="#D32F2F", zorder=7)
+
+    room_poly = rooms_dict[ent_rid]["polygon"]
+    rx, ry = room_poly.centroid.x, room_poly.centroid.y
+    ax.plot([ecx, rx], [ecy, ry], color="#D32F2F", linewidth=1.2,
+            linestyle="--", zorder=6, alpha=0.8)
+
+
 def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
-                   sample_name="", sample=None):
+                   sample_name="", sample=None, entrance_info=None):
     """Plot original RPLAN (left), BSP result (centre), and tree text (right)."""
     fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(20, 7),
                                          gridspec_kw={"width_ratios": [1, 1, 0.7]})
@@ -805,6 +890,7 @@ def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
     if sample is not None:
         draw_rplan_on_axis(ax0, sample,
                            title=f"Original RPLAN — {sample_name}")
+        _draw_entrance_on_axis(ax0, sample)
     else:
         ax0.set_visible(False)
 
@@ -813,7 +899,8 @@ def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
     _collect_leaves(tree, all_leaf_rooms)
 
     _plot_bsp_result_panel(ax1, all_leaf_rooms, boundary, access_edges,
-                           f"BSP Result — {sample_name}")
+                           f"BSP Result — {sample_name}",
+                           entrance_info=entrance_info)
 
     categories_bsp = sorted({r["room_type"] for r in all_leaf_rooms.values()})
     legend_patches_bsp = [
@@ -879,6 +966,24 @@ def format_tree(node, indent=0):
 
 
 # ---------------------------------------------------------------------------
+# Entrance / "Outside" node
+# ---------------------------------------------------------------------------
+
+def _resolve_entrance(sample: dict, leaves: dict):
+    """Return ``(entrance_room_id, entrance_polygon)`` or *None*."""
+    entrance = sample.get("entrance_expand")
+    if not entrance or len(entrance) < 3:
+        return None
+    ent_poly = Polygon(entrance)
+    if not ent_poly.is_valid or ent_poly.is_empty:
+        return None
+    ent_rid = find_entrance_room(sample, leaves)
+    if ent_rid is None:
+        return None
+    return (ent_rid, ent_poly)
+
+
+# ---------------------------------------------------------------------------
 # Process a single sample
 # ---------------------------------------------------------------------------
 
@@ -902,9 +1007,16 @@ def process_sample(sample, output_dir: Path, label: str = ""):
 
     final_access = _collect_final_access(tree, all_rooms_ref, access_edges)
 
+    leaves = {}
+    _collect_leaves(tree, leaves)
+    entrance_info = _resolve_entrance(sample, leaves)
+    if entrance_info is not None:
+        ent_rid, _ = entrance_info
+        final_access.append((OUTSIDE_ROOM_ID, ent_rid))
+
     out_path = output_dir / f"{label}_{name}_bsp.png"
     plot_final_bsp(tree, all_rooms_ref, boundary, final_access, out_path, name,
-                   sample=sample)
+                   sample=sample, entrance_info=entrance_info)
 
     tree_text = format_tree(tree)
     n_leaves = tree_text.count("[")
@@ -1042,6 +1154,7 @@ def _bsp_tree_to_split(node, access_edges, leaf_name_map):
 
     *access_edges* is a list of ``(room_id_a, room_id_b)`` tuples.
     *leaf_name_map* maps ``room_id -> _hg_name`` for every leaf.
+    Edges involving ``OUTSIDE_ROOM_ID`` are resolved to ``"outside"``.
     """
     if node is None:
         return None
@@ -1052,10 +1165,16 @@ def _bsp_tree_to_split(node, access_edges, leaf_name_map):
         room_type = node.get("room_type", 0)
         connected_names = []
         for u, v in access_edges:
-            if u == rid and v in leaf_name_map:
-                connected_names.append(leaf_name_map[v])
-            elif v == rid and u in leaf_name_map:
-                connected_names.append(leaf_name_map[u])
+            if u == rid:
+                if v == OUTSIDE_ROOM_ID:
+                    connected_names.append("outside")
+                elif v in leaf_name_map:
+                    connected_names.append(leaf_name_map[v])
+            elif v == rid:
+                if u == OUTSIDE_ROOM_ID:
+                    connected_names.append("outside")
+                elif u in leaf_name_map:
+                    connected_names.append(leaf_name_map[u])
         return {
             "name": hg_name,
             "area": float(node.get("area", 0)),
@@ -1102,6 +1221,14 @@ def sample_to_hypergraph_entry(sample: dict) -> dict | None:
         return None
 
     final_access = _collect_final_access(tree, all_rooms_ref, access_edges_orig)
+
+    leaves = {}
+    _collect_leaves(tree, leaves)
+    entrance_info = _resolve_entrance(sample, leaves)
+    if entrance_info is not None:
+        ent_rid, _ = entrance_info
+        final_access.append((OUTSIDE_ROOM_ID, ent_rid))
+
     _assign_path_names(tree)
     leaf_name_map = _build_leaf_name_map(tree)
     split_dict = _bsp_tree_to_split(tree, final_access, leaf_name_map)
