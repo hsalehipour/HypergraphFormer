@@ -972,7 +972,8 @@ class HypergraphPlotter:
 
     # -- main plotting methods -----------------------------------------------
 
-    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8)):
+    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8),
+                        node_scale=1):
         """Plot a hypergraph from JSON data. Returns the NetworkX graph."""
         import networkx as nx
         import matplotlib.pyplot as plt
@@ -1019,7 +1020,7 @@ class HypergraphPlotter:
                     nx.draw_networkx_edges(graph, pos=layout, edgelist=[(u, v)],
                                            edge_color='black', width=1.5, style='dotted')
 
-        node_sizes = [nd.get('area', 0.5) * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd.get('area', 0.5) * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5, node_size=node_sizes)
 
@@ -1185,7 +1186,8 @@ class HypergraphPlotter:
         )
         plt.show()
 
-    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax):
+    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax,
+                      node_scale=1):
         """Display a graph with detailed information on *ax*."""
         import networkx as nx
 
@@ -1216,7 +1218,7 @@ class HypergraphPlotter:
                                            edge_color='black', width=1.5,
                                            style='dotted', ax=ax)
 
-        node_sizes = [nd['area'] * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd['area'] * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5,
                                node_size=node_sizes, ax=ax)
@@ -1438,7 +1440,8 @@ class HypergraphPlotter:
             x, y = poly.exterior.xy
             color = self.color_map.get(room_type, '#D3D3D3')
             ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
-            label = face_labels[i] if face_labels is not None else room_type
+            label = (face_labels[i] if face_labels is not None and i < len(face_labels)
+                     else room_type)
             ax.text(np.mean(list(x)), np.mean(list(y)), label,
                     ha='center', va='center', fontsize=8, fontweight='bold')
 

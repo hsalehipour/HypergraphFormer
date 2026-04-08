@@ -185,7 +185,7 @@ def main():
                 )
                 ax_right.axis("off")
 
-            fig.tight_layout(rect=[0, 0, 1, 0.93])
+            fig.subplots_adjust(top=0.90, wspace=0.05)
 
             if args.output_dir:
                 out = Path(args.output_dir) / split
