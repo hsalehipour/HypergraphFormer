@@ -56,18 +56,16 @@ def get_room_name(category_index: int) -> str:
     return RPLAN_ROOM_NAMES.get(category_index, f"Unknown_{category_index}")
 
 
-def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = ""):
-    """Render one RPLAN sample to a PNG.
+def draw_rplan_on_axis(ax, sample: dict, title: str = ""):
+    """Draw one RPLAN sample on the given *ax* (axis-level, no figure ops).
 
-    Draws room polygons coloured by category, the outer boundary, adjacency
-    edges, and centroid labels.
+    This is the canonical visualisation used by every script that shows the
+    original RPLAN layout.  Draws room polygons coloured by category, the
+    outer boundary, adjacency edges, and centroid labels.
     """
-    fig, ax = plt.subplots(figsize=(8, 8))
-
     rooms = sample["rooms"]
     adjacencies = sample.get("access_adjacencies", sample["adjacencies"])
 
-    # -- room polygons --
     patches = []
     face_colors = []
     centroids = {}
@@ -87,7 +85,6 @@ def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = "")
     pc.set_facecolor(face_colors)
     ax.add_collection(pc)
 
-    # -- adjacency edges --
     for u, v in adjacencies:
         if u in centroids and v in centroids:
             xu, yu = centroids[u]
@@ -95,7 +92,6 @@ def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = "")
             ax.plot([xu, xv], [yu, yv], color="#555555", linewidth=0.8,
                     linestyle="--", zorder=3)
 
-    # -- centroid labels (room type + id) --
     for room in rooms:
         rid = room["id"]
         if rid in centroids:
@@ -104,14 +100,12 @@ def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = "")
             ax.text(cx, cy, label, ha="center", va="center", fontsize=6,
                     fontweight="bold", zorder=4)
 
-    # -- outer boundary --
     boundary_pts = np.array(
         [[pt[0], pt[1]] for pt in sample["boundary"]], dtype=float
     )
     closed = np.vstack([boundary_pts, boundary_pts[0]])
     ax.plot(closed[:, 0], closed[:, 1], color="black", linewidth=2.0, zorder=5)
 
-    # -- legend --
     categories_present = sorted({r["category"] for r in rooms})
     legend_patches = [
         mpatches.Patch(
@@ -123,21 +117,30 @@ def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = "")
     ax.legend(handles=legend_patches, loc="upper left", fontsize=8,
               framealpha=0.8)
 
-    # -- title --
-    name = sample.get("name", "?")
-    n_rooms = len(rooms)
-    n_adj = len(adjacencies)
-    adj_label = "access" if "access_adjacencies" in sample else "adj"
-    title = f"RPLAN #{name}  |  {n_rooms} rooms, {n_adj} {adj_label}"
-    if failure_reason:
-        title += f"\nFailed: {failure_reason}"
-    ax.set_title(title, fontsize=10)
-
     ax.set_aspect("equal")
     ax.autoscale_view()
     ax.invert_yaxis()
     ax.set_xlabel("x")
     ax.set_ylabel("y")
+
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_rplan_sample(sample: dict, output_path: Path, failure_reason: str = ""):
+    """Render one RPLAN sample to a standalone PNG."""
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    name = sample.get("name", "?")
+    n_rooms = len(sample["rooms"])
+    adjacencies = sample.get("access_adjacencies", sample["adjacencies"])
+    n_adj = len(adjacencies)
+    adj_label = "access" if "access_adjacencies" in sample else "adj"
+    title = f"RPLAN #{name}  |  {n_rooms} rooms, {n_adj} {adj_label}"
+    if failure_reason:
+        title += f"\nFailed: {failure_reason}"
+
+    draw_rplan_on_axis(ax, sample, title=title)
     plt.tight_layout()
 
     plt.savefig(str(output_path), dpi=200, bbox_inches="tight")
