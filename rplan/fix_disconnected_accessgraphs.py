@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fix disconnected access graphs in the Hypergraph1k dataset.
+Fix disconnected access graphs in the RPLAN dataset.
 
 For each sample with a disconnected access graph, attempts to reconnect
 components by adding edges to the leaf ``connected`` lists:
@@ -245,14 +245,14 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Fix disconnected access graphs in the Hypergraph1k dataset.",
+        description="Fix disconnected access graphs in the RPLAN dataset.",
     )
     parser.add_argument(
-        "--dataset-dir", type=str, default="dataset/hypergraph",
+        "--dataset-dir", type=str, default="dataset/rplan/dataset_access",
         help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="dataset/hypergraph_fixed",
+        "--output-dir", type=str, default="dataset/dataset_access_fixed",
         help="Directory for repaired JSON files",
     )
     parser.add_argument(

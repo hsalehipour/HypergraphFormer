@@ -7,10 +7,15 @@ dataset_original, extracts interior-door (label 17) and front-door (label 15)
 pixel clusters, determines which rooms each door connects, and writes
 a new JSON with the original fields plus an ``access_adjacencies`` field.
 
+When a door cluster touches 3+ rooms (e.g. at a junction), all pairwise
+connections are generated.  Window pixels (label 16) are additionally
+used to detect balcony access, since balconies in RPLAN often lack
+labelled doors.
+
 Usage:
-    python -m rplan.build_dataset_access
-    python -m rplan.build_dataset_access --splits train
-    python -m rplan.build_dataset_access --dilation 4 --workers 8
+    python rplan/build_dataset_access.py
+    python rplan/build_dataset_access.py --splits train
+    python rplan/build_dataset_access.py --dilation 4 --workers 8
 """
 
 import argparse
@@ -28,12 +33,22 @@ logger = logging.getLogger(__name__)
 
 INTERIOR_DOOR_LABEL = 17
 FRONT_DOOR_LABEL = 15
+WINDOW_LABEL = 16
+BALCONY_CATEGORY = 4
+
+
+def _pairs_from_instances(instance_ids: np.ndarray) -> list[tuple[int, int]]:
+    """Return all pairwise (0-indexed room) combos from 1-indexed instance IDs."""
+    from itertools import combinations
+    rooms = sorted(set(int(v) - 1 for v in instance_ids))
+    return [(min(a, b), max(a, b)) for a, b in combinations(rooms, 2)]
 
 
 def extract_access_adjacencies(
     png_path: str,
     n_rooms: int,
     dilation_iterations: int = 3,
+    room_categories: list[int] | None = None,
 ) -> list[list[int]]:
     """Return door-based room-room pairs (0-indexed) from an RPLAN PNG.
 
@@ -46,37 +61,61 @@ def extract_access_adjacencies(
     dilation_iterations : int
         How many pixels to dilate each door cluster before checking for
         nearby room instances.  3 covers typical wall thickness (~2-4 px).
+    room_categories : list[int] | None
+        DiffPlanner category for each room (0-indexed).  When provided,
+        window pixels (label 16) are treated as doors for balconies
+        (category 4).
     """
     img = np.asarray(Image.open(png_path))
     ch1 = img[:, :, 1]  # semantic labels
     ch2 = img[:, :, 2]  # room instance IDs (1-indexed)
 
-    door_mask = (ch1 == INTERIOR_DOOR_LABEL) | (ch1 == FRONT_DOOR_LABEL)
-    if not door_mask.any():
-        return []
-
-    door_labels, n_clusters = ndimage.label(door_mask)
-
     access_pairs: set[tuple[int, int]] = set()
 
-    for cluster_id in range(1, n_clusters + 1):
-        cluster_mask = door_labels == cluster_id
-        dilated = ndimage.binary_dilation(
-            cluster_mask, iterations=dilation_iterations,
-        )
-        nearby_instances = ch2[dilated & (ch2 > 0)]
-        if nearby_instances.size == 0:
-            continue
+    # --- Door-based connections (interior + front doors) ---
+    door_mask = (ch1 == INTERIOR_DOOR_LABEL) | (ch1 == FRONT_DOOR_LABEL)
+    if door_mask.any():
+        door_labels, n_clusters = ndimage.label(door_mask)
+        for cluster_id in range(1, n_clusters + 1):
+            cluster_mask = door_labels == cluster_id
+            dilated = ndimage.binary_dilation(
+                cluster_mask, iterations=dilation_iterations,
+            )
+            nearby_instances = ch2[dilated & (ch2 > 0)]
+            if nearby_instances.size == 0:
+                continue
+            vals = np.unique(nearby_instances)
+            if len(vals) >= 2:
+                for pair in _pairs_from_instances(vals):
+                    access_pairs.add(pair)
 
-        vals, counts = np.unique(nearby_instances, return_counts=True)
-        order = np.argsort(-counts)
-        vals = vals[order]
-
-        if len(vals) >= 2:
-            r_a = int(vals[0]) - 1
-            r_b = int(vals[1]) - 1
-            pair = (min(r_a, r_b), max(r_a, r_b))
-            access_pairs.add(pair)
+    # --- Window-based connections for balconies ---
+    if room_categories is not None:
+        window_mask = ch1 == WINDOW_LABEL
+        if window_mask.any():
+            win_labels, n_win = ndimage.label(window_mask)
+            balcony_instances = {
+                i + 1
+                for i, cat in enumerate(room_categories)
+                if cat == BALCONY_CATEGORY
+            }
+            for cluster_id in range(1, n_win + 1):
+                cluster_mask = win_labels == cluster_id
+                dilated = ndimage.binary_dilation(
+                    cluster_mask, iterations=dilation_iterations,
+                )
+                nearby_instances = ch2[dilated & (ch2 > 0)]
+                if nearby_instances.size == 0:
+                    continue
+                vals = np.unique(nearby_instances)
+                has_balcony = bool(balcony_instances & set(vals.tolist()))
+                if len(vals) >= 2 and has_balcony:
+                    for pair in _pairs_from_instances(vals):
+                        if any(
+                            (inst + 1) in balcony_instances
+                            for inst in pair
+                        ):
+                            access_pairs.add(pair)
 
     return sorted([list(p) for p in access_pairs])
 
@@ -89,10 +128,14 @@ def _process_sample(args):
     if not png_path.exists():
         return sample, "missing_png"
 
-    n_rooms = len(sample.get("rooms", []))
+    rooms = sample.get("rooms", [])
+    n_rooms = len(rooms)
+    room_categories = [r.get("category", -1) for r in rooms]
     try:
         access_adj = extract_access_adjacencies(
-            str(png_path), n_rooms, dilation_iterations=dilation,
+            str(png_path), n_rooms,
+            dilation_iterations=dilation,
+            room_categories=room_categories,
         )
     except Exception as exc:
         logger.warning("Failed on %s: %s", name, exc)

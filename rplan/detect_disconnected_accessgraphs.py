@@ -2,7 +2,7 @@
 """
 Detect and visualize floor plans with disconnected access graphs.
 
-Scans the Hypergraph1k dataset for samples whose access graph consists of
+Scans the RPLAN dataset for samples whose access graph consists of
 two or more isolated connected components.  For each disconnected sample,
 produces a side-by-side figure:
 
@@ -74,10 +74,10 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Detect and visualise disconnected access graphs "
-                    "in the Hypergraph1k dataset.",
+                    "in the RPLAN dataset.",
     )
     parser.add_argument(
-        "--dataset-dir", type=str, default="dataset/hypergraph",
+        "--dataset-dir", type=str, default="dataset/rplan/dataset_access",
         help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
