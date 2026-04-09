@@ -162,11 +162,6 @@ def main():
             distinct = plotter.make_distinct_labels(ag)
             distinct_orig = plotter.make_distinct_labels(ag_orig)
 
-            face_labels = [
-                distinct.get(str(i + 1), f"room{i + 1}")
-                for i in range(n_nodes)
-            ]
-
             components_orig = hg_orig.access_graph_components()
             plotter.plot_access_graph_on_axis(
                 ag_orig, ax_orig, title="Original (disconnected)",
@@ -185,6 +180,8 @@ def main():
                 polygon = [(c["X"], c["Y"]) for c in corners]
                 try:
                     mesh = hg_fixed.to_mesh(bounds=bounds)
+                    face_labels = hg_fixed.mesh_face_labels(
+                        mesh, distinct=distinct)
                     plotter.plot_mesh_on_axis(
                         mesh, ax_right,
                         boundary_polygon=polygon,

@@ -555,6 +555,49 @@ class Hypergraph:
         data_node = RGL.DataNode.deserializeDataNode(json.dumps(hg_ratio))
         return RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
 
+    def mesh_face_labels(self, mesh, distinct=None) -> list:
+        """Build display labels for each face in an assembled RGL mesh.
+
+        Uses ``unique_id`` metadata on each face to map it back to the
+        corresponding BSP leaf / access-graph node, then produces a
+        human-readable label (e.g. ``living1``, ``kitchen``).
+
+        Args:
+            mesh: RGL NMesh returned by :meth:`to_mesh`.
+            distinct: Optional dict mapping access-graph node-id to
+                label string (as returned by
+                :meth:`HypergraphPlotter.make_distinct_labels`).
+                When *None*, labels are built automatically from
+                :pyattr:`access_graph`.
+
+        Returns:
+            List of label strings, one per face in ``mesh.faceList``.
+        """
+        leaf_name_to_ag_id = {
+            leaf["name"]: str(i + 1)
+            for i, leaf in enumerate(self.leaves)
+        }
+
+        if distinct is None:
+            ag = self.access_graph
+            ag_rooms = {
+                "nodes": {k: v for k, v in ag.get("nodes", {}).items()
+                          if k != "outside"},
+                "edges": [e for e in ag.get("edges", [])
+                          if "outside" not in e],
+            }
+            distinct = HypergraphPlotter.make_distinct_labels(ag_rooms)
+
+        n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+        labels = []
+        for i in range(n):
+            face = mesh.faceList[i]
+            uid = getattr(face, 'unique_id', '')
+            ag_id = leaf_name_to_ag_id.get(uid, '')
+            labels.append(
+                distinct.get(ag_id, getattr(face, 'merge_id', 'unknown')))
+        return labels
+
     def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
         """Correct access graph to match mesh adjacency. Returns {nodes, edges} dict."""
         import networkx as nx

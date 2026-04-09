@@ -136,10 +136,6 @@ def visualize_item(item: dict, plotter: HypergraphPlotter, output_dir: Path | No
     distinct = plotter.make_distinct_labels(ag_rooms_only)
     if "outside" in ag.get("nodes", {}):
         distinct["outside"] = "Outside"
-    face_labels = [
-        distinct.get(str(i + 1), f"room{i + 1}") for i in range(n_nodes)
-        if str(i + 1) in ag.get("nodes", {})
-    ]
 
     plotter.plot_access_graph_on_axis(
         ag,
@@ -155,6 +151,7 @@ def visualize_item(item: dict, plotter: HypergraphPlotter, output_dir: Path | No
         polygon = [(c["X"], c["Y"]) for c in corners]
         try:
             mesh = hg.to_mesh(bounds=bounds)
+            face_labels = hg.mesh_face_labels(mesh, distinct=distinct)
             plotter.plot_mesh_on_axis(
                 mesh,
                 ax_right,
