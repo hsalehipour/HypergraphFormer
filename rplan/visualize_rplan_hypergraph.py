@@ -205,7 +205,7 @@ def main():
     )
     parser.add_argument(
         "--dataset-dir", type=str, default="dataset/rplan/dataset_hypergraph",
-        help="Directory containing train.json / val.json / test.json",
+        help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
         "--split", type=str, nargs="*", default=["train"],
@@ -213,8 +213,8 @@ def main():
         help="Which split(s) to visualise (default: train)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="debug_bsp_output/rplan_hg",
-        help="Save figures here (default: debug_bsp_output/rplan_hg)",
+        "--output-dir", type=str, default="rplan_disconnected_vis",
+        help="Save figures here (default: rplan_disconnected_vis)",
     )
     parser.add_argument(
         "--max", type=int, default=None,

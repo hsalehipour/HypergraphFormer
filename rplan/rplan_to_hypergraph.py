@@ -30,7 +30,9 @@ import argparse
 import json
 import logging
 import math
+import random
 from pathlib import Path
+from statistics import mean as _mean
 
 import matplotlib
 matplotlib.use("Agg")
@@ -82,6 +84,7 @@ CATEGORY_COLORS = {
 SMALL_FRAGMENT_THRESHOLD = 0.05
 LOOKAHEAD_WEIGHT = 0.5
 LOOKAHEAD_NO_SPLIT_PENALTY = -5000
+EVO_MAX_NODES = 30
 
 
 def get_room_name(category_index: int) -> str:
@@ -829,6 +832,278 @@ def build_bsp_tree(rooms, boundary, access_edges, depth=0, name="root",
 
 
 # ---------------------------------------------------------------------------
+# Evolutionary BSP search
+# ---------------------------------------------------------------------------
+
+def _evaluate_candidates(rooms, boundary):
+    """Enumerate, evaluate, and tier-sort all valid split candidates."""
+    xs, ys = collect_unique_coords(rooms)
+    candidates = []
+    for y in ys:
+        c = SplitCandidate("h", y, boundary)
+        c.evaluate(rooms, [])
+        if c.valid:
+            candidates.append(c)
+    for x in xs:
+        c = SplitCandidate("v", x, boundary)
+        c.evaluate(rooms, [])
+        if c.valid:
+            candidates.append(c)
+    if not candidates:
+        return []
+    for c in candidates:
+        n_cut = len(c.straddling)
+        if n_cut == 0:
+            c._tier = 0
+        elif not c.cuts_nonliving and c.both_endpoints_on_boundary:
+            c._tier = 1
+        elif not c.cuts_nonliving:
+            c._tier = 2
+        elif c.both_endpoints_on_boundary:
+            c._tier = 3
+        else:
+            c._tier = 4
+    candidates.sort(key=lambda c: (c._tier, -c.score))
+    return candidates
+
+
+def build_bsp_tree_with_genome(rooms, boundary, access_edges, genome,
+                               depth=0, name="root",
+                               all_rooms_ref=None, next_id_ref=None,
+                               node_counter=None):
+    """Build a BSP tree using *genome* to select among same-tier candidates.
+
+    Structurally identical to ``build_bsp_tree`` but the split choice at each
+    internal node is driven by ``genome[node_counter[0]]`` instead of always
+    picking the highest-scoring candidate.
+    """
+    if all_rooms_ref is None:
+        all_rooms_ref = {}
+    if next_id_ref is None:
+        next_id_ref = [max(rooms.keys()) + 1 if rooms else 0]
+    if node_counter is None:
+        node_counter = [0]
+    for rid, rinfo in rooms.items():
+        all_rooms_ref[rid] = rinfo
+
+    if len(rooms) == 0:
+        return None
+
+    if len(rooms) == 1:
+        rid = next(iter(rooms))
+        rinfo = rooms[rid]
+        return {
+            "name": rinfo["name"],
+            "area": rinfo["polygon"].area,
+            "room_id": rid,
+            "original_id": rinfo.get("original_id", rid),
+            "polygon": rinfo["polygon"],
+            "room_type": rinfo["room_type"],
+            "final": True,
+        }
+
+    candidates = _evaluate_candidates(rooms, boundary)
+
+    if not candidates:
+        children = []
+        for rid, rinfo in rooms.items():
+            children.append({
+                "name": rinfo["name"],
+                "area": rinfo["polygon"].area,
+                "room_id": rid,
+                "original_id": rinfo.get("original_id", rid),
+                "polygon": rinfo["polygon"],
+                "room_type": rinfo["room_type"],
+                "final": True,
+            })
+        return {
+            "name": name,
+            "area": sum(r["polygon"].area for r in rooms.values()),
+            "children": children,
+            "unsplit": True,
+        }
+
+    best_tier = candidates[0]._tier
+    same_tier = [c for c in candidates if c._tier == best_tier]
+
+    gi = node_counter[0] % len(genome)
+    node_counter[0] += 1
+    idx = int(genome[gi] * len(same_tier)) % len(same_tier)
+    split = same_tier[idx]
+
+    rooms_a, rooms_b, new_access, split_info = execute_split(
+        split, rooms, access_edges, boundary, next_id_ref=next_id_ref,
+    )
+
+    total_area = sum(r["polygon"].area for r in rooms.values())
+    n_cut = len(split.straddling)
+
+    child_a = build_bsp_tree_with_genome(
+        rooms_a, boundary, new_access, genome, depth + 1, name + "L",
+        all_rooms_ref, next_id_ref, node_counter,
+    )
+    child_b = build_bsp_tree_with_genome(
+        rooms_b, boundary, new_access, genome, depth + 1, name + "R",
+        all_rooms_ref, next_id_ref, node_counter,
+    )
+
+    children = [c for c in (child_a, child_b) if c is not None]
+    if len(children) == 1:
+        return children[0]
+
+    return {
+        "name": name,
+        "angle": split_info["angle"],
+        "area": total_area,
+        "split_direction": split_info["direction"],
+        "split_position": split_info["position"],
+        "children": children,
+        "_evo_tier": best_tier,
+        "_evo_n_cut": n_cut,
+    }
+
+
+def evaluate_fitness(tree):
+    """Compute a multi-objective fitness score for a complete BSP tree.
+
+    Higher is better.  The tier penalty dominates so that the existing
+    priority system is preserved as a hard constraint.
+    """
+    if tree is None:
+        return -1e18
+
+    leaves = []
+    internals = []
+
+    def _walk(node):
+        if node is None:
+            return
+        if node.get("final"):
+            leaves.append(node)
+            return
+        internals.append(node)
+        for ch in node.get("children", []):
+            _walk(ch)
+
+    _walk(tree)
+
+    if not leaves:
+        return -1e18
+
+    tier_penalty = sum(n.get("_evo_tier", 0) for n in internals)
+    total_cuts = sum(n.get("_evo_n_cut", 0) for n in internals)
+
+    aspect_scores = []
+    for leaf in leaves:
+        poly = leaf.get("polygon")
+        if poly is None:
+            continue
+        minx, miny, maxx, maxy = poly.bounds
+        w, h = maxx - minx, maxy - miny
+        if max(w, h) > 1e-6:
+            aspect_scores.append(min(w, h) / max(w, h))
+    avg_aspect = _mean(aspect_scores) if aspect_scores else 0.0
+
+    def _depth(node):
+        if node is None or node.get("final"):
+            return 0
+        children = node.get("children", [])
+        if not children:
+            return 0
+        return 1 + max(_depth(ch) for ch in children)
+
+    def _leaf_count(node):
+        if node is None:
+            return 0
+        if node.get("final"):
+            return 1
+        return sum(_leaf_count(ch) for ch in node.get("children", []))
+
+    children = tree.get("children", [])
+    if len(children) == 2:
+        lc_a = _leaf_count(children[0])
+        lc_b = _leaf_count(children[1])
+        balance = min(lc_a, lc_b) / max(lc_a, lc_b) if max(lc_a, lc_b) > 0 else 0
+    else:
+        balance = 0.0
+
+    return (
+        -tier_penalty * 10000
+        - total_cuts * 200
+        + avg_aspect * 50
+        + balance * 30
+    )
+
+
+def evolve_bsp_tree(rooms, boundary, access_edges,
+                    pop_size=100, n_gens=30, seed=None):
+    """Find a high-quality BSP tree via evolutionary search.
+
+    Returns ``(tree, all_rooms_ref)`` in the same format as
+    ``build_bsp_tree``.
+    """
+    rng = random.Random(seed)
+
+    population = [[0.0] * EVO_MAX_NODES]
+    for _ in range(pop_size - 1):
+        population.append([rng.random() for _ in range(EVO_MAX_NODES)])
+
+    def _build_and_score(genome):
+        arm = {}
+        nid = [max(rooms.keys()) + 1 if rooms else 0]
+        for rid, rinfo in rooms.items():
+            arm[rid] = rinfo
+        tree = build_bsp_tree_with_genome(
+            dict(rooms), boundary, access_edges, genome,
+            all_rooms_ref=arm, next_id_ref=nid,
+        )
+        return tree, arm, evaluate_fitness(tree)
+
+    best_tree, best_arm, best_fitness = None, None, -1e18
+
+    for gen in range(n_gens):
+        scored = []
+        for genome in population:
+            tree, arm, fit = _build_and_score(genome)
+            scored.append((genome, tree, arm, fit))
+            if fit > best_fitness:
+                best_fitness = fit
+                best_tree = tree
+                best_arm = arm
+
+        scored.sort(key=lambda x: x[3], reverse=True)
+
+        new_pop = [scored[0][0][:]]
+
+        while len(new_pop) < pop_size:
+            t_size = min(3, len(scored))
+            competitors = rng.sample(scored, t_size)
+            parent_a = max(competitors, key=lambda x: x[3])[0]
+            competitors = rng.sample(scored, t_size)
+            parent_b = max(competitors, key=lambda x: x[3])[0]
+
+            child = []
+            for a, b in zip(parent_a, parent_b):
+                child.append(a if rng.random() < 0.5 else b)
+
+            n_mutate = rng.randint(1, 3)
+            for _ in range(n_mutate):
+                idx = rng.randrange(len(child))
+                child[idx] = (child[idx] + rng.gauss(0, 0.15)) % 1.0
+
+            new_pop.append(child)
+
+        population = new_pop
+
+    if best_tree is None:
+        best_arm = {}
+        best_tree = build_bsp_tree(rooms, boundary, access_edges, depth=0,
+                                   all_rooms_ref=best_arm, lookahead=0)
+
+    return best_tree, best_arm
+
+
+# ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
 
@@ -1110,7 +1385,9 @@ def _resolve_entrance(sample: dict, leaves: dict):
 # Process a single sample
 # ---------------------------------------------------------------------------
 
-def process_sample(sample, output_dir: Path, label: str = "", lookahead: int = 1):
+def process_sample(sample, output_dir: Path, label: str = "",
+                   lookahead: int = 1, evolve: bool = False,
+                   evo_pop: int = 100, evo_gens: int = 30):
     """Run the full BSP pipeline on one RPLAN sample."""
     name = str(sample.get("name", "unknown"))
     rooms = sample_to_rooms(sample)
@@ -1122,9 +1399,15 @@ def process_sample(sample, output_dir: Path, label: str = "", lookahead: int = 1
     if boundary is None:
         return False, "no boundary"
 
-    all_rooms_ref = {}
-    tree = build_bsp_tree(rooms, boundary, access_edges, depth=0,
-                          all_rooms_ref=all_rooms_ref, lookahead=lookahead)
+    if evolve:
+        tree, all_rooms_ref = evolve_bsp_tree(
+            rooms, boundary, access_edges,
+            pop_size=evo_pop, n_gens=evo_gens,
+        )
+    else:
+        all_rooms_ref = {}
+        tree = build_bsp_tree(rooms, boundary, access_edges, depth=0,
+                              all_rooms_ref=all_rooms_ref, lookahead=lookahead)
     if tree is None:
         return False, "BSP returned None"
 
@@ -1341,7 +1624,10 @@ def _bsp_tree_to_split(node, access_edges, leaf_name_map,
     }
 
 
-def sample_to_hypergraph_entry(sample: dict, lookahead: int = 1) -> dict | None:
+def sample_to_hypergraph_entry(sample: dict, lookahead: int = 1,
+                               evolve: bool = False,
+                               evo_pop: int = 100,
+                               evo_gens: int = 30) -> dict | None:
     """Run BSP on one RPLAN sample and return a hypergraph dict (or *None*)."""
     name = str(sample.get("name", "unknown"))
     rooms = sample_to_rooms(sample)
@@ -1353,9 +1639,15 @@ def sample_to_hypergraph_entry(sample: dict, lookahead: int = 1) -> dict | None:
     if boundary is None:
         return None
 
-    all_rooms_ref = {}
-    tree = build_bsp_tree(rooms, boundary, access_edges_orig, depth=0,
-                          all_rooms_ref=all_rooms_ref, lookahead=lookahead)
+    if evolve:
+        tree, all_rooms_ref = evolve_bsp_tree(
+            rooms, boundary, access_edges_orig,
+            pop_size=evo_pop, n_gens=evo_gens,
+        )
+    else:
+        all_rooms_ref = {}
+        tree = build_bsp_tree(rooms, boundary, access_edges_orig, depth=0,
+                              all_rooms_ref=all_rooms_ref, lookahead=lookahead)
     if tree is None:
         return None
 
@@ -1424,11 +1716,14 @@ def _passes_filter(sample, point_edges_mode):
 
 def _export_worker(args):
     """Top-level worker for multiprocessing export."""
-    sample, point_edges_mode, lookahead = args
+    sample, point_edges_mode, lookahead, evolve, evo_pop, evo_gens = args
     if not _passes_filter(sample, point_edges_mode):
         return None, "skipped"
     try:
-        entry = sample_to_hypergraph_entry(sample, lookahead=lookahead)
+        entry = sample_to_hypergraph_entry(
+            sample, lookahead=lookahead,
+            evolve=evolve, evo_pop=evo_pop, evo_gens=evo_gens,
+        )
     except Exception:
         return None, "fail"
     if entry is not None:
@@ -1448,7 +1743,7 @@ def main():
         help="Output directory for debug PNGs",
     )
     parser.add_argument("--split", type=str, default=None,
-                        choices=["train", "val", "test"])
+                        choices=["train", "validation", "test"])
     parser.add_argument("--sample", type=str, nargs="+", default=None,
                         help="One or more RPLAN sample names (e.g. 3951 57395)")
     parser.add_argument("--max-samples", type=int, default=None,
@@ -1480,6 +1775,18 @@ def main():
         "--lookahead", type=int, default=1,
         help="Look-ahead depth for BSP split scoring (0 = greedy, 1 = default)",
     )
+    parser.add_argument(
+        "--evolve", action="store_true",
+        help="Use evolutionary search for BSP split selection (slower, higher quality)",
+    )
+    parser.add_argument(
+        "--evo-pop", type=int, default=100,
+        help="Evolutionary search population size (default: 100)",
+    )
+    parser.add_argument(
+        "--evo-gens", type=int, default=30,
+        help="Evolutionary search generations (default: 30)",
+    )
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -1490,7 +1797,7 @@ def main():
 
     data_dir = Path(args.data_dir)
     splits = [args.split] if args.split else (
-        ["train", "val", "test"] if args.export else ["train"]
+        ["train", "validation", "test"] if args.export else ["train"]
     )
 
     for split_name in splits:
@@ -1513,7 +1820,11 @@ def main():
 
             entries = []
             ok, fail, skipped = 0, 0, 0
-            work_items = [(s, args.point_edges, args.lookahead) for s in candidates]
+            work_items = [
+                (s, args.point_edges, args.lookahead,
+                 args.evolve, args.evo_pop, args.evo_gens)
+                for s in candidates
+            ]
 
             if args.workers > 0:
                 from multiprocessing import Pool
@@ -1558,8 +1869,13 @@ def main():
                     logger.info("Sample #%s skipped by --point-edges=%s",
                                 sample.get("name", "?"), args.point_edges)
                     continue
-                success, info = process_sample(sample, output_dir, split_name,
-                                               lookahead=args.lookahead)
+                success, info = process_sample(
+                    sample, output_dir, split_name,
+                    lookahead=args.lookahead,
+                    evolve=args.evolve,
+                    evo_pop=args.evo_pop,
+                    evo_gens=args.evo_gens,
+                )
                 if success:
                     ok += 1
                 else:
