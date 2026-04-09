@@ -1253,38 +1253,33 @@ def sample_to_hypergraph_entry(sample: dict) -> dict | None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _run_export(args):
-    """Export all RPLAN samples as hypergraph JSON for the given splits."""
-    data_dir = Path(args.data_dir)
-    output_dir = Path(args.export_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _select_samples(all_samples, args):
+    """Return the list of samples to process based on CLI flags."""
+    if args.sample_index is not None:
+        if args.sample_index >= len(all_samples):
+            logger.error("Index %d out of range (%d samples)",
+                         args.sample_index, len(all_samples))
+            return []
+        return [all_samples[args.sample_index]]
 
-    splits = [args.split] if args.split else ["train", "val", "test"]
+    if args.batch or args.export:
+        limit = args.max_samples
+        if limit is None and args.batch and not args.export:
+            limit = 20
+        if limit is not None:
+            return all_samples[:min(limit, len(all_samples))]
+        return all_samples
 
-    for split_name in splits:
-        json_path = data_dir / f"data_{split_name}.json"
-        if not json_path.exists():
-            logger.warning("Skipping %s (not found: %s)", split_name, json_path)
-            continue
+    return [all_samples[0]]
 
-        with open(json_path, "r", encoding="utf-8") as f:
-            samples = json.load(f)
-        logger.info("Exporting %s: %d samples", split_name, len(samples))
 
-        entries = []
-        ok, fail = 0, 0
-        for sample in tqdm(samples, desc=f"export-{split_name}"):
-            entry = sample_to_hypergraph_entry(sample)
-            if entry is not None:
-                entries.append(entry)
-                ok += 1
-            else:
-                fail += 1
-
-        out_path = output_dir / f"{split_name}.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(entries, f)
-        logger.info("  Wrote %d entries to %s (%d failed)", ok, out_path, fail)
+def _passes_filter(sample, point_edges_mode):
+    if point_edges_mode == "include":
+        return True
+    has = has_point_only_edges(sample)
+    if point_edges_mode == "exclude":
+        return not has
+    return has  # "only"
 
 
 def main():
@@ -1296,14 +1291,16 @@ def main():
     )
     parser.add_argument(
         "--output-dir", "-o", type=str, default="debug_bsp_output",
+        help="Output directory for debug PNGs",
     )
     parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"])
     parser.add_argument("--sample-index", type=int, default=None,
                         help="Process a single sample by index")
     parser.add_argument("--batch", action="store_true",
-                        help="Process multiple samples (debug PNG mode)")
-    parser.add_argument("--max-samples", type=int, default=20)
+                        help="Process multiple samples")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Limit number of samples (default: 20 for --batch, all for --export)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument(
         "--point-edges", type=str, default="include",
@@ -1315,8 +1312,9 @@ def main():
     )
     parser.add_argument(
         "--export", action="store_true",
-        help="Export hypergraph JSON files (same format as dataset/hypergraph). "
-             "Processes all samples in --split (or all splits if omitted).",
+        help="Export hypergraph JSON instead of debug PNGs. "
+             "Respects --sample-index, --batch, --max-samples, --point-edges. "
+             "Without --sample-index or --batch, exports ALL samples.",
     )
     parser.add_argument(
         "--export-dir", type=str, default="dataset/rplan/dataset_hypergraph",
@@ -1330,67 +1328,71 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    if args.export:
-        _run_export(args)
-        return
-
-    split = args.split or "train"
-
     data_dir = Path(args.data_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    splits = [args.split] if args.split else (
+        ["train", "val", "test"] if args.export else ["train"]
+    )
 
-    json_path = data_dir / f"data_{split}.json"
-    if not json_path.exists():
-        logger.error("File not found: %s", json_path)
-        return
+    for split_name in splits:
+        json_path = data_dir / f"data_{split_name}.json"
+        if not json_path.exists():
+            logger.error("File not found: %s", json_path)
+            continue
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        samples = json.load(f)
-    logger.info("Loaded %d samples from %s", len(samples), json_path)
+        with open(json_path, "r", encoding="utf-8") as f:
+            all_samples = json.load(f)
+        logger.info("Loaded %d samples from %s", len(all_samples), json_path)
 
-    def _passes_filter(sample):
-        if args.point_edges == "include":
-            return True
-        has = has_point_only_edges(sample)
-        if args.point_edges == "exclude":
-            return not has
-        return has  # "only"
+        candidates = _select_samples(all_samples, args)
+        if not candidates:
+            continue
 
-    if args.sample_index is not None:
-        if args.sample_index >= len(samples):
-            logger.error("Index %d out of range", args.sample_index)
-            return
-        sample = samples[args.sample_index]
-        if not _passes_filter(sample):
-            logger.info("Sample #%s skipped by --point-edges=%s",
-                        sample.get("name", "?"), args.point_edges)
-            return
-        success, info = process_sample(sample, output_dir, split)
-        logger.info("Sample #%s: %s", sample.get("name", "?"), info)
-    elif args.batch:
-        n = min(args.max_samples, len(samples))
-        ok, fail, skipped = 0, 0, 0
-        for i in tqdm(range(n), desc="BSP"):
-            if not _passes_filter(samples[i]):
-                skipped += 1
-                continue
-            success, info = process_sample(samples[i], output_dir, split)
-            if success:
-                ok += 1
-            else:
-                fail += 1
-                logger.debug("Sample %d: %s", i, info)
-        logger.info("Done: %d ok, %d failed, %d skipped out of %d",
-                     ok, fail, skipped, n)
-    else:
-        sample = samples[0]
-        if not _passes_filter(sample):
-            logger.info("Sample #%s skipped by --point-edges=%s",
-                        sample.get("name", "?"), args.point_edges)
-            return
-        success, info = process_sample(sample, output_dir, split)
-        logger.info("Sample #%s: %s", sample.get("name", "?"), info)
+        if args.export:
+            export_dir = Path(args.export_dir)
+            export_dir.mkdir(parents=True, exist_ok=True)
+
+            entries = []
+            ok, fail, skipped = 0, 0, 0
+            for sample in tqdm(candidates, desc=f"export-{split_name}"):
+                if not _passes_filter(sample, args.point_edges):
+                    skipped += 1
+                    continue
+                entry = sample_to_hypergraph_entry(sample)
+                if entry is not None:
+                    entries.append(entry)
+                    ok += 1
+                else:
+                    fail += 1
+
+            out_path = export_dir / f"{split_name}.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f)
+            logger.info("Wrote %d entries to %s (%d failed, %d skipped)",
+                        ok, out_path, fail, skipped)
+        else:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            ok, fail, skipped = 0, 0, 0
+            for sample in tqdm(candidates, desc="BSP",
+                               disable=len(candidates) == 1):
+                if not _passes_filter(sample, args.point_edges):
+                    skipped += 1
+                    logger.info("Sample #%s skipped by --point-edges=%s",
+                                sample.get("name", "?"), args.point_edges)
+                    continue
+                success, info = process_sample(sample, output_dir, split_name)
+                if success:
+                    ok += 1
+                else:
+                    fail += 1
+                    logger.debug("Sample %s: %s", sample.get("name", "?"), info)
+                if len(candidates) == 1:
+                    logger.info("Sample #%s: %s",
+                                sample.get("name", "?"), info)
+            if len(candidates) > 1:
+                logger.info("Done: %d ok, %d failed, %d skipped out of %d",
+                            ok, fail, skipped, len(candidates))
 
 
 if __name__ == "__main__":
