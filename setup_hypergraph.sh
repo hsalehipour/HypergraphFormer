@@ -33,7 +33,7 @@ echo ""
 # ============================================
 # Step 1: Clone hypergraph repository
 # ============================================
-echo "[1/4] Checking hypergraph repository..."
+echo "[1/5] Checking hypergraph repository..."
 
 if [ ! -d "$HYPERGRAPH_REPO" ]; then
     echo "Hypergraph repository not found, cloning from $HYPERGRAPH_REMOTE..."
@@ -56,7 +56,7 @@ echo ""
 # ============================================
 # Step 2: Check/Create virtual environment
 # ============================================
-echo "[2/4] Checking Python virtual environment..."
+echo "[2/5] Checking Python virtual environment..."
 
 if [ ! -d "$VENV_PATH" ]; then
     echo "Virtual environment not found, creating at $VENV_PATH..."
@@ -78,7 +78,7 @@ echo ""
 # ============================================
 # Step 3: Install Python dependencies
 # ============================================
-echo "[3/4] Installing Python dependencies..."
+echo "[3/5] Installing Python dependencies..."
 
 # Check for hypergraph Python requirements
 if [ -f "$HYPERGRAPH_REPO/requirements.txt" ]; then
@@ -121,7 +121,7 @@ else
     
     # Run the DLL compilation script
     cd "$HYPERGRAPH_REPO"
-    ./build_dlls.sh
+    ./build_dlls.sh --clean
     
     echo "✓ C# DLLs compiled successfully"
 fi
@@ -140,9 +140,7 @@ cd "$HYPERGRAPH_REPO"
 # Check if setup.py exists
 if [ -f "$HYPERGRAPH_REPO/setup.py" ]; then
     echo "Installing hypergraph in editable mode (pip install -e)..."
-    pip install -e . > /dev/null 2>&1
-    
-    if [ $? -eq 0 ]; then
+    if pip install -e . > /dev/null 2>&1; then
         echo "✓ Hypergraph package installed"
         echo "  Now you can import with: from hypergraph.api.lib.tools import RGL"
         echo "  No need to manually add sys.path in your scripts!"

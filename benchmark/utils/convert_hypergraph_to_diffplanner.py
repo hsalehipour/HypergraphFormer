@@ -280,8 +280,8 @@ Examples:
     )
     parser.add_argument(
         "--splits", nargs="+",
-        choices=["train", "validation", "test"],
-        default=["train", "validation", "test"],
+        choices=["train", "val", "test"],
+        default=["train", "val", "test"],
         help="Splits to process (default: all)",
     )
     parser.add_argument(

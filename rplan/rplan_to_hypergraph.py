@@ -1743,7 +1743,7 @@ def main():
         help="Output directory for debug PNGs",
     )
     parser.add_argument("--split", type=str, default=None,
-                        choices=["train", "validation", "test"])
+                        choices=["train", "val", "test"])
     parser.add_argument("--sample", type=str, nargs="+", default=None,
                         help="One or more RPLAN sample names (e.g. 3951 57395)")
     parser.add_argument("--max-samples", type=int, default=None,
@@ -1797,7 +1797,7 @@ def main():
 
     data_dir = Path(args.data_dir)
     splits = [args.split] if args.split else (
-        ["train", "validation", "test"] if args.export else ["train"]
+        ["train", "val", "test"] if args.export else ["train"]
     )
 
     for split_name in splits:

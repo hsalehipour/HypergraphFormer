@@ -82,8 +82,8 @@ def main():
     )
     parser.add_argument(
         "--split", type=str, nargs="*",
-        default=["train", "validation", "test"],
-        choices=["train", "validation", "test"],
+        default=["train", "val", "test"],
+        choices=["train", "val", "test"],
         help="Which split(s) to scan (default: all three)",
     )
     parser.add_argument(
