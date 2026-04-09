@@ -1300,6 +1300,20 @@ def _passes_filter(sample, point_edges_mode):
     return has  # "only"
 
 
+def _export_worker(args):
+    """Top-level worker for multiprocessing export."""
+    sample, point_edges_mode = args
+    if not _passes_filter(sample, point_edges_mode):
+        return None, "skipped"
+    try:
+        entry = sample_to_hypergraph_entry(sample)
+    except Exception:
+        return None, "fail"
+    if entry is not None:
+        return entry, "ok"
+    return None, "fail"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="BSP conversion for RPLAN data (pure Python / shapely)",
@@ -1336,6 +1350,10 @@ def main():
         "--export-dir", type=str, default="dataset/rplan/dataset_hypergraph",
         help="Output directory for --export (default: dataset/rplan/dataset_hypergraph)",
     )
+    parser.add_argument(
+        "--workers", "-j", type=int, default=0,
+        help="Number of parallel workers for --export (0 = single process)",
+    )
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -1369,16 +1387,33 @@ def main():
 
             entries = []
             ok, fail, skipped = 0, 0, 0
-            for sample in tqdm(candidates, desc=f"export-{split_name}"):
-                if not _passes_filter(sample, args.point_edges):
-                    skipped += 1
-                    continue
-                entry = sample_to_hypergraph_entry(sample)
-                if entry is not None:
-                    entries.append(entry)
-                    ok += 1
-                else:
-                    fail += 1
+            work_items = [(s, args.point_edges) for s in candidates]
+
+            if args.workers > 0:
+                from multiprocessing import Pool
+                with Pool(processes=args.workers) as pool:
+                    for entry, status in tqdm(
+                        pool.imap(_export_worker, work_items, chunksize=64),
+                        total=len(work_items),
+                        desc=f"export-{split_name}",
+                    ):
+                        if status == "ok":
+                            entries.append(entry)
+                            ok += 1
+                        elif status == "skipped":
+                            skipped += 1
+                        else:
+                            fail += 1
+            else:
+                for item in tqdm(work_items, desc=f"export-{split_name}"):
+                    entry, status = _export_worker(item)
+                    if status == "ok":
+                        entries.append(entry)
+                        ok += 1
+                    elif status == "skipped":
+                        skipped += 1
+                    else:
+                        fail += 1
 
             out_path = export_dir / f"{split_name}.json"
             with open(out_path, "w", encoding="utf-8") as f:
