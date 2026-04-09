@@ -76,14 +76,14 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Visualize fixed access-graph cases from the Hypergraph1k dataset.",
+        description="Visualize fixed access-graph cases from the RPLAN dataset.",
     )
     parser.add_argument(
-        "--original-dir", type=str, default="dataset/hypergraph",
+        "--original-dir", type=str, default="dataset/rplan/dataset_hypergraph",
         help="Directory with the original train.json / validation.json / test.json",
     )
     parser.add_argument(
-        "--fixed-dir", type=str, default="dataset/hypergraph_fixed",
+        "--fixed-dir", type=str, default="dataset/rplan/dataset_hypergraph_fixed",
         help="Directory with the fixed train.json / validation.json / test.json",
     )
     parser.add_argument(
@@ -93,7 +93,7 @@ def main():
         help="Which split(s) to process (default: all three)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="dataset/disconnected_fixed_vis",
+        "--output-dir", type=str, default="dataset/rplan/disconnected_fixed_vis",
         help="Save figures to this directory (per-split sub-folders)",
     )
     args = parser.parse_args()

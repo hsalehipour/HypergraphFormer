@@ -5,11 +5,13 @@ Fix disconnected access graphs in the RPLAN dataset.
 For each sample with a disconnected access graph, attempts to reconnect
 components by adding edges to the leaf ``connected`` lists:
 
-  1. **Foyer–Foyer bridge**: If two components each contain a foyer and
-     those foyers share a polygon edge, connect them.
-  2. **Node–Foyer/Living bridge**: Connect any node in one component to
-     an adjacent foyer (priority) or living room in another component.
-  3. **Any adjacent bridge**: As a last resort, connect any pair of
+  1. **Living-Living bridge**: If two components each contain a living
+     room and those rooms share a polygon edge, connect them.
+  2. **Node-Living bridge (edge)**: Connect any node in one component
+     to an edge-adjacent living room in another component.
+  3. **Node-Living bridge (point)**: Same as 2, but for rooms that
+     share only a point with a living room (no shared edge).
+  4. **Any adjacent bridge**: As a last resort, connect any pair of
      physically adjacent rooms across components.
 
 "Physically adjacent" means the two rooms' mesh polygons overlap when
@@ -19,7 +21,7 @@ Writes repaired splits to new JSON files in an output directory.
 
 Usage:
     python rplan/fix_disconnected_accessgraphs.py
-    python rplan/fix_disconnected_accessgraphs.py --output-dir dataset/hypergraph_fixed
+    python rplan/fix_disconnected_accessgraphs.py --output-dir dataset/rplan/dataset_hypergraph_fixed
 """
 
 from __future__ import annotations
@@ -45,17 +47,26 @@ SCALE_FACTOR = 1.05
 # ── Helpers ────────────────────────────────────────────────────────────
 
 def _build_physical_adjacency(hg: Hypergraph, bounds: dict):
-    """Return a set of (i, j) pairs where face i and face j share a polygon edge.
+    """Return edge-adjacent and point-adjacent room pairs.
 
-    Uses the same scaled-polygon heuristic as ``correct_accessgraph``.
+    Uses the same scaled-polygon heuristic as ``correct_accessgraph``
+    for edge adjacency, and raw polygon intersection for point adjacency.
     ``i`` and ``j`` are 0-based face/leaf indices.
+
+    Returns
+    -------
+    (edge_adj, point_adj, n)
+        *edge_adj*: pairs sharing a polygon edge (scaled overlap > 0).
+        *point_adj*: pairs sharing only a point (touch but no edge).
+        *n*: number of faces.
     """
     mesh = hg.to_mesh(bounds=bounds)
     n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
     if n <= 0:
-        return set(), n
+        return set(), set(), n
 
-    polys = []
+    raw_polys = []
+    scaled_polys = []
     for i in range(n):
         f = mesh.faceList[i]
         pts = f.getPoints()
@@ -64,25 +75,35 @@ def _build_physical_adjacency(hg: Hypergraph, bounds: dict):
             for j in range(int(getattr(pts, "Count", 0) or 0))
         ]
         raw = Polygon(corners) if len(corners) >= 3 else Polygon()
-        polys.append(
+        raw_polys.append(raw)
+        scaled_polys.append(
             _scale(raw, xfact=SCALE_FACTOR, yfact=SCALE_FACTOR, origin="centroid")
             if not raw.is_empty else raw
         )
 
-    adj: set[tuple[int, int]] = set()
+    edge_adj: set[tuple[int, int]] = set()
+    point_adj: set[tuple[int, int]] = set()
     for i in range(n):
-        if polys[i].is_empty:
+        if raw_polys[i].is_empty:
             continue
         for j in range(i + 1, n):
-            if polys[j].is_empty:
+            if raw_polys[j].is_empty:
                 continue
             try:
-                if polys[i].intersection(polys[j]).area > 1e-12:
-                    adj.add((i, j))
+                if scaled_polys[i].intersection(scaled_polys[j]).area > 1e-12:
+                    ix = raw_polys[i].intersection(raw_polys[j])
+                    if ix.is_empty:
+                        point_adj.add((i, j))
+                    elif ix.geom_type == "Point" or (
+                        ix.geom_type == "MultiPoint"
+                    ):
+                        point_adj.add((i, j))
+                    else:
+                        edge_adj.add((i, j))
             except Exception:
                 pass
 
-    return adj, n
+    return edge_adj, point_adj, n
 
 
 def _component_of(node_id: str, components: list[set[str]]) -> int:
@@ -139,7 +160,8 @@ def fix_access_graph(hg_dict: dict, bounds: dict) -> tuple[dict, int]:
     if hg.is_access_graph_connected():
         return fixed, 0
 
-    phys_adj, n_faces = _build_physical_adjacency(hg, bounds)
+    edge_adj, point_adj, n_faces = _build_physical_adjacency(hg, bounds)
+    all_adj = edge_adj | point_adj
     leaves = hg.leaves
     n_leaves = len(leaves)
 
@@ -161,30 +183,30 @@ def fix_access_graph(hg_dict: dict, bounds: dict) -> tuple[dict, int]:
 
         bridge = None
 
-        # Strategy 1: foyer ↔ foyer
+        # Strategy 1: living ↔ living (edge-adjacent)
         bridge = _try_bridge(
-            components, node_types, phys_adj,
-            lambda ti, tj: ti == "foyer" and tj == "foyer",
+            components, node_types, edge_adj,
+            lambda ti, tj: ti == "living" and tj == "living",
         )
 
-        # Strategy 2a: any node ↔ foyer
+        # Strategy 2: any node ↔ living (edge-adjacent)
         if bridge is None:
             bridge = _try_bridge(
-                components, node_types, phys_adj,
-                lambda ti, tj: ti == "foyer" or tj == "foyer",
-            )
-
-        # Strategy 2b: any node ↔ living
-        if bridge is None:
-            bridge = _try_bridge(
-                components, node_types, phys_adj,
+                components, node_types, edge_adj,
                 lambda ti, tj: ti == "living" or tj == "living",
             )
 
-        # Strategy 3: any physically adjacent pair across components
+        # Strategy 3: any node ↔ living (point-only adjacent)
         if bridge is None:
             bridge = _try_bridge(
-                components, node_types, phys_adj,
+                components, node_types, point_adj,
+                lambda ti, tj: ti == "living" or tj == "living",
+            )
+
+        # Strategy 4: any physically adjacent pair across components
+        if bridge is None:
+            bridge = _try_bridge(
+                components, node_types, all_adj,
                 lambda ti, tj: True,
             )
 
@@ -213,6 +235,44 @@ def fix_access_graph(hg_dict: dict, bounds: dict) -> tuple[dict, int]:
         )
 
     return fixed, edges_added
+
+
+def _fix_worker(item_with_idx):
+    """Top-level worker for multiprocessing."""
+    idx, item = item_with_idx
+    split_str = item.get("split", "")
+    if not split_str:
+        return idx, item, "skip"
+
+    hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
+    hg = Hypergraph(hg_dict)
+
+    if hg.is_access_graph_connected():
+        return idx, item, "connected"
+
+    item_id = item.get("id", f"item_{idx}")
+    bounds_str = item.get("bounds", "")
+    bounds = (
+        json.loads(bounds_str)
+        if isinstance(bounds_str, str) and bounds_str
+        else bounds_str
+    )
+
+    if not bounds or not isinstance(bounds, dict):
+        return idx, item, "no_bounds"
+
+    try:
+        fixed_dict, n_added = fix_access_graph(hg_dict, bounds)
+    except Exception:
+        return idx, item, "error"
+
+    hg_after = Hypergraph(fixed_dict)
+    now_connected = hg_after.is_access_graph_connected()
+
+    patched = dict(item)
+    patched["split"] = json.dumps(fixed_dict)
+    status = f"fixed:{n_added}" if now_connected else f"partial:{n_added}"
+    return idx, patched, status
 
 
 # ── I/O ────────────────────────────────────────────────────────────────
@@ -248,11 +308,11 @@ def main():
         description="Fix disconnected access graphs in the RPLAN dataset.",
     )
     parser.add_argument(
-        "--dataset-dir", type=str, default="dataset/rplan/dataset_access",
+        "--dataset-dir", type=str, default="dataset/rplan/dataset_hypergraph",
         help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="dataset/dataset_access_fixed",
+        "--output-dir", type=str, default="dataset/rplan/dataset_hypergraph_fixed",
         help="Directory for repaired JSON files",
     )
     parser.add_argument(
@@ -260,6 +320,10 @@ def main():
         default=["train", "validation", "test"],
         choices=["train", "validation", "test"],
         help="Which split(s) to process (default: all three)",
+    )
+    parser.add_argument(
+        "--workers", "-j", type=int, default=0,
+        help="Number of parallel workers (0 = single process)",
     )
     args = parser.parse_args()
 
@@ -281,51 +345,35 @@ def main():
         fixed = 0
         total_edges = 0
 
-        for idx, item in enumerate(items):
-            split_str = item.get("split", "")
-            if not split_str:
-                continue
+        work_items = list(enumerate(items))
 
-            hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
-            hg = Hypergraph(hg_dict)
+        if args.workers > 0:
+            from multiprocessing import Pool
+            from tqdm import tqdm
+            with Pool(processes=args.workers) as pool:
+                results = list(tqdm(
+                    pool.imap(_fix_worker, work_items, chunksize=32),
+                    total=len(work_items),
+                    desc=f"fix-{split}",
+                ))
+        else:
+            results = [_fix_worker(wi) for wi in work_items]
 
-            if hg.is_access_graph_connected():
-                continue
-
-            disconnected += 1
-            item_id = item.get("id", f"item_{idx}")
-
-            bounds_str = item.get("bounds", "")
-            bounds = (
-                json.loads(bounds_str)
-                if isinstance(bounds_str, str) and bounds_str
-                else bounds_str
-            )
-
-            if not bounds or not isinstance(bounds, dict):
-                logger.warning("  %s: no bounds, skipping.", item_id)
-                continue
-
-            try:
-                fixed_dict, n_added = fix_access_graph(hg_dict, bounds)
-            except Exception as exc:
-                logger.warning("  %s: fix failed (%s), keeping original.", item_id, exc)
-                continue
-
-            hg_after = Hypergraph(fixed_dict)
-            now_connected = hg_after.is_access_graph_connected()
-            comps_after = len(hg_after.access_graph_components())
-
-            if now_connected:
+        for idx, patched_item, status in results:
+            items[idx] = patched_item
+            if status.startswith("fixed:"):
+                n_added = int(status.split(":")[1])
+                disconnected += 1
                 fixed += 1
-            total_edges += n_added
-
-            item["split"] = json.dumps(fixed_dict)
-
-            status = "FIXED" if now_connected else f"PARTIAL ({comps_after} comps left)"
-            logger.info(
-                "  %s  %s  (+%d edges)", item_id, status, n_added,
-            )
+                total_edges += n_added
+            elif status.startswith("partial:"):
+                n_added = int(status.split(":")[1])
+                disconnected += 1
+                total_edges += n_added
+            elif status == "no_bounds":
+                disconnected += 1
+            elif status == "error":
+                disconnected += 1
 
         save_split(items, output_dir, split)
 
