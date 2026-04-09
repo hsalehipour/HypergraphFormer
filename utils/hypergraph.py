@@ -894,6 +894,7 @@ class HypergraphPlotter:
         'storage': '#5254a3',
         'storeroom': '#5254a3',
         'stairs': '#72246c',
+        'outside': '#FF0000',
     }
 
     ROOM_COLOR_MAP = ROOM_COLORS  # legacy alias
