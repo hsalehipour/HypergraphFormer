@@ -18,8 +18,8 @@ slightly scaled (same heuristic as ``Hypergraph.correct_accessgraph``).
 Writes repaired splits to new JSON files in an output directory.
 
 Usage:
-    python dataset/hypergraph/fix_disconnected_accessgraphs.py
-    python dataset/hypergraph/fix_disconnected_accessgraphs.py --output-dir dataset/hypergraph_fixed
+    python utils/fix_disconnected_accessgraphs.py
+    python utils/fix_disconnected_accessgraphs.py --output-dir dataset/hypergraph_fixed
 """
 
 from __future__ import annotations

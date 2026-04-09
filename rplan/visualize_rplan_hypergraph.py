@@ -12,10 +12,10 @@ For every sample two panels are produced:
     Right -- RGL mesh floor plan with boundary (requires the C# RGL library).
 
 Usage:
-    python dataset/rplan/visualize_rplan_hypergraph.py
-    python dataset/rplan/visualize_rplan_hypergraph.py --max 20
-    python dataset/rplan/visualize_rplan_hypergraph.py --dataset-dir dataset/rplan/dataset_hypergraph --split train
-    python dataset/rplan/visualize_rplan_hypergraph.py --output-dir rplan_hg_vis/
+    python rplan/visualize_rplan_hypergraph.py
+    python rplan/visualize_rplan_hypergraph.py --max 20
+    python rplan/visualize_rplan_hypergraph.py --dataset-dir dataset/rplan/dataset_hypergraph --split train
+    python rplan/visualize_rplan_hypergraph.py --output-dir rplan_hg_vis/
 """
 
 from __future__ import annotations

@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Visualize the fixed access-graph cases.
+Detect and visualize floor plans with disconnected access graphs.
 
-Compares each original disconnected sample against its fixed counterpart,
-producing a side-by-side figure identical in style to
-``detect_disconnected_accessgraphs.py`` but using the **fixed** JSON data:
+Scans the Hypergraph1k dataset for samples whose access graph consists of
+two or more isolated connected components.  For each disconnected sample,
+produces a side-by-side figure:
 
-    Top-left    -- Fixed access graph (now connected).
-    Bottom-left -- Original access graph (disconnected).
-    Right       -- RGL mesh floor plan with boundary.
-
-Only samples that were actually repaired (were disconnected in the original
-data and are now connected in the fixed data) are visualised.
+    Left  -- Access graph (styled per benchmark conventions).
+    Right -- RGL mesh floor plan with boundary (via subdivideWithMeshRatio).
 
 Usage:
-    python dataset/hypergraph/visualize_fixed_accessgraphs.py
-    python dataset/hypergraph/visualize_fixed_accessgraphs.py --output-dir dataset/disconnected_fixed_vis
+    python utils/detect_disconnected_accessgraphs.py
+    python utils/detect_disconnected_accessgraphs.py --split test --max 10
+    python utils/detect_disconnected_accessgraphs.py --output-dir docs/disconnected
 """
 
 from __future__ import annotations
@@ -76,115 +73,95 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Visualize fixed access-graph cases from the Hypergraph1k dataset.",
+        description="Detect and visualise disconnected access graphs "
+                    "in the Hypergraph1k dataset.",
     )
     parser.add_argument(
-        "--original-dir", type=str, default="dataset/hypergraph",
-        help="Directory with the original train.json / validation.json / test.json",
-    )
-    parser.add_argument(
-        "--fixed-dir", type=str, default="dataset/hypergraph_fixed",
-        help="Directory with the fixed train.json / validation.json / test.json",
+        "--dataset-dir", type=str, default="dataset/hypergraph",
+        help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
         "--split", type=str, nargs="*",
         default=["train", "validation", "test"],
         choices=["train", "validation", "test"],
-        help="Which split(s) to process (default: all three)",
+        help="Which split(s) to scan (default: all three)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="dataset/disconnected_fixed_vis",
-        help="Save figures to this directory (per-split sub-folders)",
+        "--output-dir", type=str, default=None,
+        help="Save figures to this directory instead of displaying them",
+    )
+    parser.add_argument(
+        "--max", type=int, default=None,
+        help="Stop after this many disconnected samples (per split)",
+    )
+    parser.add_argument(
+        "--min-components", type=int, default=2,
+        help="Minimum number of connected components to flag (default: 2)",
     )
     args = parser.parse_args()
 
-    original_dir = Path(args.original_dir)
-    fixed_dir = Path(args.fixed_dir)
+    dataset_dir = Path(args.dataset_dir)
     plotter = HypergraphPlotter()
     grand_total = 0
+    grand_disconnected = 0
 
     for split in args.split:
-        logger.info("Processing %s ...", split)
-        orig_items = load_split_raw(original_dir, split)
-        fixed_items = load_split_raw(fixed_dir, split)
-
-        if not orig_items or not fixed_items:
+        logger.info("Scanning %s ...", split)
+        items = load_split_raw(dataset_dir, split)
+        if not items:
             continue
 
-        fixed_by_id = {it["id"]: it for it in fixed_items}
         found = 0
+        for item in items:
+            hg = Hypergraph(item["hg_dict"])
+            components = hg.access_graph_components()
 
-        for orig in orig_items:
-            hg_orig = Hypergraph(orig["hg_dict"])
-            if hg_orig.is_access_graph_connected():
-                continue
-
-            fixed = fixed_by_id.get(orig["id"])
-            if fixed is None:
-                continue
-
-            hg_fixed = Hypergraph(fixed["hg_dict"])
-            if not hg_fixed.is_access_graph_connected():
+            if len(components) < args.min_components:
                 continue
 
             found += 1
-            grand_total += 1
+            grand_disconnected += 1
 
-            ag = hg_fixed.access_graph
+            ag = hg.access_graph
+            n_comp = len(components)
+            comp_summary = ", ".join(
+                f"C{i+1}({len(c)})" for i, c in enumerate(components)
+            )
             n_nodes = len(ag.get("nodes", {}))
             n_edges = len(ag.get("edges", []))
 
-            ag_orig = hg_orig.access_graph
-            n_edges_orig = len(ag_orig.get("edges", []))
-            added = n_edges - n_edges_orig
-
             logger.info(
-                "  FIXED  %s  (index=%d, %d rooms, %d→%d edges, +%d)",
-                orig["id"], orig["index"], n_nodes,
-                n_edges_orig, n_edges, added,
+                "  DISCONNECTED  %s  (index=%d, %d components, "
+                "%d rooms, %d edges)",
+                item["id"], item["index"], n_comp, n_nodes, n_edges,
             )
 
-            import matplotlib.gridspec as gridspec
-
-            fig = plt.figure(figsize=(18, 9))
-            gs = gridspec.GridSpec(2, 2, width_ratios=[1, 1], hspace=0.30)
-            ax_fixed = fig.add_subplot(gs[0, 0])
-            ax_orig = fig.add_subplot(gs[1, 0])
-            ax_right = fig.add_subplot(gs[:, 1])
-
+            fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 7))
             fig.suptitle(
-                f"{orig['id']}  |  db={orig['database']}  |  "
-                f"{n_nodes} rooms, {n_edges} edges (+{added} added)  |  "
-                f"FIXED (was disconnected)",
+                f"{item['id']}  |  db={item['database']}  |  "
+                f"{n_nodes} rooms, {n_edges} edges  |  "
+                f"{n_comp} components: {comp_summary}",
                 fontsize=11, fontweight="bold",
             )
 
             distinct = plotter.make_distinct_labels(ag)
-            distinct_orig = plotter.make_distinct_labels(ag_orig)
-
             face_labels = [
                 distinct.get(str(i + 1), f"room{i + 1}")
                 for i in range(n_nodes)
             ]
 
-            components_orig = hg_orig.access_graph_components()
             plotter.plot_access_graph_on_axis(
-                ag_orig, ax_orig, title="Original (disconnected)",
-                components=components_orig,
-                node_labels=distinct_orig,
-            )
-
-            plotter.plot_access_graph_on_axis(
-                ag, ax_fixed, title="Fixed (connected)",
+                ag, ax_left, title="Access Graph",
+                components=components,
                 node_labels=distinct,
             )
 
-            bounds = fixed.get("bounds")
+            bounds = item.get("bounds")
             if bounds and isinstance(bounds, dict):
                 corners = bounds.get("corners", [])
                 polygon = [(c["X"], c["Y"]) for c in corners]
                 try:
-                    mesh = hg_fixed.to_mesh(bounds=bounds)
+                    mesh = hg.to_mesh(bounds=bounds)
                     plotter.plot_mesh_on_axis(
                         mesh, ax_right,
                         boundary_polygon=polygon,
@@ -193,7 +170,7 @@ def main():
                     )
                 except Exception as exc:
                     logger.warning("  Could not render mesh for %s: %s",
-                                   orig["id"], exc)
+                                   item["id"], exc)
                     ax_right.text(
                         0.5, 0.5, f"Mesh render failed:\n{exc}",
                         ha="center", va="center", transform=ax_right.transAxes,
@@ -210,17 +187,34 @@ def main():
 
             fig.subplots_adjust(top=0.90, wspace=0.05)
 
-            out = Path(args.output_dir) / split
-            out.mkdir(parents=True, exist_ok=True)
-            fig.savefig(
-                out / f"{orig['id']}.png",
-                dpi=150, bbox_inches="tight",
-            )
-            plt.close(fig)
+            if args.output_dir:
+                out = Path(args.output_dir) / split
+                out.mkdir(parents=True, exist_ok=True)
+                fig.savefig(
+                    out / f"{item['id']}.png",
+                    dpi=150, bbox_inches="tight",
+                )
+                plt.close(fig)
+            else:
+                plt.show()
 
-        logger.info("  %s: %d fixed cases visualised", split, found)
+            if args.max and found >= args.max:
+                logger.info("  Reached --max %d, moving on.", args.max)
+                break
 
-    logger.info("Overall: %d fixed cases visualised", grand_total)
+        grand_total += len(items)
+        logger.info(
+            "  %s: %d disconnected / %d total (%.1f%%)",
+            split, found, len(items),
+            100 * found / len(items) if items else 0,
+        )
+
+    logger.info(
+        "Overall: %d disconnected / %d total (%.1f%%)",
+        grand_disconnected, grand_total,
+        100 * grand_disconnected / grand_total if grand_total else 0,
+    )
+
     return 0
 
 

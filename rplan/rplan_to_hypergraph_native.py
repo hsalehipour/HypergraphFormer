@@ -19,7 +19,7 @@ Modes:
   Debug (default) — renders PNG visualisations:
     python -m rplan.rplan_to_hypergraph_native --sample 3951
     python -m rplan.rplan_to_hypergraph_native --sample 3951 57395
-    python -m rplan.rplan_to_hypergraph_native --batch --max-samples 100
+    python -m rplan.rplan_to_hypergraph_native --max-samples 100
 
   Export — writes hypergraph JSON files (same format as dataset/hypergraph):
     python -m rplan.rplan_to_hypergraph_native --export
@@ -1282,12 +1282,10 @@ def _select_samples(all_samples, args):
                 logger.error("Sample name '%s' not found in dataset", name)
         return selected
 
-    if args.batch or args.export:
-        limit = args.max_samples
-        if limit is None and args.batch and not args.export:
-            limit = 20
-        if limit is not None:
-            return all_samples[:min(limit, len(all_samples))]
+    if args.max_samples is not None:
+        return all_samples[:min(args.max_samples, len(all_samples))]
+
+    if args.export:
         return all_samples
 
     return [all_samples[0]]
@@ -1317,10 +1315,8 @@ def main():
                         choices=["train", "val", "test"])
     parser.add_argument("--sample", type=str, nargs="+", default=None,
                         help="One or more RPLAN sample names (e.g. 3951 57395)")
-    parser.add_argument("--batch", action="store_true",
-                        help="Process multiple samples")
     parser.add_argument("--max-samples", type=int, default=None,
-                        help="Limit number of samples (default: 20 for --batch, all for --export)")
+                        help="Limit number of samples to process")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument(
         "--point-edges", type=str, default="include",
@@ -1333,8 +1329,8 @@ def main():
     parser.add_argument(
         "--export", action="store_true",
         help="Export hypergraph JSON instead of debug PNGs. "
-             "Respects --sample-index, --batch, --max-samples, --point-edges. "
-             "Without --sample-index or --batch, exports ALL samples.",
+             "Respects --sample, --max-samples, --point-edges. "
+             "Without --sample or --max-samples, exports ALL samples.",
     )
     parser.add_argument(
         "--export-dir", type=str, default="dataset/rplan/dataset_hypergraph",
