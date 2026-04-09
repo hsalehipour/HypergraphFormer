@@ -17,12 +17,13 @@ Split-line priorities:
 
 Modes:
   Debug (default) — renders PNG visualisations:
-    python -m rplan.rplan_to_hypergraph_native --sample-index 0
+    python -m rplan.rplan_to_hypergraph_native --sample 3951
+    python -m rplan.rplan_to_hypergraph_native --sample 3951 57395
     python -m rplan.rplan_to_hypergraph_native --batch --max-samples 100
 
   Export — writes hypergraph JSON files (same format as dataset/hypergraph):
     python -m rplan.rplan_to_hypergraph_native --export
-    python -m rplan.rplan_to_hypergraph_native --export --split train
+    python -m rplan.rplan_to_hypergraph_native --sample 3951 --export
 """
 
 import argparse
@@ -1149,12 +1150,18 @@ def _build_leaf_name_map(node, result=None):
     return result
 
 
-def _bsp_tree_to_split(node, access_edges, leaf_name_map):
+def _bsp_tree_to_split(node, access_edges, leaf_name_map,
+                       parent_angle=0.0):
     """Convert internal BSP tree dict to the hypergraph ``split`` format.
 
     *access_edges* is a list of ``(room_id_a, room_id_b)`` tuples.
     *leaf_name_map* maps ``room_id -> _hg_name`` for every leaf.
     Edges involving ``OUTSIDE_ROOM_ID`` are resolved to ``"outside"``.
+
+    RGL reads the **children's** angle fields to determine how to split the
+    parent's space (see ``DataNode.SubdivideTree`` in C#).  Therefore each
+    node must carry its *parent's* split angle, not its own.
+    *parent_angle* is threaded through the recursion for this purpose.
     """
     if node is None:
         return None
@@ -1178,23 +1185,33 @@ def _bsp_tree_to_split(node, access_edges, leaf_name_map):
         return {
             "name": hg_name,
             "area": float(node.get("area", 0)),
-            "angle": float(node.get("angle", 0)),
+            "angle": parent_angle,
             "mergeid": CATEGORY_TO_MERGEID.get(room_type, "extra"),
             "final": True,
             "children": [],
             "connected": connected_names,
         }
 
+    my_split_angle = float(node.get("angle", 0))
+
+    bsp_children = list(node.get("children", []))
+    # RGL (CW faces) places the first child on the BOTTOM for H splits but
+    # on the LEFT for V splits.  Our BSP puts the "above" child first for H
+    # splits, so we must reverse children for horizontal splits to match RGL.
+    if node.get("split_direction") == "h":
+        bsp_children = list(reversed(bsp_children))
+
     children_out = []
-    for child in node.get("children", []):
-        converted = _bsp_tree_to_split(child, access_edges, leaf_name_map)
+    for child in bsp_children:
+        converted = _bsp_tree_to_split(child, access_edges, leaf_name_map,
+                                       parent_angle=my_split_angle)
         if converted is not None:
             children_out.append(converted)
 
     return {
         "name": hg_name,
         "area": float(node.get("area", 0)),
-        "angle": float(node.get("angle", 0)),
+        "angle": parent_angle,
         "mergeid": hg_name,
         "final": False,
         "children": children_out,
@@ -1255,12 +1272,15 @@ def sample_to_hypergraph_entry(sample: dict) -> dict | None:
 
 def _select_samples(all_samples, args):
     """Return the list of samples to process based on CLI flags."""
-    if args.sample_index is not None:
-        if args.sample_index >= len(all_samples):
-            logger.error("Index %d out of range (%d samples)",
-                         args.sample_index, len(all_samples))
-            return []
-        return [all_samples[args.sample_index]]
+    if args.sample is not None:
+        name_to_sample = {str(s.get("name", "")): s for s in all_samples}
+        selected = []
+        for name in args.sample:
+            if name in name_to_sample:
+                selected.append(name_to_sample[name])
+            else:
+                logger.error("Sample name '%s' not found in dataset", name)
+        return selected
 
     if args.batch or args.export:
         limit = args.max_samples
@@ -1295,8 +1315,8 @@ def main():
     )
     parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"])
-    parser.add_argument("--sample-index", type=int, default=None,
-                        help="Process a single sample by index")
+    parser.add_argument("--sample", type=str, nargs="+", default=None,
+                        help="One or more RPLAN sample names (e.g. 3951 57395)")
     parser.add_argument("--batch", action="store_true",
                         help="Process multiple samples")
     parser.add_argument("--max-samples", type=int, default=None,
