@@ -85,6 +85,8 @@ CATEGORY_COLORS = {
 }
 
 SMALL_FRAGMENT_THRESHOLD = 0.05
+LOOKAHEAD_WEIGHT = 0.5
+LOOKAHEAD_NO_SPLIT_PENALTY = -5000
 
 
 def get_room_name(category_index: int) -> str:
@@ -437,8 +439,14 @@ class SplitCandidate:
         )
 
 
-def find_best_split(rooms, boundary, access_edges):
-    """Find the best BSP split for the given set of rooms."""
+def find_best_split(rooms, boundary, access_edges, lookahead=0):
+    """Find the best BSP split for the given set of rooms.
+
+    When *lookahead* > 0 each valid candidate is additionally scored by
+    simulating the best greedy split on each resulting child partition.
+    This lets the algorithm prefer splits that lead to cleaner future
+    partitions (fewer room cuts downstream).
+    """
     xs, ys = collect_unique_coords(rooms)
 
     candidates = []
@@ -456,8 +464,54 @@ def find_best_split(rooms, boundary, access_edges):
     if not candidates:
         return None
 
+    if lookahead > 0:
+        for c in candidates:
+            rooms_a, rooms_b = _build_lookahead_rooms(c)
+            child_score = 0.0
+            for child_rooms in (rooms_a, rooms_b):
+                if len(child_rooms) <= 1:
+                    continue
+                child_best = find_best_split(
+                    child_rooms, boundary, [], lookahead=lookahead - 1,
+                )
+                if child_best is not None:
+                    child_score += child_best.score
+                else:
+                    child_score += LOOKAHEAD_NO_SPLIT_PENALTY
+            c.score += LOOKAHEAD_WEIGHT * child_score
+
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates[0]
+
+
+def _build_lookahead_rooms(candidate):
+    """Build lightweight child-room dicts from an already-evaluated candidate.
+
+    Returns ``(rooms_a, rooms_b)`` using temporary negative IDs for
+    straddling-room fragments so they don't collide with real room IDs.
+    """
+    rooms_a = dict(candidate.side_a)
+    rooms_b = dict(candidate.side_b)
+    tmp_id = -1
+    for orig_id, (low_list, high_list) in candidate.cut_rooms.items():
+        rinfo = candidate.straddling[orig_id]
+        for poly in low_list:
+            if poly.area > 1e-6:
+                rooms_a[tmp_id] = {
+                    "polygon": poly,
+                    "room_type": rinfo["room_type"],
+                    "name": rinfo["name"],
+                }
+                tmp_id -= 1
+        for poly in high_list:
+            if poly.area > 1e-6:
+                rooms_b[tmp_id] = {
+                    "polygon": poly,
+                    "room_type": rinfo["room_type"],
+                    "name": rinfo["name"],
+                }
+                tmp_id -= 1
+    return rooms_a, rooms_b
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +656,7 @@ def execute_split(split: SplitCandidate, rooms, access_edges, boundary,
 # ---------------------------------------------------------------------------
 
 def build_bsp_tree(rooms, boundary, access_edges, depth=0, name="root",
-                   all_rooms_ref=None, next_id_ref=None):
+                   all_rooms_ref=None, next_id_ref=None, lookahead=1):
     """Recursively build a BSP tree from room polygons.
 
     *all_rooms_ref* is a mutable dict that accumulates every room (including
@@ -611,6 +665,9 @@ def build_bsp_tree(rooms, boundary, access_edges, depth=0, name="root",
 
     *next_id_ref* is a single-element list ``[int]`` used as a shared counter
     to guarantee globally unique fragment IDs across all recursive calls.
+
+    *lookahead* controls how many levels ahead ``find_best_split`` simulates
+    when scoring candidate splits (0 = greedy, 1 = one step ahead, etc.).
 
     Returns a dict representing the BSP tree node.
     """
@@ -639,7 +696,7 @@ def build_bsp_tree(rooms, boundary, access_edges, depth=0, name="root",
             "final": True,
         }
 
-    split = find_best_split(rooms, boundary, access_edges)
+    split = find_best_split(rooms, boundary, access_edges, lookahead=lookahead)
 
     if split is None:
         logger.warning(
@@ -685,11 +742,11 @@ def build_bsp_tree(rooms, boundary, access_edges, depth=0, name="root",
 
     child_a = build_bsp_tree(
         rooms_a, boundary, new_access, depth + 1, name + "L",
-        all_rooms_ref, next_id_ref
+        all_rooms_ref, next_id_ref, lookahead=lookahead,
     )
     child_b = build_bsp_tree(
         rooms_b, boundary, new_access, depth + 1, name + "R",
-        all_rooms_ref, next_id_ref
+        all_rooms_ref, next_id_ref, lookahead=lookahead,
     )
 
     children = [c for c in (child_a, child_b) if c is not None]
@@ -988,7 +1045,7 @@ def _resolve_entrance(sample: dict, leaves: dict):
 # Process a single sample
 # ---------------------------------------------------------------------------
 
-def process_sample(sample, output_dir: Path, label: str = ""):
+def process_sample(sample, output_dir: Path, label: str = "", lookahead: int = 1):
     """Run the full BSP pipeline on one RPLAN sample."""
     name = str(sample.get("name", "unknown"))
     rooms = sample_to_rooms(sample)
@@ -1002,7 +1059,7 @@ def process_sample(sample, output_dir: Path, label: str = ""):
 
     all_rooms_ref = {}
     tree = build_bsp_tree(rooms, boundary, access_edges, depth=0,
-                          all_rooms_ref=all_rooms_ref)
+                          all_rooms_ref=all_rooms_ref, lookahead=lookahead)
     if tree is None:
         return False, "BSP returned None"
 
@@ -1219,7 +1276,7 @@ def _bsp_tree_to_split(node, access_edges, leaf_name_map,
     }
 
 
-def sample_to_hypergraph_entry(sample: dict) -> dict | None:
+def sample_to_hypergraph_entry(sample: dict, lookahead: int = 1) -> dict | None:
     """Run BSP on one RPLAN sample and return a hypergraph dict (or *None*)."""
     name = str(sample.get("name", "unknown"))
     rooms = sample_to_rooms(sample)
@@ -1233,7 +1290,7 @@ def sample_to_hypergraph_entry(sample: dict) -> dict | None:
 
     all_rooms_ref = {}
     tree = build_bsp_tree(rooms, boundary, access_edges_orig, depth=0,
-                          all_rooms_ref=all_rooms_ref)
+                          all_rooms_ref=all_rooms_ref, lookahead=lookahead)
     if tree is None:
         return None
 
@@ -1302,11 +1359,11 @@ def _passes_filter(sample, point_edges_mode):
 
 def _export_worker(args):
     """Top-level worker for multiprocessing export."""
-    sample, point_edges_mode = args
+    sample, point_edges_mode, lookahead = args
     if not _passes_filter(sample, point_edges_mode):
         return None, "skipped"
     try:
-        entry = sample_to_hypergraph_entry(sample)
+        entry = sample_to_hypergraph_entry(sample, lookahead=lookahead)
     except Exception:
         return None, "fail"
     if entry is not None:
@@ -1354,6 +1411,10 @@ def main():
         "--workers", "-j", type=int, default=0,
         help="Number of parallel workers for --export (0 = single process)",
     )
+    parser.add_argument(
+        "--lookahead", type=int, default=1,
+        help="Look-ahead depth for BSP split scoring (0 = greedy, 1 = default)",
+    )
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -1387,7 +1448,7 @@ def main():
 
             entries = []
             ok, fail, skipped = 0, 0, 0
-            work_items = [(s, args.point_edges) for s in candidates]
+            work_items = [(s, args.point_edges, args.lookahead) for s in candidates]
 
             if args.workers > 0:
                 from multiprocessing import Pool
@@ -1432,7 +1493,8 @@ def main():
                     logger.info("Sample #%s skipped by --point-edges=%s",
                                 sample.get("name", "?"), args.point_edges)
                     continue
-                success, info = process_sample(sample, output_dir, split_name)
+                success, info = process_sample(sample, output_dir, split_name,
+                                               lookahead=args.lookahead)
                 if success:
                     ok += 1
                 else:
