@@ -243,7 +243,7 @@ def main():
             lora_suffix = f"epochs{args.epochs}_lora_r{args.lora_r}_alpha{args.lora_alpha}"
         else:
             lora_suffix = f"epochs{args.epochs}_full_finetune"
-        args.output_dir = f"checkpoints/qwen_hypergraph_filtered/{lora_suffix}"
+        args.output_dir = f"checkpoints/qwen_rplan_filtered/{lora_suffix}"
         logger.info(f"Using default output directory: {args.output_dir}")
     
     # Set CUDA_VISIBLE_DEVICES for single-GPU mode only
@@ -348,7 +348,7 @@ def main():
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         report_to=["tensorboard"],
-        save_total_limit=10,  # Keep only last 10 checkpoints
+        save_total_limit=30,  # Keep only last 10 checkpoints
         # DDP-specific settings for better multi-GPU stability
         ddp_find_unused_parameters=False,  # Set to True if you get DDP errors with LoRA
         ddp_backend="nccl" if args.multi_gpu and torch.cuda.is_available() else None,

@@ -8,6 +8,18 @@ Qwen and GPT generation/evaluation scripts.
 import json
 
 
+_OUTSIDE_RULES_TEXT_1 ="""\
+  The only exception is the Outside node. It is a special node that denotes that the room it is connected to has an outside door.
+  Therefore, it should be located by the boundary of the apartment and not be surrounded by other rooms. 
+  However, this node should not be considered part of the accessgraph or part of the list of rooms.
+  """
+
+
+_OUTSIDE_RULES_TEXT_2 ="""\
+  Make sure that the accessgraph respects the Outside property of one of the rooms.
+  """
+
+
 BSP_RULES_TEXT = """\
 # CRITICAL STRUCTURE RULES:
 
@@ -290,6 +302,8 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
+{_OUTSIDE_RULES_TEXT_1}
+
 {_SIMPLE_BSP_RULES_TEXT}
 
 {_SIMPLE_CONNECTIVITY_RULES}
@@ -298,7 +312,7 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph.
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
 
 ### Access Graph:
 ```json
@@ -416,6 +430,8 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
+{_OUTSIDE_RULES_TEXT_1}
+
 {_SIMPLE_BSP_RULES_TEXT}
 
 {_SIMPLE_CONNECTIVITY_RULES}
@@ -424,7 +440,7 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph."""
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"""
 
     return prompt
 
