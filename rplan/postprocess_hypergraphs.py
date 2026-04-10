@@ -17,11 +17,8 @@ reconnect components by adding edges to the leaf ``connected`` lists:
 "Physically adjacent" means the two rooms' mesh polygons overlap when
 slightly scaled (same heuristic as ``Hypergraph.correct_accessgraph``).
 
-Clipper numerical noise (tiny sliver faces in the RGL mesh) is
-filtered at the C# level using a relative area threshold
-(``totalArea * 1e-3``) inside ``SubdivideMultiFaceDirectionClipper``.
-The mesh-level sliver filter in ``_build_physical_adjacency`` handles
-any residual artifacts so face indices align with BSP leaves.
+``_build_physical_adjacency`` requires RGL mesh faces to match BSP
+leaves 1-to-1; samples where this fails are skipped.
 
 Writes repaired splits to new JSON files in an output directory.
 
@@ -49,7 +46,6 @@ from utils.hypergraph import Hypergraph
 logger = logging.getLogger(__name__)
 
 SCALE_FACTOR = 1.05
-SLIVER_MESH_FRAC = 1e-3            # mesh faces < 0.1 % of total mesh area
 
 
 # ── Physical adjacency (mesh-based) ───────────────────────────────────
@@ -57,21 +53,26 @@ SLIVER_MESH_FRAC = 1e-3            # mesh faces < 0.1 % of total mesh area
 def _build_physical_adjacency(hg: Hypergraph, bounds: dict, n_leaves: int):
     """Return edge-adjacent and point-adjacent room pairs.
 
-    Builds face polygons from the RGL mesh and filters out any Clipper
-    sliver artifacts (tiny faces) so that the remaining face indices
-    correspond 1-to-1 with BSP leaf indices.
+    Builds face polygons from the RGL mesh and requires a strict 1-to-1
+    correspondence between mesh faces and BSP leaves.  If the face
+    count does not equal *n_leaves* the function bails out, since
+    index alignment cannot be guaranteed.
 
     Returns
     -------
     (edge_adj, point_adj, ok)
-        *ok* is True when the (filtered) face count matches *n_leaves*.
+        *ok* is True when the face count matches *n_leaves*.
     """
     mesh = hg.to_mesh(bounds=bounds)
     raw_count = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    if raw_count <= 0:
+    if raw_count != n_leaves:
+        logger.debug(
+            "Mesh face count (%d) != leaves (%d); skipping fix.",
+            raw_count, n_leaves,
+        )
         return set(), set(), False
 
-    face_data = []
+    raw_polys = []
     for fi in range(raw_count):
         f = mesh.faceList[fi]
         pts = f.getPoints()
@@ -79,31 +80,8 @@ def _build_physical_adjacency(hg: Hypergraph, bounds: dict, n_leaves: int):
             (float(pts[j].X), float(pts[j].Y))
             for j in range(int(getattr(pts, "Count", 0) or 0))
         ]
-        poly = Polygon(corners) if len(corners) >= 3 else Polygon()
-        face_data.append((fi, poly, poly.area if not poly.is_empty else 0.0))
+        raw_polys.append(Polygon(corners) if len(corners) >= 3 else Polygon())
 
-    total_mesh_area = sum(a for _, _, a in face_data)
-    min_face_area = total_mesh_area * SLIVER_MESH_FRAC
-    kept = [(fi, poly) for fi, poly, area in face_data
-            if area > min_face_area]
-
-    if len(kept) != n_leaves:
-        logger.debug(
-            "Face count after sliver filter (%d) != leaves (%d) "
-            "(raw mesh had %d faces).",
-            len(kept), n_leaves, raw_count,
-        )
-        if len(kept) > n_leaves:
-            face_data_sorted = sorted(face_data, key=lambda x: x[2])
-            excess = len(kept) - n_leaves
-            drop_indices = {fd[0] for fd in face_data_sorted[:excess]}
-            kept = [(fi, poly) for fi, poly, area in face_data
-                    if fi not in drop_indices and area > 0]
-
-        if len(kept) != n_leaves:
-            return set(), set(), False
-
-    raw_polys = [poly for _, poly in kept]
     scaled_polys = [
         _scale(p, xfact=SCALE_FACTOR, yfact=SCALE_FACTOR, origin="centroid")
         if not p.is_empty else p
