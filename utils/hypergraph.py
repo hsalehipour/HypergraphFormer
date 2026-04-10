@@ -942,10 +942,24 @@ class HypergraphPlotter:
 
     ROOM_COLOR_MAP = ROOM_COLORS  # legacy alias
 
+    MESH_SLIVER_FRAC = 1e-3  # faces < 0.1 % of total mesh area are Clipper noise
+
     def __init__(self, color_map=None):
         self.color_map = color_map if color_map is not None else self.ROOM_COLORS
 
     # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _mesh_min_area(face_list):
+        """Return the minimum visible face area for *face_list*.
+
+        Sums every face's area, then returns
+        ``total * MESH_SLIVER_FRAC``.  Faces below this value are
+        Clipper numerical artifacts and should be skipped when rendering.
+        """
+        total = sum(getattr(face_list[i], 'Area', 0)
+                    for i in range(face_list.Count))
+        return total * HypergraphPlotter.MESH_SLIVER_FRAC
 
     @staticmethod
     def create_color_map_with_roomtype(graph):
@@ -1295,10 +1309,13 @@ class HypergraphPlotter:
         room_types_plotted = set()
 
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_counts[room_type] = room_counts.get(room_type, 0) + 1
 
@@ -1379,10 +1396,13 @@ class HypergraphPlotter:
 
         total_area = 0
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_corners = []
                 for j in range(face.getPoints().Count):
@@ -1426,8 +1446,11 @@ class HypergraphPlotter:
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 10))
+        min_area = self._mesh_min_area(mesh.faceList)
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
+            if getattr(face, 'Area', 0) < min_area:
+                continue
             room_type = getattr(face, 'merge_id', 'unknown')
             points = face.getPoints()
             corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
@@ -1470,11 +1493,15 @@ class HypergraphPlotter:
             by = [p[1] for p in boundary_polygon] + [boundary_polygon[0][1]]
             ax.plot(bx, by, 'k-', linewidth=2)
 
+        min_area = self._mesh_min_area(mesh.faceList)
         total_area = 0
+        label_idx = 0
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
             room_type = getattr(face, 'merge_id', 'unknown')
             area_val = getattr(face, 'Area', 0)
+            if area_val < min_area:
+                continue
             total_area += area_val
             points = face.getPoints()
             corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
@@ -1484,8 +1511,10 @@ class HypergraphPlotter:
             x, y = poly.exterior.xy
             color = self.color_map.get(room_type, '#D3D3D3')
             ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
-            label = (face_labels[i] if face_labels is not None and i < len(face_labels)
+            label = (face_labels[label_idx]
+                     if face_labels is not None and label_idx < len(face_labels)
                      else room_type)
+            label_idx += 1
             ax.text(np.mean(list(x)), np.mean(list(y)), label,
                     ha='center', va='center', fontsize=8, fontweight='bold')
 

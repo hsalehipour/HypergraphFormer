@@ -213,8 +213,8 @@ def main():
         help="Which split(s) to visualise (default: train)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="rplan_disconnected_vis",
-        help="Save figures here (default: rplan_disconnected_vis)",
+        "--output-dir", type=str, default="rplan_rgl_vis",
+        help="Save figures here (default: rplan_rgl_vis)",
     )
     parser.add_argument(
         "--max", type=int, default=None,

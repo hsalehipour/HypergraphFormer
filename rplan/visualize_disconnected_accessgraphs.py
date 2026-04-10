@@ -12,7 +12,7 @@ produces a side-by-side figure:
 Usage:
     python rplan/detect_disconnected_accessgraphs.py
     python rplan/detect_disconnected_accessgraphs.py --split test --max 10
-    python rplan/detect_disconnected_accessgraphs.py --output-dir docs/disconnected
+    python rplan/detect_disconnected_accessgraphs.py --output-dir dataset/rplan/disconnected
 """
 
 from __future__ import annotations
