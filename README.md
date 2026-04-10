@@ -48,7 +48,7 @@ source .venv/bin/activate
 # Python packages
 pip install -r requirements.txt
 
-# Editable install (makes utils, scripts, benchmark, msd importable as packages)
+# Editable install (makes utils, scripts, benchmark, msd, rplan importable as packages)
 pip install -e .
 
 # External repos (geometry library + HouseGAN++ baseline)
@@ -97,6 +97,16 @@ HypergraphFormer/
 │   │  # Post-inference scoring (--metrics ged accuracy delta)
 │   └── score_results.py             Score saved results against ground truth
 │
+├── rplan/                          # ── RPLAN dataset processing ───────
+│   ├── build_dataset_access.py      Build access graphs from DiffPlanner + original PNGs
+│   ├── rplan_to_hypergraph.py       Native Python BSP conversion (with look-ahead
+│   │                                      and evolutionary search)
+│   ├── rplan_to_hypergraph_rgl.py   RGL-based BSP conversion (C# geometry library)
+│   ├── postprocess_hypergraphs.py   Fix disconnected access graphs
+│   ├── visualize_rplan_hypergraph.py            Visualize BSP + RGL mesh
+│   ├── visualize_disconnected_accessgraphs.py   Visualize disconnected samples
+│   └── visualize_fixed_accessgraphs.py          Before/after comparison
+│
 ├── utils/                          # ── Shared utility library ─────────
 │   ├── __init__.py                     Public API re-exports
 │   ├── utils.py                        Validation, JSON extraction, timeout
@@ -107,9 +117,15 @@ HypergraphFormer/
 │   └── benchmark_qwen_inference.py     Inference timing benchmark
 │
 ├── dataset/                        # ── Raw datasets ───────────────────
-│   ├── hypergraph/                      train.json, validation.json, test.json
-│   ├── msd/                            Modified Swiss Dwellings CSV
-│   └── furniture_json/                 Furniture placement data
+│   ├── hypergraph/                      Hypergraph1k: train.json, validation.json, test.json
+│   ├── rplan/                           RPLAN data (see "Preparing the RPLAN Dataset")
+│   │   ├── dataset_original/               RPLAN floorplan PNGs (downloaded)
+│   │   ├── dataset_diffplanner/            DiffPlanner JSON splits (downloaded)
+│   │   ├── dataset_access/                 Access graphs (built from above)
+│   │   ├── dataset_hypergraph_la0/         BSP hypergraphs (exported)
+│   │   └── dataset_hypergraph_la0_fixed/   Post-processed (access graphs fixed)
+│   ├── msd/                             Modified Swiss Dwellings CSV
+│   └── furniture_json/                  Furniture placement data
 │
 ├── eval_format/                    # ── Prepared evaluation data ───────
 │   ├── train/                          779 .txt files (accessgraph + hypergraph)
@@ -128,17 +144,108 @@ HypergraphFormer/
 │   ├── eval_housediffusion.sh
 │   ├── finetune_houseganpp.sh
 │   ├── finetune_housediffusion.sh
+│   ├── utils/
+│   │   ├── convert_hypergraph_to_rplan.py
+│   │   └── convert_hypergraph_to_diffplanner.py
 │   └── src/
 │
 ├── notebooks/                      # Jupyter notebooks
 │   └── generate_and_visualize_hypergraphs.ipynb
 │
-├── run_fewshot_experiments.sh       # Batch few-shot experiments + scoring
+├── prepare_rplan_hypergraph.sh     # End-to-end RPLAN pipeline (download, build, export)
+├── run_fewshot_experiments.sh      # Batch few-shot experiments + scoring
+├── setup_hypergraph.sh             # Clone & build C# geometry library
 ├── pyproject.toml                  # Editable install config (pip install -e .)
 ├── requirements.txt
-├── setup_hypergraph.sh
 └── README.md
 ```
+
+---
+
+## Preparing the RPLAN Dataset
+
+The RPLAN pipeline converts the raw [RPLAN](https://wutomwu.github.io/particulars.html?id=1)
+floor-plan images into BSP-tree hypergraphs.  The automated script handles
+downloading, building, and exporting:
+
+```bash
+# Full pipeline (downloads data, exports hypergraphs, fixes access graphs)
+./prepare_rplan_hypergraph.sh --access
+
+# Reuse existing dataset_access (faster, skips step 3)
+./prepare_rplan_hypergraph.sh
+
+# Clean rebuild of hypergraph data only
+./prepare_rplan_hypergraph.sh --clean
+
+# Also generate debug visualizations of remaining disconnections
+./prepare_rplan_hypergraph.sh --debug
+
+# Override worker count (default: nproc)
+./prepare_rplan_hypergraph.sh -j 32
+```
+
+The pipeline runs the following steps:
+
+1. **Download RPLAN original dataset** — Floorplan PNGs from
+   [Box](https://berkeley.app.box.com/s/m8369bxmaixananf4otajydraxa7y92v)
+   → `dataset/rplan/dataset_original/`
+2. **Download DiffPlanner data** — Room annotations from
+   [GitHub](https://github.com/shidong-wang/DiffPlanner/releases) →
+   `dataset/rplan/dataset_diffplanner/`
+3. **Build access graphs** (`--access`) — Extracts door positions from the
+   original PNGs and matches them to DiffPlanner room annotations →
+   `dataset/rplan/dataset_access/`
+4. **Export BSP hypergraphs** — Pure-Python BSP conversion with configurable
+   look-ahead scoring → `dataset/rplan/dataset_hypergraph_la0/`
+5. **Post-process** — Fixes disconnected access graphs by adding edges between
+   physically adjacent rooms → `dataset/rplan/dataset_hypergraph_la0_fixed/`
+6. **Debug visualization** (`--debug`) — Renders remaining disconnected samples
+   for manual inspection → `debug/`
+
+### BSP Conversion Details
+
+The native Python BSP converter (`rplan/rplan_to_hypergraph.py`) supports
+several split-selection strategies:
+
+```bash
+# Greedy (fastest)
+python rplan/rplan_to_hypergraph.py --export --lookahead 0 -j 64
+
+# 1-step look-ahead (default)
+python rplan/rplan_to_hypergraph.py --export --lookahead 1 -j 64
+
+# Evolutionary search (slowest, highest quality)
+python rplan/rplan_to_hypergraph.py --export --evolve --evo-pop 100 --evo-gens 30 -j 64
+```
+
+The split selection optimizes for: (1) minimizing the number of cuts through
+adjacent rooms, (2) balanced area splits, and (3) reasonable aspect ratios.
+
+### Visualization
+
+```bash
+# Visualize specific samples (BSP + RGL mesh side by side)
+python rplan/visualize_rplan_hypergraph.py --sample 3951 57395
+
+# Visualize disconnected access graphs in a dataset
+python rplan/visualize_disconnected_accessgraphs.py \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug
+
+# Compare before/after access graph fixes
+python rplan/visualize_fixed_accessgraphs.py \
+    --before-dir dataset/rplan/dataset_hypergraph_la0 \
+    --after-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug_fixed
+```
+
+### RPLAN Dataset Statistics
+
+| Split | Samples |
+|---|---|
+| Train | 56,053 |
+| Val | 12,018 |
+| Test | 12,002 |
+| **Total** | **80,073** |
 
 ---
 
@@ -349,7 +456,7 @@ The `utils/` package provides shared helpers used by the pipeline scripts:
 
 | Module | Contents |
 |---|---|
-| `utils/hypergraph.py` | `Hypergraph` class (validation, transformers, RGL integration, parsing), `HypergraphPlotter` |
+| `utils/hypergraph.py` | `Hypergraph` class (validation, transformers, RGL integration, parsing, access-graph component analysis), `HypergraphPlotter` (mesh sliver filtering, `unique_id`-based face labelling) |
 | `utils/utils.py` | `validate_hypergraph`, `TimeoutException`, `time_limit`, JSON extraction helpers |
 | `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `room_type_accuracy`, `compute_room_type_accuracy`, `bucketed_room_accuracy`, `produce_room_list` |
 | `utils/prompts.py` | BSP rules text, prompt templates (`create_structured_prompt`, `create_simple_prompt`, etc.) |
@@ -364,7 +471,7 @@ The `utils/` package provides shared helpers used by the pipeline scripts:
 
 - **Location**: `~/REPOs/hypergraph`
 - **Purpose**: Hypergraph construction and geometry operations via pythonnet
-- **Setup**: `./setup_hypergraph.sh`
+- **Setup**: `./setup_hypergraph.sh` (clones repo, builds DLLs, installs as editable package)
 - **Import**: `from hypergraph.api.lib.tools import RGL`
 
 ### houseganpp (Baseline GAN)
@@ -380,7 +487,7 @@ Both repositories remain **unmodified** and are cloned as external dependencies.
 
 ## Troubleshooting
 
-### "No module named 'utils'" (or scripts, benchmark, msd)
+### "No module named 'utils'" (or scripts, benchmark, msd, rplan)
 
 ```bash
 pip install -e .   # editable install — makes project packages importable
@@ -434,6 +541,24 @@ apartments.  It is split 7:1:1 into train / validation / test sets.
 - **Format**: Pre-split JSON files (`train.json`, `validation.json`, `test.json`)
 - **Use**: Primary dataset for training and evaluation
 
+### RPLAN Dataset
+
+The [RPLAN](https://doi.org/10.1145/3355089.3356524) dataset contains ~80,000
+real-world residential floor plans.  We convert each sample into a BSP-tree
+hypergraph using the pipeline described in
+[Preparing the RPLAN Dataset](#preparing-the-rplan-dataset).
+
+| Split | Samples |
+|---|---|
+| Train | 56,053 |
+| Val | 12,018 |
+| Test | 12,002 |
+| **Total** | **80,073** |
+
+- **Location**: `dataset/rplan/dataset_hypergraph_la0_fixed/`
+- **Format**: Pre-split JSON files (`train.json`, `val.json`, `test.json`)
+- **Use**: Large-scale training and evaluation
+
 ### Modified Swiss Dwellings (MSD)
 
 - **Location**: `dataset/msd/`
@@ -466,5 +591,5 @@ If you use this code or the Hypergraph1k dataset, please cite:
 ---
 
 **Project**: HypergraphFormer
-**Last Updated**: 2026-03-16
+**Last Updated**: 2026-04-10
 **Python**: 3.9+

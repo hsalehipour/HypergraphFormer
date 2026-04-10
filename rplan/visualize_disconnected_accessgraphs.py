@@ -2,7 +2,7 @@
 """
 Detect and visualize floor plans with disconnected access graphs.
 
-Scans the Hypergraph1k dataset for samples whose access graph consists of
+Scans the RPLAN dataset for samples whose access graph consists of
 two or more isolated connected components.  For each disconnected sample,
 produces a side-by-side figure:
 
@@ -10,9 +10,9 @@ produces a side-by-side figure:
     Right -- RGL mesh floor plan with boundary (via subdivideWithMeshRatio).
 
 Usage:
-    python scripts/detect_disconnected_accessgraphs.py
-    python scripts/detect_disconnected_accessgraphs.py --split test --max 10
-    python scripts/detect_disconnected_accessgraphs.py --output-dir docs/disconnected
+    python rplan/detect_disconnected_accessgraphs.py
+    python rplan/detect_disconnected_accessgraphs.py --split test --max 10
+    python rplan/detect_disconnected_accessgraphs.py --output-dir dataset/rplan/disconnected
 """
 
 from __future__ import annotations
@@ -74,16 +74,16 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Detect and visualise disconnected access graphs "
-                    "in the Hypergraph1k dataset.",
+                    "in the RPLAN dataset.",
     )
     parser.add_argument(
-        "--dataset-dir", type=str, default="dataset/hypergraph",
+        "--dataset-dir", type=str, default="dataset/rplan/dataset_access",
         help="Directory containing train.json / validation.json / test.json",
     )
     parser.add_argument(
         "--split", type=str, nargs="*",
-        default=["train", "validation", "test"],
-        choices=["train", "validation", "test"],
+        default=["train", "val", "test"],
+        choices=["train", "val", "test"],
         help="Which split(s) to scan (default: all three)",
     )
     parser.add_argument(
@@ -145,10 +145,6 @@ def main():
             )
 
             distinct = plotter.make_distinct_labels(ag)
-            face_labels = [
-                distinct.get(str(i + 1), f"room{i + 1}")
-                for i in range(n_nodes)
-            ]
 
             plotter.plot_access_graph_on_axis(
                 ag, ax_left, title="Access Graph",
@@ -162,6 +158,8 @@ def main():
                 polygon = [(c["X"], c["Y"]) for c in corners]
                 try:
                     mesh = hg.to_mesh(bounds=bounds)
+                    face_labels = hg.mesh_face_labels(
+                        mesh, distinct=distinct)
                     plotter.plot_mesh_on_axis(
                         mesh, ax_right,
                         boundary_polygon=polygon,
