@@ -14,8 +14,8 @@ Only samples that were actually repaired (were disconnected in the original
 data and are now connected in the fixed data) are visualised.
 
 Usage:
-    python dataset/hypergraph/visualize_fixed_accessgraphs.py
-    python dataset/hypergraph/visualize_fixed_accessgraphs.py --output-dir dataset/disconnected_fixed_vis
+    python rplan/visualize_fixed_accessgraphs.py
+    python rplan/visualize_fixed_accessgraphs.py --output-dir dataset/disconnected_fixed_vis
 """
 
 from __future__ import annotations
@@ -76,24 +76,24 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Visualize fixed access-graph cases from the Hypergraph1k dataset.",
+        description="Visualize fixed access-graph cases from the RPLAN dataset.",
     )
     parser.add_argument(
-        "--original-dir", type=str, default="dataset/hypergraph",
+        "--original-dir", type=str, default="dataset/rplan/dataset_hypergraph",
         help="Directory with the original train.json / validation.json / test.json",
     )
     parser.add_argument(
-        "--fixed-dir", type=str, default="dataset/hypergraph_fixed",
+        "--fixed-dir", type=str, default="dataset/rplan/dataset_hypergraph_fixed",
         help="Directory with the fixed train.json / validation.json / test.json",
     )
     parser.add_argument(
         "--split", type=str, nargs="*",
-        default=["train", "validation", "test"],
-        choices=["train", "validation", "test"],
+        default=["train", "val", "test"],
+        choices=["train", "val", "test"],
         help="Which split(s) to process (default: all three)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="dataset/disconnected_fixed_vis",
+        "--output-dir", type=str, default="dataset/rplan/disconnected_fixed_vis",
         help="Save figures to this directory (per-split sub-folders)",
     )
     args = parser.parse_args()
@@ -162,11 +162,6 @@ def main():
             distinct = plotter.make_distinct_labels(ag)
             distinct_orig = plotter.make_distinct_labels(ag_orig)
 
-            face_labels = [
-                distinct.get(str(i + 1), f"room{i + 1}")
-                for i in range(n_nodes)
-            ]
-
             components_orig = hg_orig.access_graph_components()
             plotter.plot_access_graph_on_axis(
                 ag_orig, ax_orig, title="Original (disconnected)",
@@ -185,6 +180,8 @@ def main():
                 polygon = [(c["X"], c["Y"]) for c in corners]
                 try:
                     mesh = hg_fixed.to_mesh(bounds=bounds)
+                    face_labels = hg_fixed.mesh_face_labels(
+                        mesh, distinct=distinct)
                     plotter.plot_mesh_on_axis(
                         mesh, ax_right,
                         boundary_polygon=polygon,

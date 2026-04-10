@@ -8,4 +8,4 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["utils*", "scripts*", "benchmark*", "msd*"]
+include = ["utils*", "rplan*", "scripts*", "benchmark*", "msd*"]

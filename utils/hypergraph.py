@@ -555,6 +555,49 @@ class Hypergraph:
         data_node = RGL.DataNode.deserializeDataNode(json.dumps(hg_ratio))
         return RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
 
+    def mesh_face_labels(self, mesh, distinct=None) -> list:
+        """Build display labels for each face in an assembled RGL mesh.
+
+        Uses ``unique_id`` metadata on each face to map it back to the
+        corresponding BSP leaf / access-graph node, then produces a
+        human-readable label (e.g. ``living1``, ``kitchen``).
+
+        Args:
+            mesh: RGL NMesh returned by :meth:`to_mesh`.
+            distinct: Optional dict mapping access-graph node-id to
+                label string (as returned by
+                :meth:`HypergraphPlotter.make_distinct_labels`).
+                When *None*, labels are built automatically from
+                :pyattr:`access_graph`.
+
+        Returns:
+            List of label strings, one per face in ``mesh.faceList``.
+        """
+        leaf_name_to_ag_id = {
+            leaf["name"]: str(i + 1)
+            for i, leaf in enumerate(self.leaves)
+        }
+
+        if distinct is None:
+            ag = self.access_graph
+            ag_rooms = {
+                "nodes": {k: v for k, v in ag.get("nodes", {}).items()
+                          if k != "outside"},
+                "edges": [e for e in ag.get("edges", [])
+                          if "outside" not in e],
+            }
+            distinct = HypergraphPlotter.make_distinct_labels(ag_rooms)
+
+        n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+        labels = []
+        for i in range(n):
+            face = mesh.faceList[i]
+            uid = getattr(face, 'unique_id', '')
+            ag_id = leaf_name_to_ag_id.get(uid, '')
+            labels.append(
+                distinct.get(ag_id, getattr(face, 'merge_id', 'unknown')))
+        return labels
+
     def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
         """Correct access graph to match mesh adjacency. Returns {nodes, edges} dict."""
         import networkx as nx
@@ -894,14 +937,29 @@ class HypergraphPlotter:
         'storage': '#5254a3',
         'storeroom': '#5254a3',
         'stairs': '#72246c',
+        'outside': '#FF0000',
     }
 
     ROOM_COLOR_MAP = ROOM_COLORS  # legacy alias
+
+    MESH_SLIVER_FRAC = 1e-3  # faces < 0.1 % of total mesh area are Clipper noise
 
     def __init__(self, color_map=None):
         self.color_map = color_map if color_map is not None else self.ROOM_COLORS
 
     # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _mesh_min_area(face_list):
+        """Return the minimum visible face area for *face_list*.
+
+        Sums every face's area, then returns
+        ``total * MESH_SLIVER_FRAC``.  Faces below this value are
+        Clipper numerical artifacts and should be skipped when rendering.
+        """
+        total = sum(getattr(face_list[i], 'Area', 0)
+                    for i in range(face_list.Count))
+        return total * HypergraphPlotter.MESH_SLIVER_FRAC
 
     @staticmethod
     def create_color_map_with_roomtype(graph):
@@ -1251,10 +1309,13 @@ class HypergraphPlotter:
         room_types_plotted = set()
 
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_counts[room_type] = room_counts.get(room_type, 0) + 1
 
@@ -1335,10 +1396,13 @@ class HypergraphPlotter:
 
         total_area = 0
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_corners = []
                 for j in range(face.getPoints().Count):
@@ -1382,8 +1446,11 @@ class HypergraphPlotter:
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 10))
+        min_area = self._mesh_min_area(mesh.faceList)
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
+            if getattr(face, 'Area', 0) < min_area:
+                continue
             room_type = getattr(face, 'merge_id', 'unknown')
             points = face.getPoints()
             corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
@@ -1426,11 +1493,14 @@ class HypergraphPlotter:
             by = [p[1] for p in boundary_polygon] + [boundary_polygon[0][1]]
             ax.plot(bx, by, 'k-', linewidth=2)
 
+        min_area = self._mesh_min_area(mesh.faceList)
         total_area = 0
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
             room_type = getattr(face, 'merge_id', 'unknown')
             area_val = getattr(face, 'Area', 0)
+            if area_val < min_area:
+                continue
             total_area += area_val
             points = face.getPoints()
             corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
@@ -1440,7 +1510,8 @@ class HypergraphPlotter:
             x, y = poly.exterior.xy
             color = self.color_map.get(room_type, '#D3D3D3')
             ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
-            label = (face_labels[i] if face_labels is not None and i < len(face_labels)
+            label = (face_labels[i]
+                     if face_labels is not None and i < len(face_labels)
                      else room_type)
             ax.text(np.mean(list(x)), np.mean(list(y)), label,
                     ha='center', va='center', fontsize=8, fontweight='bold')
