@@ -145,10 +145,6 @@ def main():
             )
 
             distinct = plotter.make_distinct_labels(ag)
-            face_labels = [
-                distinct.get(str(i + 1), f"room{i + 1}")
-                for i in range(n_nodes)
-            ]
 
             plotter.plot_access_graph_on_axis(
                 ag, ax_left, title="Access Graph",
@@ -162,6 +158,8 @@ def main():
                 polygon = [(c["X"], c["Y"]) for c in corners]
                 try:
                     mesh = hg.to_mesh(bounds=bounds)
+                    face_labels = hg.mesh_face_labels(
+                        mesh, distinct=distinct)
                     plotter.plot_mesh_on_axis(
                         mesh, ax_right,
                         boundary_polygon=polygon,

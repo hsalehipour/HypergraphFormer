@@ -51,58 +51,76 @@ SCALE_FACTOR = 1.05
 # ── Physical adjacency (mesh-based) ───────────────────────────────────
 
 def _build_physical_adjacency(hg: Hypergraph, bounds: dict, n_leaves: int):
-    """Return edge-adjacent and point-adjacent room pairs.
+    """Return edge-adjacent and point-adjacent room pairs (by leaf index).
 
-    Builds face polygons from the RGL mesh and requires a strict 1-to-1
-    correspondence between mesh faces and BSP leaves.  If the face
-    count does not equal *n_leaves* the function bails out, since
-    index alignment cannot be guaranteed.
+    Each mesh face carries a ``unique_id`` that matches a BSP leaf
+    ``name``.  Faces are mapped to leaf indices via this ID, so extra
+    degenerate Clipper faces (duplicates with zero area) are handled
+    gracefully — they simply map to the same leaf.
 
     Returns
     -------
     (edge_adj, point_adj, ok)
-        *ok* is True when the face count matches *n_leaves*.
+        Adjacency sets contain ``(leaf_i, leaf_j)`` pairs.
+        *ok* is True when every leaf has at least one mesh face.
     """
     mesh = hg.to_mesh(bounds=bounds)
     raw_count = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    if raw_count != n_leaves:
-        logger.debug(
-            "Mesh face count (%d) != leaves (%d); skipping fix.",
-            raw_count, n_leaves,
-        )
+    if raw_count <= 0:
         return set(), set(), False
 
-    raw_polys = []
+    leaves = hg.leaves
+    name_to_idx = {leaf["name"]: i for i, leaf in enumerate(leaves)}
+
+    # Group faces by leaf index via unique_id.
+    leaf_polys: dict[int, list[Polygon]] = {i: [] for i in range(n_leaves)}
     for fi in range(raw_count):
         f = mesh.faceList[fi]
+        uid = str(getattr(f, "unique_id", ""))
+        li = name_to_idx.get(uid, -1)
+        if li < 0:
+            continue
         pts = f.getPoints()
         corners = [
             (float(pts[j].X), float(pts[j].Y))
             for j in range(int(getattr(pts, "Count", 0) or 0))
         ]
-        raw_polys.append(Polygon(corners) if len(corners) >= 3 else Polygon())
+        poly = Polygon(corners) if len(corners) >= 3 else Polygon()
+        if not poly.is_empty and poly.area > 0:
+            leaf_polys[li].append(poly)
 
-    scaled_polys = [
+    empty_leaves = [i for i in range(n_leaves) if not leaf_polys[i]]
+    if empty_leaves:
+        logger.debug(
+            "%d leaf(es) have no mesh faces: %s", len(empty_leaves), empty_leaves,
+        )
+        return set(), set(), False
+
+    from shapely.ops import unary_union
+
+    merged: list[Polygon] = []
+    for i in range(n_leaves):
+        u = unary_union(leaf_polys[i])
+        merged.append(u)
+
+    scaled = [
         _scale(p, xfact=SCALE_FACTOR, yfact=SCALE_FACTOR, origin="centroid")
         if not p.is_empty else p
-        for p in raw_polys
+        for p in merged
     ]
 
     edge_adj: set[tuple[int, int]] = set()
     point_adj: set[tuple[int, int]] = set()
-    n = len(raw_polys)
-    for i in range(n):
-        if raw_polys[i].is_empty:
+    for i in range(n_leaves):
+        if merged[i].is_empty:
             continue
-        for j in range(i + 1, n):
-            if raw_polys[j].is_empty:
+        for j in range(i + 1, n_leaves):
+            if merged[j].is_empty:
                 continue
             try:
-                if scaled_polys[i].intersection(scaled_polys[j]).area > 1e-12:
-                    ix = raw_polys[i].intersection(raw_polys[j])
-                    if ix.is_empty:
-                        point_adj.add((i, j))
-                    elif ix.geom_type in ("Point", "MultiPoint"):
+                if scaled[i].intersection(scaled[j]).area > 1e-12:
+                    ix = merged[i].intersection(merged[j])
+                    if ix.is_empty or ix.geom_type in ("Point", "MultiPoint"):
                         point_adj.add((i, j))
                     else:
                         edge_adj.add((i, j))
