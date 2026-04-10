@@ -1495,7 +1495,6 @@ class HypergraphPlotter:
 
         min_area = self._mesh_min_area(mesh.faceList)
         total_area = 0
-        label_idx = 0
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
             room_type = getattr(face, 'merge_id', 'unknown')
@@ -1511,10 +1510,9 @@ class HypergraphPlotter:
             x, y = poly.exterior.xy
             color = self.color_map.get(room_type, '#D3D3D3')
             ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
-            label = (face_labels[label_idx]
-                     if face_labels is not None and label_idx < len(face_labels)
+            label = (face_labels[i]
+                     if face_labels is not None and i < len(face_labels)
                      else room_type)
-            label_idx += 1
             ax.text(np.mean(list(x)), np.mean(list(y)), label,
                     ha='center', va='center', fontsize=8, fontweight='bold')
 

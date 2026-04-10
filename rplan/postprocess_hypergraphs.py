@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
 """
-Post-process exported hypergraphs: prune BSP slivers, then fix
-disconnected access graphs.
-
-**Step 1 — Sliver pruning**
-
-BSP subdivision can produce tiny leaf fragments (slivers) when room
-edges don't perfectly align.  These slivers also cause the RGL mesh
-reconstruction to generate extra Clipper artifact faces, leading to
-face-count / leaf-count mismatches that block later repairs.
-
-For each sample, leaves whose area is below a fraction of the total
-floor area are collapsed: the parent split node is replaced by the
-non-sliver sibling, and ``connected`` references to the pruned leaf
-are removed from the rest of the tree.
-
-**Step 2 — Access-graph reconnection**
+Post-process exported hypergraphs: fix disconnected access graphs.
 
 For each sample with a disconnected access graph, attempts to
 reconnect components by adding edges to the leaf ``connected`` lists:
@@ -31,6 +16,12 @@ reconnect components by adding edges to the leaf ``connected`` lists:
 
 "Physically adjacent" means the two rooms' mesh polygons overlap when
 slightly scaled (same heuristic as ``Hypergraph.correct_accessgraph``).
+
+Clipper numerical noise (tiny sliver faces in the RGL mesh) is
+filtered at the C# level using a relative area threshold
+(``totalArea * 1e-3``) inside ``SubdivideMultiFaceDirectionClipper``.
+The mesh-level sliver filter in ``_build_physical_adjacency`` handles
+any residual artifacts so face indices align with BSP leaves.
 
 Writes repaired splits to new JSON files in an output directory.
 
@@ -50,7 +41,6 @@ import logging
 import sys
 from pathlib import Path
 
-import networkx as nx
 from shapely.affinity import scale as _scale
 from shapely.geometry import Polygon
 
@@ -59,91 +49,10 @@ from utils.hypergraph import Hypergraph
 logger = logging.getLogger(__name__)
 
 SCALE_FACTOR = 1.05
-SLIVER_AREA_FRAC = 0.003          # leaves < 0.3 % of total area
 SLIVER_MESH_FRAC = 1e-3            # mesh faces < 0.1 % of total mesh area
 
 
-# ── Step 1: sliver pruning ────────────────────────────────────────────
-
-def _tree_total_area(node: dict) -> float:
-    """Sum of all leaf areas in the subtree."""
-    if node.get("final", False):
-        return node.get("area", 0.0)
-    return sum(_tree_total_area(c) for c in node.get("children", []))
-
-
-def _remove_connected_refs(node: dict, name: str):
-    """Recursively strip *name* from every leaf's ``connected`` list."""
-    if node.get("final", False):
-        conn = node.get("connected")
-        if conn and name in conn:
-            conn.remove(name)
-        return
-    for child in node.get("children", []):
-        _remove_connected_refs(child, name)
-
-
-def _prune_slivers_recursive(
-    node: dict, min_area: float, pruned_names: list[str],
-) -> int:
-    """Bottom-up removal of sliver leaves.
-
-    When a leaf's area < *min_area*, its parent split is replaced
-    in-place by the sibling subtree.  The pruned leaf's name is
-    appended to *pruned_names* for a later full-tree cleanup pass.
-
-    Returns the number of slivers removed.
-    """
-    if node.get("final", False):
-        return 0
-
-    children = node.get("children", [])
-    if len(children) != 2:
-        return 0
-
-    removed = 0
-    for child in children:
-        removed += _prune_slivers_recursive(child, min_area, pruned_names)
-
-    children = node.get("children", [])
-    if len(children) != 2:
-        return removed
-
-    for i, child in enumerate(children):
-        if child.get("final", False) and child.get("area", 0) < min_area:
-            sibling = children[1 - i]
-            sliver_name = child.get("name", "")
-            node.clear()
-            node.update(sibling)
-            if sliver_name:
-                pruned_names.append(sliver_name)
-            removed += 1
-            break
-
-    return removed
-
-
-def prune_tree_slivers(
-    hg_dict: dict,
-    min_frac: float = SLIVER_AREA_FRAC,
-) -> tuple[dict, int]:
-    """Remove sliver leaves from a BSP tree dict (in-place on a copy).
-
-    Returns ``(pruned_dict, n_removed)``.
-    """
-    pruned = copy.deepcopy(hg_dict)
-    total_area = _tree_total_area(pruned)
-    if total_area <= 0:
-        return pruned, 0
-    min_area = total_area * min_frac
-    pruned_names: list[str] = []
-    n_removed = _prune_slivers_recursive(pruned, min_area, pruned_names)
-    for name in pruned_names:
-        _remove_connected_refs(pruned, name)
-    return pruned, n_removed
-
-
-# ── Step 2: physical adjacency (mesh-based) ───────────────────────────
+# ── Physical adjacency (mesh-based) ───────────────────────────────────
 
 def _build_physical_adjacency(hg: Hypergraph, bounds: dict, n_leaves: int):
     """Return edge-adjacent and point-adjacent room pairs.
@@ -339,26 +248,17 @@ def fix_access_graph(hg_dict: dict, bounds: dict) -> tuple[dict, int]:
 
 def _fix_worker(work_item):
     """Top-level worker for multiprocessing."""
-    idx, item, sliver_frac = work_item
+    idx, item = work_item
     split_str = item.get("split", "")
     if not split_str:
-        return idx, item, "skip", 0
+        return idx, item, "skip"
 
     hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
-
-    # --- Step 1: prune BSP slivers ---
-    hg_dict, n_slivers = prune_tree_slivers(hg_dict, min_frac=sliver_frac)
-
     hg = Hypergraph(hg_dict)
 
     if hg.is_access_graph_connected():
-        patched = dict(item)
-        patched["split"] = json.dumps(hg_dict)
-        status = "connected" if n_slivers == 0 else f"pruned:{n_slivers}"
-        return idx, patched, status, n_slivers
+        return idx, item, "connected"
 
-    # --- Step 2: fix disconnected access graph ---
-    item_id = item.get("id", f"item_{idx}")
     bounds_str = item.get("bounds", "")
     bounds = (
         json.loads(bounds_str)
@@ -367,16 +267,12 @@ def _fix_worker(work_item):
     )
 
     if not bounds or not isinstance(bounds, dict):
-        patched = dict(item)
-        patched["split"] = json.dumps(hg_dict)
-        return idx, patched, "no_bounds", n_slivers
+        return idx, item, "no_bounds"
 
     try:
         fixed_dict, n_added = fix_access_graph(hg_dict, bounds)
     except Exception:
-        patched = dict(item)
-        patched["split"] = json.dumps(hg_dict)
-        return idx, patched, "error", n_slivers
+        return idx, item, "error"
 
     hg_after = Hypergraph(fixed_dict)
     now_connected = hg_after.is_access_graph_connected()
@@ -384,7 +280,7 @@ def _fix_worker(work_item):
     patched = dict(item)
     patched["split"] = json.dumps(fixed_dict)
     status = f"fixed:{n_added}" if now_connected else f"partial:{n_added}"
-    return idx, patched, status, n_slivers
+    return idx, patched, status
 
 
 # ── I/O ───────────────────────────────────────────────────────────────
@@ -415,8 +311,7 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Post-process hypergraphs: prune BSP slivers and "
-                    "fix disconnected access graphs.",
+        description="Post-process hypergraphs: fix disconnected access graphs.",
     )
     parser.add_argument(
         "--dataset-dir", type=str, default="dataset/rplan/dataset_hypergraph",
@@ -436,14 +331,7 @@ def main():
         "--workers", "-j", type=int, default=0,
         help="Number of parallel workers (0 = single process)",
     )
-    parser.add_argument(
-        "--sliver-frac", type=float, default=SLIVER_AREA_FRAC,
-        help="Prune BSP leaves smaller than this fraction of total area "
-             f"(default: {SLIVER_AREA_FRAC})",
-    )
     args = parser.parse_args()
-
-    sliver_frac = args.sliver_frac
 
     dataset_dir = Path(args.dataset_dir)
     output_dir = Path(args.output_dir)
@@ -452,7 +340,6 @@ def main():
     grand_disconnected = 0
     grand_fixed = 0
     grand_edges = 0
-    grand_slivers = 0
 
     for split in args.split:
         logger.info("Processing %s ...", split)
@@ -463,9 +350,8 @@ def main():
         disconnected = 0
         fixed = 0
         total_edges = 0
-        total_slivers = 0
 
-        work_items = [(i, item, sliver_frac) for i, item in enumerate(items)]
+        work_items = [(i, item) for i, item in enumerate(items)]
 
         if args.workers > 0:
             from multiprocessing import Pool
@@ -479,9 +365,8 @@ def main():
         else:
             results = [_fix_worker(wi) for wi in work_items]
 
-        for idx, patched_item, status, n_sliv in results:
+        for idx, patched_item, status in results:
             items[idx] = patched_item
-            total_slivers += n_sliv
             if status.startswith("fixed:"):
                 n_added = int(status.split(":")[1])
                 disconnected += 1
@@ -502,17 +387,15 @@ def main():
         pct_fixed = 100 * fixed / disconnected if disconnected else 0
         logger.info(
             "  %s: %d disconnected / %d total (%.1f%%), "
-            "%d fixed (%.1f%% of disconnected), %d edges added, "
-            "%d slivers pruned",
+            "%d fixed (%.1f%% of disconnected), %d edges added",
             split, disconnected, len(items), pct_disc,
-            fixed, pct_fixed, total_edges, total_slivers,
+            fixed, pct_fixed, total_edges,
         )
 
         grand_total += len(items)
         grand_disconnected += disconnected
         grand_fixed += fixed
         grand_edges += total_edges
-        grand_slivers += total_slivers
 
     logger.info("")
     logger.info("=" * 60)
@@ -533,7 +416,6 @@ def main():
         remaining,
         100 * remaining / grand_total if grand_total else 0,
     )
-    logger.info("Slivers pruned: %d", grand_slivers)
     logger.info("=" * 60)
 
     return 0
