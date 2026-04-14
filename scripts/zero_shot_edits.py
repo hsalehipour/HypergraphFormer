@@ -119,15 +119,25 @@ EDIT_OPERATION_GUIDANCE = """\
 - Return only the edited hypergraph JSON.
 - Do not add explanations, markdown, comments, or any surrounding text.
 """
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = ""
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL_NAME = "gpt-5.4"
+API_KEY_PATH = REPO_ROOT / "api_key"
 
 
 def load_hypergraph(path: Path, sample_id: str) -> dict:
     with open(path) as f:
         data = json.load(f)
     return data[str(sample_id)]
+
+
+def load_openai_api_key() -> str:
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if API_KEY_PATH.exists():
+        return API_KEY_PATH.read_text().strip()
+    return ""
 
 
 def load_bounds(test_dir: Path, sample_id: str) -> dict:
@@ -286,9 +296,9 @@ def generate_local(model, tokenizer, messages: list[dict[str, str]], max_new_tok
 
 
 def generate_openai(messages: list[dict[str, str]], max_output_tokens: int, temperature: float):
-    api_key = os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
+    api_key = load_openai_api_key()
     if not api_key:
-        raise ValueError("Set OPENAI_API_KEY in the environment or fill OPENAI_API_KEY in this file.")
+        raise ValueError(f"Set OPENAI_API_KEY in the environment or place the key in {API_KEY_PATH}.")
     payload = json.dumps(
         {
             "model": OPENAI_MODEL_NAME,
