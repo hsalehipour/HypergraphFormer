@@ -81,6 +81,8 @@ INSTRUCTION_PROMPT_GPT_RAG = (
     "Leaf nodes are rooms with final=true, no children, mergeid equal to the room type, and connected containing only other leaf node names. "
     "Connected lists must exclude internal nodes, mergeid strings, and self-loops, and adjacency should be bidirectional. "
     "Areas should remain approximately conserved and split angles must stay axis-aligned only: 0, pi/2, pi, or 3pi/2. "
+    "After any edit, every internal BSP node must have an area equal to the sum of its two children, recursively up to the root. "
+    "Do not leave stale internal-node areas from the original hypergraph. "
     "If the requested edit removes or changes rooms, update the BSP tree and connectivity coherently instead of copying the input unchanged. "
     "Return only the edited hypergraph JSON and no explanation."
 )
@@ -91,6 +93,15 @@ EDIT_OPERATION_GUIDANCE = """\
 - You must apply the requested operation to the current hypergraph and return the EDITED hypergraph JSON.
 - Do not return the original hypergraph unchanged unless the command explicitly asks you to preserve it exactly.
 - Preserve as much of the original valid structure as possible, except where the requested edit requires a change.
+- After every edit, recompute affected BSP areas recursively so each internal node area equals the sum of its two children.
+- Never leave stale parent areas from the original hypergraph after changing leaves or subtrees.
+- Before returning the JSON, check that every non-leaf node still has exactly 2 children and valid area conservation.
+- If a room changes type or semantic role, do not simply keep the old leaf area by default.
+- Update edited leaf areas so they are realistic for their new semantic roles.
+- If rooms are swapped or converted, adjust their leaf areas to reflect the new semantics instead of performing a label-only edit.
+- A room that becomes functionally smaller should usually receive less area, and a room that becomes functionally larger should usually receive more area.
+- After changing any leaf area, recompute all ancestor BSP node areas recursively up to the root.
+- Before returning the JSON, verify that edited room areas are semantically plausible for their new roles.
 
 ### If the command asks to remove a room
 - If the room is specified, remove that room.
@@ -98,22 +109,48 @@ EDIT_OPERATION_GUIDANCE = """\
 - Delete exactly one leaf room unless the command says otherwise.
 - Repair the BSP tree so it remains a valid binary tree after the removal.
 - Adjust areas and nearby partitions so the edited apartment remains spatially plausible.
+- Recompute all ancestor node areas up to the root after the removal.
 - Update all affected `connected` lists so connectivity is still valid, bidirectional, and free of self-loops.
 
 ### If the command asks to add a room
 - Find an appropriate place in the tree to introduce a new split and create the new room as a valid leaf.
 - The new room must have final=true, a room-type mergeid, no children, valid connected entries, and realistic area and angle values.
 - Adjust neighboring partitions to account for reasonable area shifts while preserving a valid BSP structure.
+- Recompute all affected internal-node areas recursively after inserting the new room.
 
 ### If the command asks to resize a room
 - Find the target room and the surrounding BSP split that controls its allocated area.
 - Revise partition areas to give that room more or less space while keeping the rest of the apartment plausible.
 - If needed, propagate area changes upward or to nearby siblings, but keep the tree valid.
+- Ensure every ancestor area is updated so parent area equals the sum of child areas at each level.
 
 ### If the command asks to swap rooms
-- Identify the two rooms and swap their room-type assignments.
+- Identify the two room categories explicitly named in the command and swap exactly those two room types.
+- Do not substitute different room categories that were not requested.
+- If multiple candidate rooms exist for one category, choose one consistent target room and apply the swap only to that pair.
 - Preserve the rest of the tree structure unless the command requires more changes.
-- If needed, adapt local areas to keep the result plausible while retaining valid connectivity.
+- Do not change names of other rooms outside of this pair.
+- You must update BSP node partition areas to keep the areas of the rooms plausible while retaining valid connectivity.
+- Do not perform a label-only edit when the new room semantics imply a different size.
+- If leaf areas change, recompute all affected ancestor node areas recursively up to the root.
+- If leaf areas stay the same, still verify that all parent areas remain correct and do not keep stale values.
+
+### If the command asks to change / convert to studio, one-bed, 2-bedroom etc.
+- First, identify how many bedrooms there are in the hypergraph.
+- identify how many bedrooms need to be removed or added to convert it to a studio/one-bed/two-bedroom etc.
+- For each bedroom, perform these additions or removal like in previous commands.
+- Keep the overall connectivity the same but adjust area partitions so that bedrooms are of reasonable size.
+- Recompute parent BSP areas recursively after each structural change.
+
+### If asked to rotate the hypergraph
+- check the angles of the BSP split and change them all to a certain value that will rotate the hypergraph.
+
+### If asked about the possibility to rotate the plan to make a certain entrance from west/east/north/south:
+- first, identify the room connected to the 'Outside' node.
+- Check whether it is on the left/right/top/bottom of the apartment, given the hypergraph split.
+- Then identify a rotation that will make the entrance from the desired direction.
+- Change all the split angles to the value that will rotate hypergraph accordingly.
+
 
 ### Output Requirements
 - Return only the edited hypergraph JSON.
