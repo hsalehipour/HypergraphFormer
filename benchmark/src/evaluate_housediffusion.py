@@ -19,7 +19,6 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-from scipy import ndimage
 from PIL import Image, ImageDraw
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely import make_valid
@@ -58,6 +57,7 @@ ID_COLOR = {
     6: '#ED6D87',       # foyer; Pinkish (same as living)
     10: '#FF9FBB',      # extra; Light pink
     17: '#b8b5b4',      # door; light grey
+    -1: 'white',        # outside node (matches original House-Diffusion script)
 }
 
 # # Colors for visualization (RPLAN standard)
@@ -427,57 +427,88 @@ def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
 
 def build_access_graph_from_polygons(polygons):
     """
-    Build access graph directly from polygon representation using computational geometry.
+    Build access graph from polygon representation using IoU-based door detection.
     
-    More accurate than mask-based approach - uses actual polygon intersections.
+    Matches the algorithm from House-Diffusion's original image_sample.py:
+    - For each door, compute IoU with every room polygon
+    - Accept connections where 0 < IoU < 0.2
+    - Interior doors (type 17): connect the top-2 rooms by IoU
+    - Front doors (type 15): connect the top-1 room to an outside node (-1)
     
     Args:
         polygons: List of dicts with 'coords', 'room_type', 'room_idx'
     
     Returns:
-        NetworkX graph with room nodes and door-based connections
+        NetworkX graph with room nodes, an outside node (-1), and door-based connections
     """
+    from collections import defaultdict
+
     G = nx.Graph()
     
-    # Separate rooms and doors
+    # Separate rooms, interior doors, and front doors
     rooms = []
-    doors = []
+    interior_doors = []
+    front_doors = []
     
     for i, poly_data in enumerate(polygons):
         room_type = poly_data['room_type']
         coords = poly_data['coords']
         
+        try:
+            poly = ShapelyPolygon(coords)
+            if not poly.is_valid:
+                poly = make_valid(poly)
+        except Exception:
+            continue
+        
         if room_type == 17:  # interior door
-            doors.append({'idx': i, 'coords': coords, 'polygon': ShapelyPolygon(coords)})
-        elif room_type not in [15]:  # exclude front doors
-            rooms.append({'idx': i, 'coords': coords, 'room_type': room_type, 'polygon': ShapelyPolygon(coords)})
+            interior_doors.append({'idx': i, 'room_type': room_type, 'polygon': poly})
+        elif room_type == 15:  # front door
+            front_doors.append({'idx': i, 'room_type': room_type, 'polygon': poly})
+        else:
+            rooms.append({'idx': i, 'room_type': room_type, 'polygon': poly})
             G.add_node(i, label=int(room_type))
     
-    # For each door, find which rooms it connects
-    for door in doors:
+    # Add outside node (matches original script's node -1)
+    G.add_node(-1, label=-1)
+    
+    all_doors = interior_doors + front_doors
+    
+    # For each door, compute IoU with every room and collect candidates
+    doors_rooms_map = defaultdict(list)
+    for door in all_doors:
         door_poly = door['polygon']
-        if not door_poly.is_valid:
-            door_poly = make_valid(door_poly)
-        
-        connected_rooms = []
-        
         for room in rooms:
             room_poly = room['polygon']
-            if not room_poly.is_valid:
-                room_poly = make_valid(room_poly)
-            
-            # Check if door and room intersect (share boundary or overlap)
-            if door_poly.intersects(room_poly):
-                intersection = door_poly.intersection(room_poly)
-                # Require meaningful intersection (not just a point)
-                if intersection.area > 0 or (hasattr(intersection, 'length') and intersection.length > 0):
-                    connected_rooms.append(room['idx'])
+            try:
+                intersection_area = door_poly.intersection(room_poly).area
+                union_area = door_poly.union(room_poly).area
+                if union_area > 0:
+                    iou = intersection_area / union_area
+                    if iou > 0 and iou < 0.2:
+                        doors_rooms_map[door['idx']].append((room['idx'], iou))
+            except Exception:
+                continue
+    
+    # Connect rooms through doors (matching original top-K selection)
+    for door in all_doors:
+        k = door['idx']
+        if k not in doors_rooms_map:
+            continue
+        conn = doors_rooms_map[k]
+        conn = sorted(conn, key=lambda tup: tup[1], reverse=True)
         
-        # Connect all pairs of rooms that share this door
-        for i, room1_idx in enumerate(connected_rooms):
-            for room2_idx in connected_rooms[i+1:]:
-                if not G.has_edge(room1_idx, room2_idx):
-                    G.add_edge(room1_idx, room2_idx)
+        if door['room_type'] == 17:  # interior door -> connect top-2 rooms
+            conn_top2 = conn[:2]
+            if len(conn_top2) > 1:
+                l1, l2 = conn_top2[0][0], conn_top2[1][0]
+                if not G.has_edge(l1, l2):
+                    G.add_edge(l1, l2)
+        elif door['room_type'] == 15:  # front door -> connect top-1 room to outside
+            if len(conn) > 0:
+                l1 = conn[0][0]
+                if not G.has_edge(-1, l1):
+                    G.add_edge(-1, l1)
     
     return G
 
@@ -583,112 +614,88 @@ def corners_to_masks(coords, room_types_onehot, room_indices_onehot, padding_mas
     return np.array(masks_list), np.array(room_types_list)
 
 
-def build_access_graph_from_masks(room_types, masks):
-    """
-    Build access graph from generated masks by detecting door connections.
-    
-    Extracts which rooms are connected through doors in the generated layout.
-    Uses same logic as HouseGAN++ version.
-    
-    Args:
-        room_types: Array of room type IDs (RPLAN format, 1-indexed)
-        masks: Generated masks for each room/door
-    
-    Returns:
-        NetworkX graph with only room nodes and door-based connections
-    """
-    # Create graph
-    G = nx.Graph()
-    door_connections = {}  # door_idx -> [connected_room_indices]
-    
-    # Identify room and door nodes
-    room_indices = []
-    door_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_indices.append(k)
-            door_connections[k] = []
-    
-    # For each door, find which rooms it connects
-    for door_idx in door_indices:
-        door_mask = masks[door_idx] > 0
-        
-        # Check which rooms are adjacent to this door
-        for room_idx in room_indices:
-            room_mask = masks[room_idx] > 0
-            
-            # Check if door and room are adjacent (share boundary)
-            # Dilate door mask and check for overlap with room
-            dilated_door = ndimage.binary_dilation(door_mask, iterations=2)
-            
-            if np.any(dilated_door & room_mask):
-                door_connections[door_idx].append(room_idx)
-    
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if not G.has_edge(room1, room2):
-                    G.add_edge(room1, room2)
-    
-    return G
-
 
 def build_access_graph_from_ground_truth(graph_data, room_types):
     """
     Build access graph from ground truth graph data.
     
+    Matches the algorithm from House-Diffusion's original get_graph():
+    - Room nodes for all non-door types
+    - Outside node (-1) connected via front doors (type 15)
+    - Interior doors (type 17) connect pairs of rooms
+    - Direct room-room edges where both endpoints are rooms
+    
     Args:
         graph_data: Ground truth graph triples [N, 3] with [node1, rel, node2]
                    where rel > 0 indicates adjacency
-        room_types: Array of room type IDs
+        room_types: Array of room type IDs (RPLAN format after reverse mapping)
     
     Returns:
-        NetworkX graph with room nodes and door connections
+        NetworkX graph with room nodes, outside node (-1), and door-based connections
     """
     G = nx.Graph()
     
-    # Add room nodes (exclude doors type 17 and front door type 15)
     room_indices = []
-    door_indices = []
+    interior_door_indices = []
+    front_door_indices = []
     for k, room_type in enumerate(room_types):
         if room_type not in [15, 17]:
             G.add_node(k, label=int(room_type))
             room_indices.append(k)
         elif room_type == 17:
-            door_indices.append(k)
+            interior_door_indices.append(k)
+        elif room_type == 15:
+            front_door_indices.append(k)
     
-    # Build door connections map
-    door_connections = {door_idx: [] for door_idx in door_indices}
+    # Add outside node (matches original script's node -1)
+    G.add_node(-1, label=-1)
     
-    # Parse edges from graph data
+    room_set = set(room_indices)
+    interior_door_set = set(interior_door_indices)
+    front_door_set = set(front_door_indices)
+    
+    # Build door connections maps
+    interior_door_connections = {idx: [] for idx in interior_door_indices}
+    front_door_connections = {idx: [] for idx in front_door_indices}
+    
     for edge in graph_data:
         if len(edge) != 3:
             continue
         node1, rel, node2 = int(edge[0]), edge[1], int(edge[2])
         
-        # Only consider positive relationships (adjacent)
         if rel <= 0:
             continue
         
-        # Check if this edge involves a door
-        if node1 in door_indices:
-            if node2 in room_indices:
-                door_connections[node1].append(node2)
-        elif node2 in door_indices:
-            if node1 in room_indices:
-                door_connections[node2].append(node1)
+        # Both endpoints are rooms -> direct edge (original script does this too)
+        if node1 in room_set and node2 in room_set:
+            if not G.has_edge(node1, node2):
+                G.add_edge(node1, node2)
+            continue
+        
+        # Interior door connects rooms
+        if node1 in interior_door_set and node2 in room_set:
+            interior_door_connections[node1].append(node2)
+        elif node2 in interior_door_set and node1 in room_set:
+            interior_door_connections[node2].append(node1)
+        
+        # Front door connects room to outside
+        if node1 in front_door_set and node2 in room_set:
+            front_door_connections[node1].append(node2)
+        elif node2 in front_door_set and node1 in room_set:
+            front_door_connections[node2].append(node1)
     
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
+    # Connect rooms that share an interior door
+    for door_idx, connected_rooms in interior_door_connections.items():
         for i, room1 in enumerate(connected_rooms):
             for room2 in connected_rooms[i+1:]:
                 if not G.has_edge(room1, room2):
                     G.add_edge(room1, room2)
+    
+    # Connect rooms to outside via front doors
+    for door_idx, connected_rooms in front_door_connections.items():
+        for room_idx in connected_rooms:
+            if not G.has_edge(-1, room_idx):
+                G.add_edge(-1, room_idx)
     
     return G
 
@@ -731,16 +738,18 @@ def visualize_comparison(
     ax_graph_gt = fig.add_subplot(gs[1, 0])
     ax_graph_gt.set_title('GT: Door Connections', fontsize=10)
     if G_true.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos = nx.nx_agraph.graphviz_layout(G_true, prog='neato')
         except:
             pos = nx.spring_layout(G_true, seed=42, k=1.5)
         
-        colors = [ID_COLOR.get(G_true.nodes[node]['label'], '#BEBEBE') 
-                 for node in G_true.nodes()]
-        nx.draw(G_true, pos, node_color=colors, node_size=1000,
-               edgecolors='blue', linewidths=0.0, edge_color='#b8b5b4',
+        node_colors = [ID_COLOR.get(G_true.nodes[n]['label'], '#BEBEBE') for n in G_true.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_true.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_true.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_true.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_true.edges()]
+        nx.draw(G_true, pos, node_color=node_colors, node_size=node_sizes,
+               edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
                style='dotted', width=4.0, with_labels=False, ax=ax_graph_gt)
     ax_graph_gt.axis('off')
     
@@ -756,16 +765,18 @@ def visualize_comparison(
     ax_graph_pred = fig.add_subplot(gs[1, 1])
     ax_graph_pred.set_title('Predicted: Door Connections', fontsize=10)
     if G_pred.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos = nx.nx_agraph.graphviz_layout(G_pred, prog='neato')
         except:
             pos = nx.spring_layout(G_pred, seed=42, k=1.5)
         
-        colors = [ID_COLOR.get(G_pred.nodes[node]['label'], '#BEBEBE')
-                 for node in G_pred.nodes()]
-        nx.draw(G_pred, pos, node_color=colors, node_size=1000,
-               edgecolors='blue', linewidths=0.0, edge_color='#b8b5b4', 
+        node_colors = [ID_COLOR.get(G_pred.nodes[n]['label'], '#BEBEBE') for n in G_pred.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_pred.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_pred.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_pred.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_pred.edges()]
+        nx.draw(G_pred, pos, node_color=node_colors, node_size=node_sizes,
+               edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
                style='dotted', width=4.0, with_labels=False, ax=ax_graph_pred)
     ax_graph_pred.axis('off')
     
