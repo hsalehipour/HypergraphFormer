@@ -893,8 +893,8 @@ def parse_args():
                        help="path to trained diffusion model checkpoint")
     
     # Evaluation parameters
-    parser.add_argument("--batch_size", type=int, default=1,
-                       help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=64,
+                       help="size of the batches (64 matches House-Diffusion's default)")
     parser.add_argument("--num_samples", type=int, default=None,
                        help="number of samples to evaluate (None = auto-detect from NPZ file)")
     parser.add_argument("--num_variations", type=int, default=1,
@@ -1521,30 +1521,44 @@ def main():
                     model_kwargs[key] = model_kwargs[key].to(device)
                 
                 batch_size_actual = data_sample.shape[0]
-                
-                # Process each sample in batch
+
+                # Generate all variations for the full batch at once
+                batch_pred_coords = []  # [num_variations][batch_size_actual] of [2, num_points]
+                for var_idx in range(args.num_variations):
+                    with torch.no_grad():
+                        pred_sample = sample_fn(
+                            model,
+                            data_sample.shape,
+                            clip_denoised=args.clip_denoised,
+                            model_kwargs=model_kwargs,
+                            analog_bit=args.analog_bit,
+                        )
+                    # pred_sample shape: [timesteps, batch, 2, num_points]
+                    batch_pred_coords.append(pred_sample[-1].cpu().numpy())  # [batch, 2, num_points]
+                    del pred_sample
+                    torch.cuda.empty_cache()
+
+                # Post-process each sample in the batch
                 for batch_idx in range(batch_size_actual):
                     if sample_count >= total_samples:
                         break
 
-                    # Extract ground truth for this sample
-                    gt_sample = data_sample[batch_idx:batch_idx+1]
-                    gt_kwargs = {k: v[batch_idx:batch_idx+1] for k, v in model_kwargs.items()}
+                    gt_coords = data_sample[batch_idx].cpu().numpy()  # [2, num_points]
+                    gt_room_types_oh = model_kwargs['room_types'][batch_idx].cpu().numpy()
+                    gt_room_indices_oh = model_kwargs['room_indices'][batch_idx].cpu().numpy()
+                    gt_padding_mask = (1 - model_kwargs['src_key_padding_mask'][batch_idx].cpu().numpy()).astype(int)
 
-                    # Extract GT conditioning for this sample
-                    gt_coords = gt_sample[0].cpu().numpy()  # [2, num_points]
-                    gt_room_types_oh = gt_kwargs['room_types'][0].cpu().numpy()  # [num_points, 25]
-                    gt_room_indices_oh = gt_kwargs['room_indices'][0].cpu().numpy()  # [num_points, 32]
-                    gt_padding_mask = (1 - gt_kwargs['src_key_padding_mask'][0].cpu().numpy()).astype(int)  # [num_points]
+                    syn_room_types_oh = model_kwargs['syn_room_types'][batch_idx].cpu().numpy()
+                    syn_room_indices_oh = model_kwargs['syn_room_indices'][batch_idx].cpu().numpy()
+                    syn_padding_mask = (1 - model_kwargs['syn_src_key_padding_mask'][batch_idx].cpu().numpy()).astype(int)
 
-                    # Extract syn conditioning (the model generates using syn_ keys,
-                    # so predictions must be decoded with syn structure)
-                    syn_room_types_oh = gt_kwargs['syn_room_types'][0].cpu().numpy()  # [num_points, 25]
-                    syn_room_indices_oh = gt_kwargs['syn_room_indices'][0].cpu().numpy()  # [num_points, 32]
-                    syn_padding_mask = (1 - gt_kwargs['syn_src_key_padding_mask'][0].cpu().numpy()).astype(int)  # [num_points]
-
-                    # Storage for this sample's variations
                     sample_variations = []
+                    for var_idx in range(args.num_variations):
+                        sample_variations.append({
+                            'variation_idx': var_idx,
+                            'pred_coords': batch_pred_coords[var_idx][batch_idx].copy(),
+                        })
+
                     sample_data = {
                         'sample_idx': sample_count,
                         'variations': sample_variations,
@@ -1557,35 +1571,9 @@ def main():
                         'syn_padding_mask': syn_padding_mask,
                     }
 
-                    for var_idx in range(args.num_variations):
-                        # Generate sample
-                        with torch.no_grad():
-                            pred_sample = sample_fn(
-                                model,
-                                gt_sample.shape,
-                                clip_denoised=args.clip_denoised,
-                                model_kwargs=gt_kwargs,
-                                analog_bit=args.analog_bit,
-                            )
-
-                        # pred_sample shape: [timesteps, batch, 2, num_points]
-                        pred_coords = pred_sample[-1, 0].cpu().numpy()  # [2, num_points]
-
-                        del pred_sample
-                        torch.cuda.empty_cache()
-
-                        sample_variations.append({
-                            'variation_idx': var_idx,
-                            'pred_coords': pred_coords.copy(),
-                        })
-
-                    # Postprocess sample's variations
                     results = postprocess_sample(sample_data, results, args.save_graphs, args.out, sample_ids_array)
-
-                    # Record results (always extend, even with NaNs)
                     results['all_geds'].extend(results['variation_geds'])
 
-                    # After all variations for this sample, store in cache if enabled
                     if save_mode:
                         cache_samples.append({
                             'sample_idx': sample_count,
