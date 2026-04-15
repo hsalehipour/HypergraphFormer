@@ -139,7 +139,63 @@ def _build_graph(rms_type, fp_eds, eds_to_rms, out_size=64):
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(json_dir, output_dir, set_name='eval', target_set=None):
+def _collect_cnumber_dist(json_dir, target_set=None):
+    """Collect corner-number distribution from a JSON directory (typically train)."""
+    json_dir = Path(json_dir)
+    list_path = json_dir / 'list.txt'
+    if list_path.exists():
+        with open(list_path) as f:
+            filenames = [line.strip() for line in f if line.strip()]
+    else:
+        filenames = [f.name for f in sorted(json_dir.glob('*.json'))]
+
+    print(f"[cndist] Scanning {len(filenames)} JSONs in {json_dir} ...")
+
+    cnumber_dist = defaultdict(list)
+    max_num_points = 100
+    for fname in tqdm(filenames, desc="Building cndist"):
+        fpath = json_dir / fname
+        if not fpath.exists():
+            continue
+        try:
+            rms_type, fp_eds, rms_bbs, eds_to_rms = _reader(str(fpath))
+        except Exception:
+            continue
+        fp_size = len([x for x in rms_type if x != 15 and x != 17])
+        if target_set is not None and fp_size != target_set:
+            continue
+        try:
+            graph_nodes, graph_edges, rooms_mks = _build_graph(rms_type, fp_eds, eds_to_rms)
+        except Exception:
+            continue
+        total_corners = 0
+        for room_mask, room_type in zip(rooms_mks, graph_nodes):
+            room_mask = room_mask.astype(np.uint8)
+            room_mask = cv.resize(room_mask, (256, 256), interpolation=cv.INTER_AREA)
+            contours, _ = cv.findContours(room_mask, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            n_corners = len(contours[0][:, 0, :])
+            hd_type = {15: 11, 17: 12, 16: 13}.get(room_type, room_type) if room_type > 10 else room_type
+            cnumber_dist[hd_type].append(n_corners)
+            total_corners += n_corners
+        if total_corners > max_num_points:
+            continue
+
+    print(f"[cndist] Collected distribution for {sum(len(v) for v in cnumber_dist.values())} rooms "
+          f"across {len(cnumber_dist)} room types")
+    return dict(cnumber_dist)
+
+
+def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_dir=None):
+    """Convert House-Diffusion JSON files to NPZ format.
+
+    Args:
+        train_json_dir: Directory of train-split JSONs. Used to build the
+            corner-number distribution (cndist) required for synthesized
+            conditioning at eval time.  If None and set_name=='eval', the
+            cndist is (incorrectly) built from the eval data itself.
+    """
     target_set_str = "all" if target_set is None else str(target_set)
     max_num_points = 100
 
@@ -289,9 +345,15 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None):
     )
     print(f"Saved {len(houses)} samples to {npz_path}")
 
-    # ---- Save cndist (always, needed by RPlanhgDataset at eval time) ---------
+    # ---- Build / save cndist --------------------------------------------------
+    # For eval: prefer cndist from training data if train_json_dir is provided.
+    if set_name == 'eval' and train_json_dir is not None:
+        train_cnumber_dist = _collect_cnumber_dist(train_json_dir, target_set)
+    else:
+        train_cnumber_dist = dict(cnumber_dist)
+
     cndist_path = output_dir / f'rplan_train_{target_set_str}_cndist.npz'
-    np.savez_compressed(cndist_path, cnumber_dist=dict(cnumber_dist))
+    np.savez_compressed(cndist_path, cnumber_dist=train_cnumber_dist)
     print(f"Saved corner distribution to {cndist_path}")
 
     # ---- For eval: build synthesized conditioning ----------------------------
@@ -310,12 +372,12 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None):
             corner_bounds = []
             num_points = 0
             num_room_corners_total = [
-                cnumber_dist[room[1]][random.randint(0, len(cnumber_dist[room[1]]) - 1)]
+                train_cnumber_dist[room[1]][random.randint(0, len(train_cnumber_dist[room[1]]) - 1)]
                 for room in h
             ]
             while np.sum(num_room_corners_total) >= max_num_points:
                 num_room_corners_total = [
-                    cnumber_dist[room[1]][random.randint(0, len(cnumber_dist[room[1]]) - 1)]
+                    train_cnumber_dist[room[1]][random.randint(0, len(train_cnumber_dist[room[1]]) - 1)]
                     for room in h
                 ]
 
@@ -401,10 +463,14 @@ def main():
                         help="Dataset split name (default: eval)")
     parser.add_argument("--target_set", type=int, default=None,
                         help="Filter by room count (default: None = all)")
+    parser.add_argument("--train_json_dir", type=str, default=None,
+                        help="Directory of train-split JSONs (for cndist); "
+                             "required for correct eval syn generation")
     args = parser.parse_args()
 
     convert(args.json_dir, args.output_dir,
-            set_name=args.set_name, target_set=args.target_set)
+            set_name=args.set_name, target_set=args.target_set,
+            train_json_dir=args.train_json_dir)
 
 
 if __name__ == "__main__":

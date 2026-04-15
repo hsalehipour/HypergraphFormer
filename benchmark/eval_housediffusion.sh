@@ -110,18 +110,30 @@ echo ""
 
 # Resolve JSON_DIR to absolute path for consistent NPZ placement
 JSON_DIR="$(cd "$JSON_DIR" && pwd)"
-NPZ_DIR="$JSON_DIR/processed_rplan"
+DATASET_ROOT="$(dirname "$JSON_DIR")"
+NPZ_DIR="$DATASET_ROOT/processed_rplan"
 EVAL_NPZ="$NPZ_DIR/rplan_eval_all.npz"
 CNDIST_NPZ="$NPZ_DIR/rplan_train_all_cndist.npz"
 SYN_NPZ="$NPZ_DIR/rplan_eval_all_syn.npz"
 
+# Train JSON dir: sibling "train/" directory (for building cndist from training data)
+TRAIN_JSON_DIR="$DATASET_ROOT/train"
+
 if [ -f "$EVAL_NPZ" ] && [ -f "$CNDIST_NPZ" ] && [ -f "$SYN_NPZ" ]; then
     echo "✓ Using cached NPZ files in $NPZ_DIR"
 else
+    CONVERT_CMD="python3 \"$BENCHMARK_DIR/utils/convert_json_to_npz.py\" \
+        --json_dir \"$JSON_DIR\" \
+        --output_dir \"$NPZ_DIR\""
+    if [ -d "$TRAIN_JSON_DIR" ]; then
+        echo "Using train data from $TRAIN_JSON_DIR for corner distribution"
+        CONVERT_CMD="$CONVERT_CMD --train_json_dir \"$TRAIN_JSON_DIR\""
+    else
+        echo "Warning: Train directory not found at $TRAIN_JSON_DIR"
+        echo "  Corner distribution will be built from eval data (less accurate)"
+    fi
     echo "Converting JSON -> NPZ ..."
-    python3 "$BENCHMARK_DIR/utils/convert_json_to_npz.py" \
-        --json_dir "$JSON_DIR" \
-        --output_dir "$NPZ_DIR"
+    eval $CONVERT_CMD
     echo "✓ NPZ conversion complete"
 fi
 echo ""
