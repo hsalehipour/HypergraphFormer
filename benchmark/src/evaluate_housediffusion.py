@@ -969,24 +969,31 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
     # Clear variation_geds
     results['variation_geds'] = []
 
+    # Use syn conditioning for predictions (the model generates using syn_ keys
+    # which have different corner counts than GT). Fall back to GT if syn not available.
+    syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
+    syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
+    syn_padding_mask = sample_data.get('syn_padding_mask', sample_data['gt_padding_mask'])
+
     # Process each variation
     for var_data in sample_data['variations']:
         var_idx = var_data['variation_idx']
         
         # Convert to polygons (for access graph) and masks (for visualization)
+        # Predictions must use syn_ conditioning (matches the structure the model generated)
         pred_polygons = corners_to_polygons_and_types(
             var_data['pred_coords'],
-            sample_data['gt_room_types_oh'],  # Use GT conditioning
-            sample_data['gt_room_indices_oh'],
-            sample_data['gt_padding_mask'],
+            syn_room_types_oh,
+            syn_room_indices_oh,
+            syn_padding_mask,
             image_size=256
         )
         
         pred_masks, pred_room_types = corners_to_masks(
             var_data['pred_coords'],
-            sample_data['gt_room_types_oh'],  # Use GT conditioning
-            sample_data['gt_room_indices_oh'],
-            sample_data['gt_padding_mask'],
+            syn_room_types_oh,
+            syn_room_indices_oh,
+            syn_padding_mask,
             image_size=256
         )
 
@@ -1524,11 +1531,17 @@ def main():
                     gt_sample = data_sample[batch_idx:batch_idx+1]
                     gt_kwargs = {k: v[batch_idx:batch_idx+1] for k, v in model_kwargs.items()}
 
-                    # Extract data for this sample
+                    # Extract GT conditioning for this sample
                     gt_coords = gt_sample[0].cpu().numpy()  # [2, num_points]
                     gt_room_types_oh = gt_kwargs['room_types'][0].cpu().numpy()  # [num_points, 25]
                     gt_room_indices_oh = gt_kwargs['room_indices'][0].cpu().numpy()  # [num_points, 32]
                     gt_padding_mask = (1 - gt_kwargs['src_key_padding_mask'][0].cpu().numpy()).astype(int)  # [num_points]
+
+                    # Extract syn conditioning (the model generates using syn_ keys,
+                    # so predictions must be decoded with syn structure)
+                    syn_room_types_oh = gt_kwargs['syn_room_types'][0].cpu().numpy()  # [num_points, 25]
+                    syn_room_indices_oh = gt_kwargs['syn_room_indices'][0].cpu().numpy()  # [num_points, 32]
+                    syn_padding_mask = (1 - gt_kwargs['syn_src_key_padding_mask'][0].cpu().numpy()).astype(int)  # [num_points]
 
                     # Storage for this sample's variations
                     sample_variations = []
@@ -1539,6 +1552,9 @@ def main():
                         'gt_room_types_oh': gt_room_types_oh,
                         'gt_room_indices_oh': gt_room_indices_oh,
                         'gt_padding_mask': gt_padding_mask,
+                        'syn_room_types_oh': syn_room_types_oh,
+                        'syn_room_indices_oh': syn_room_indices_oh,
+                        'syn_padding_mask': syn_padding_mask,
                     }
 
                     for var_idx in range(args.num_variations):
@@ -1577,6 +1593,9 @@ def main():
                             'gt_room_types_oh': gt_room_types_oh.copy(),
                             'gt_room_indices_oh': gt_room_indices_oh.copy(),
                             'gt_padding_mask': gt_padding_mask.copy(),
+                            'syn_room_types_oh': syn_room_types_oh.copy(),
+                            'syn_room_indices_oh': syn_room_indices_oh.copy(),
+                            'syn_padding_mask': syn_padding_mask.copy(),
                             'variations': sample_variations
                         })
 
