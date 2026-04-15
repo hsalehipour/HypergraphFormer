@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Evaluate House-Diffusion on the Hypergraph1K Dataset.
+Evaluate House-Diffusion floorplan generation.
 
 Generates floorplans and computes three metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
+
+Expects a pre-processed NPZ file via --data_path.  To convert from
+House-Diffusion JSON files, use benchmark/utils/convert_json_to_npz.py first
+(the shell wrapper eval_housediffusion.sh does this automatically).
 
 Supports caching generated outputs for reproducible re-evaluation.
 """
