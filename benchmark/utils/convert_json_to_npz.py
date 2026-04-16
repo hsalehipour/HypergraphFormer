@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert House-Diffusion JSON files (from raster_to_json.py) to NPZ format.
+Convert RPLAN JSON files (from Housegan-data-reader) to NPZ format.
 
 Replicates the preprocessing pipeline of rplanhg_datasets.py:
     reader() -> centering -> build_graph() -> contour extraction
@@ -188,7 +188,7 @@ def _collect_cnumber_dist(json_dir, target_set=None):
 
 
 def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_dir=None):
-    """Convert House-Diffusion JSON files to NPZ format.
+    """Convert RPLAN JSON files to NPZ format.
 
     Args:
         train_json_dir: Directory of train-split JSONs. Used to build the
@@ -453,7 +453,7 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert House-Diffusion JSON files to NPZ format"
+        description="Convert RPLAN JSON files to NPZ format"
     )
     parser.add_argument("--json_dir", type=str, required=True,
                         help="Directory containing {id}.json files")

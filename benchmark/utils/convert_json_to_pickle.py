@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Convert House-Diffusion JSON files to HouseGAN++ pickle format.
+Convert RPLAN JSON files to HouseGAN++ pickle format.
 
-Source: per-sample JSON files produced by raster_to_json / batch_raster_to_json,
+Source: per-sample JSON files produced by Housegan-data-reader
+        (raster_to_json / batch_raster_to_json),
         each containing {room_type, boxes, edges, ed_rm}.
 
 Target: a single pickle file (list of dicts) loadable by
@@ -34,7 +35,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 def _reader(filepath):
-    """Read a House-Diffusion JSON and return centred arrays."""
+    """Read an RPLAN JSON and return centred arrays."""
     with open(filepath) as f:
         info = json.load(f)
     rms_bbs = np.asarray(info['boxes'])
@@ -193,7 +194,7 @@ def _mask_to_polygon(mask, target_size=64):
 
 def _convert_one(json_path, target_size=64):
     """
-    Convert a single House-Diffusion JSON to a HouseGAN++ pickle sample dict.
+    Convert a single RPLAN JSON to a HouseGAN++ pickle sample dict.
 
     Returns dict {id, polygons, room_types, triples} or None on failure.
     """
@@ -287,7 +288,7 @@ def convert(json_dir, output_path, target_set=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert House-Diffusion JSON files to HouseGAN++ pickle format",
+        description="Convert RPLAN JSON files to HouseGAN++ pickle format",
     )
     parser.add_argument(
         "--json_dir", type=str, required=True,
@@ -295,7 +296,7 @@ def main():
     )
     parser.add_argument(
         "--output", "-o", type=str, required=True,
-        help="Output pickle path (e.g. Hypergraph_to_RPLAN/test/test_data.pkl)",
+        help="Output pickle path (e.g. processed_rplan_pickles/test_data.pkl)",
     )
     parser.add_argument(
         "--target_set", type=int, default=None,

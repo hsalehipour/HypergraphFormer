@@ -4,7 +4,7 @@
 # House-Diffusion Evaluation Script
 # ============================================
 # Generates floorplans and computes metrics (GED, room accuracy, delta)
-# from a directory of House-Diffusion JSON files (any dataset).
+# from a directory of RPLAN JSON files (produced by Housegan-data-reader).
 #
 # Automatically converts JSON -> NPZ (if not already cached) using
 # benchmark/utils/convert_json_to_npz.py, then runs evaluation.
@@ -27,7 +27,7 @@ HOUSEDIFFUSION_REPO="$REPOS_DIR/house_diffusion"
 # Virtual environment
 VENV_PATH="$HF_ROOT/.venv"
 
-# Data path -- directory of House-Diffusion JSON files
+# Data path -- directory of RPLAN JSON files
 JSON_DIR="${1:-}"
 
 # Model checkpoint
@@ -64,8 +64,8 @@ echo ""
 if [ -z "$JSON_DIR" ]; then
     echo "Usage: $0 <json_dir>"
     echo ""
-    echo "  json_dir  Directory containing House-Diffusion JSON files"
-    echo "            (produced by raster_to_json.py or batch_raster_to_json.py)"
+    echo "  json_dir  Directory containing RPLAN JSON files"
+    echo "            (produced by Housegan-data-reader's batch_raster_to_json.py)"
     exit 1
 fi
 

@@ -860,7 +860,7 @@ Examples:
   python convert_hypergraph_to_rplan.py --verbose
   
   # Custom paths and target size
-  python convert_hypergraph_to_rplan.py --input /path/to/dataset/hypergraph --output /path/to/Hypergraph_to_RPLAN --target-size 128
+  python convert_hypergraph_to_rplan.py --input /path/to/dataset/hypergraph --output /path/to/processed_rplan_pickles --target-size 128
         """
     )
     
@@ -874,8 +874,8 @@ Examples:
     parser.add_argument(
         '--output', '-o',
         type=Path,
-        default=PROJECT_ROOT.parent / 'Hypergraph_to_RPLAN',
-        help='Path to output directory (default: PROJECT_ROOT/../Hypergraph_to_RPLAN)'
+        default=PROJECT_ROOT.parent / 'processed_rplan_pickles',
+        help='Path to output directory (default: PROJECT_ROOT/../processed_rplan_pickles)'
     )
     
     parser.add_argument(

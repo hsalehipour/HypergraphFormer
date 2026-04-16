@@ -214,10 +214,10 @@ def main():
         epilog="""
 Examples:
   # Visualize first 5 samples from training set
-  python visualize_hypergraph_pickle.py --pickle Hypergraph_to_RPLAN/train/train_data.pkl --num_samples 5 --output_path ./hypergraph_viz
+  python visualize_hypergraph_pickle.py --pickle processed_rplan_pickles/train_data.pkl --num_samples 5 --output_path ./hypergraph_viz
 
   # Visualize specific sample by ID
-  python visualize_hypergraph_pickle.py --pickle Hypergraph_to_RPLAN/train/train_data.pkl --sample_id c-n-0100 --output_path ./hypergraph_viz
+  python visualize_hypergraph_pickle.py --pickle processed_rplan_pickles/train_data.pkl --sample_id c-n-0100 --output_path ./hypergraph_viz
         """
     )
     

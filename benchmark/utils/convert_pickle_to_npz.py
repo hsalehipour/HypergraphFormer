@@ -408,9 +408,9 @@ def convert_pickle_to_npz(pickle_path, output_dir, set_name, target_set):
 def main():
     parser = argparse.ArgumentParser(description="Convert hypergraph-based pickle to house-diffusion NPZ format")
     parser.add_argument("--input-dir", type=str, required=True,
-                        help="Input directory with pickle files (e.g., dataset/Hypergraph_to_RPLAN)")
+                        help="Input directory with pickle files (e.g., processed_rplan_pickles)")
     parser.add_argument("--output-dir", type=str, required=True,
-                        help="Output directory for NPZ files (e.g., house_diffusion/processed_rplan)")
+                        help="Output directory for NPZ files (e.g., processed_rplan)")
     parser.add_argument("--target-set", type=int, default=None,
                         help="Target room count for filtering (None = no filter, use all samples)")
     

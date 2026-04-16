@@ -44,10 +44,6 @@ RPLAN_NPZ_DIR="$RPLAN_DATASET_ROOT/processed_rplan"
 RPLAN_TEST_IDS="$RPLAN_DATASET_ROOT/ids_test.txt"
 RPLAN_TRAIN_IDS="$RPLAN_DATASET_ROOT/ids_train.txt"
 
-# Hypergraph1K dataset paths (legacy)
-HYPERGRAPH_INPUT="$HF_ROOT/dataset/hypergraph"
-HYPERGRAPH_RPLAN_OUTPUT="$BENCHMARK_DIR/dataset/Hypergraph_to_RPLAN"
-
 # Model checkpoint
 CHECKPOINT="$HOUSEDIFFUSION_REPO/checkpoints/pretrained_model250000.pt"
 

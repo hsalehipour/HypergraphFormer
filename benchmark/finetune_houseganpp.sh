@@ -17,8 +17,9 @@ HOUSEGANPP_REPO="$REPOS_DIR/houseganpp"
 VENV_PATH="$HF_ROOT/.venv"
 
 # Data paths
-TRAIN_DATA="$BENCHMARK_DIR/dataset/Hypergraph_to_RPLAN/train/train_data.pkl"
-VAL_DATA="$BENCHMARK_DIR/dataset/Hypergraph_to_RPLAN/validation/validation_data.pkl"
+RPLAN_DATASET_ROOT="$HF_ROOT/dataset/rplan/dataset_housediffusion"
+TRAIN_DATA="$RPLAN_DATASET_ROOT/processed_rplan_pickles/train_data.pkl"
+VAL_DATA="$RPLAN_DATASET_ROOT/processed_rplan_pickles/val_data.pkl"
 
 # Model checkpoint
 CHECKPOINT="$HOUSEGANPP_REPO/checkpoints/pretrained.pth"
