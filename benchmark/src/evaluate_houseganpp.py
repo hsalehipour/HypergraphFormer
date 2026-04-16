@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Evaluate HouseGAN++ on the Hypergraph1K Dataset.
+Evaluate HouseGAN++ floorplan generation.
 
 Generates floorplans and computes three metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
+
+Expects an RPLAN pickle file via --data_path.  To convert from
+RPLAN JSON files, use benchmark/utils/convert_json_to_pickle.py first
+(the shell wrapper eval_houseganpp.sh does this automatically).
 
 Supports caching generated outputs for reproducible re-evaluation.
 """
@@ -21,7 +25,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import multiprocessing
-from scipy import ndimage
+from collections import defaultdict
 from datetime import datetime
 import webcolors
 import cv2
@@ -52,6 +56,7 @@ ID_COLOR = {
     6: '#ED6D87',       # foyer; Pinkish (same as living)
     10: '#FF9FBB',      # extra; Light pink
     17: '#b8b5b4',      # door; light grey
+    -1: 'white',        # outside node (matches original HouseGAN++ script)
 }
 
 def draw_masks(masks, room_types, image_size=256):
@@ -98,28 +103,6 @@ def draw_masks(masks, room_types, image_size=256):
     
     return bg_img.resize((image_size, image_size))
 
-def mask_to_bb(mask):
-    """
-    Convert binary mask to bounding box.
-    
-    Args:
-        mask: Binary mask (2D numpy array)
-        
-    Returns:
-        Bounding box [x0, y0, x1, y1]
-    """
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    
-    if not rows.any() or not cols.any():
-        # Empty mask
-        return [0, 0, 0, 0]
-    
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    
-    return [rmin, cmin, rmax, cmax]
-
 
 def count_actual_rooms_from_masks(nodes, masks):
     """
@@ -157,11 +140,9 @@ def count_actual_rooms_from_masks(nodes, masks):
             expected_rooms += 1
             expected_room_types.append(int(room_type))
             
-            # Get mask and count connected components
-            mask = masks[k] > 0
-            
-            # Use scipy.ndimage.label to find connected components
-            labeled_mask, num_components = ndimage.label(mask)
+            mask = (masks[k] > 0).astype(np.uint8)
+            num_labels, _ = cv2.connectedComponents(mask)
+            num_components = num_labels - 1  # subtract background label
             
             total_room_regions += num_components
             per_mask_components.append(num_components)
@@ -394,163 +375,148 @@ def _infer(graph, model, prev_state=None):
     return masks
 
 
-def is_adjacent(bb1, bb2, threshold=0.05):
+def remove_multiple_components(masks, nodes):
     """
-    Check if two bounding boxes are adjacent.
+    For each mask, keep only the largest connected component.
+    
+    Matches HouseGAN++ misc/utils.py remove_multiple_components().
     
     Args:
-        bb1, bb2: Bounding boxes in format [x0, y0, x1, y1]
-        threshold: Distance threshold for adjacency
+        masks: List or array of masks
+        nodes: Array of 0-indexed room type indices
     
     Returns:
-        True if boxes are adjacent
+        List of cleaned masks
     """
-    x0, y0, x1, y1 = bb1
-    x2, y2, x3, y3 = bb2
-    
-    h1, h2 = x1 - x0, x3 - x2
-    w1, w2 = y1 - y0, y3 - y2
-    
-    xc1, xc2 = (x0 + x1) / 2.0, (x2 + x3) / 2.0
-    yc1, yc2 = (y0 + y1) / 2.0, (y2 + y3) / 2.0
-    
-    delta_x = abs(xc2 - xc1) - (h1 + h2) / 2.0
-    delta_y = abs(yc2 - yc1) - (w1 + w2) / 2.0
-    
-    return delta_x <= threshold and delta_y <= threshold
+    new_masks = []
+    for mk, nd in zip(masks, nodes):
+        m_cv = np.array(mk)
+        m_cv[m_cv > 0] = 255.0
+        m_cv[m_cv < 0] = 0.0
+        m_cv = m_cv.astype('uint8')
+        ret, thresh = cv2.threshold(m_cv, 127, 255, 0)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 1:
+            cnt_m = np.zeros_like(m_cv)
+            c = max(contours, key=cv2.contourArea)
+            cv2.drawContours(cnt_m, [c], 0, (255, 255, 255), -1)
+            cnt_m[cnt_m > 0] = 1.0
+            cnt_m[cnt_m < 0] = -1.0
+            new_masks.append(cnt_m)
+        else:
+            new_masks.append(mk)
+    return new_masks
 
 
 def build_access_graph_from_masks(nodes, masks):
     """
-    Build access graph from generated masks by detecting door connections.
+    Build access graph from generated masks using IoU-based door detection.
     
-    Extracts which rooms are connected through doors in the generated layout.
+    Matches the algorithm from HouseGAN++ misc/utils.py estimate_graph():
+    - Remove multiple components per mask (keep largest)
+    - For each door, compute IoU with every room mask
+    - Accept connections where 0 < IoU < 0.2
+    - Interior doors (type 17): connect the top-2 rooms by IoU
+    - Front doors (type 15): connect the top-1 room to an outside node (-1)
     
     Args:
         nodes: Array of room types (integer indices, 0-indexed from one-hot)
         masks: Generated masks for each room/door
     
     Returns:
-        NetworkX graph with only room nodes and door-based connections
+        NetworkX graph with room nodes, an outside node (-1), and door-based connections
     """
-    # Convert nodes to 1-indexed room types (RPLAN IDs)
-    room_types = nodes + 1
-    
-    # Create graph
+    masks = remove_multiple_components(masks, nodes)
+
     G = nx.Graph()
-    door_connections = {}  # door_idx -> [connected_room_indices]
-    
-    # Identify room and door nodes
-    room_indices = []
-    door_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_indices.append(k)
-            door_connections[k] = []
-    
-    # For each door, find which rooms it connects
-    for door_idx in door_indices:
-        door_mask = masks[door_idx] > 0
-        
-        # Check which rooms are adjacent to this door
-        for room_idx in room_indices:
-            room_mask = masks[room_idx] > 0
-            
-            # Check if door and room are adjacent (share boundary)
-            # Dilate door mask and check for overlap with room
-            dilated_door = ndimage.binary_dilation(door_mask, iterations=2)
-            
-            if np.any(dilated_door & room_mask):
-                door_connections[door_idx].append(room_idx)
-    
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if not G.has_edge(room1, room2):
-                    G.add_edge(room1, room2)
-    
+
+    for k, label in enumerate(nodes):
+        _type = label + 1
+        if _type >= 0 and _type not in [15, 17]:
+            G.add_node(k, label=int(_type))
+
+    G.add_node(-1, label=-1)
+
+    doors_inds = np.where((nodes == 14) | (nodes == 16))[0]
+    rooms_inds = np.where((nodes != 14) & (nodes != 16))[0]
+    doors_rooms_map = defaultdict(list)
+    for k in doors_inds:
+        for l in rooms_inds:
+            if k > l:
+                m1 = np.array(masks[k], dtype=float)
+                m2 = np.array(masks[l], dtype=float)
+                m1[m1 > 0] = 1.0
+                m1[m1 <= 0] = 0.0
+                m2[m2 > 0] = 1.0
+                m2[m2 <= 0] = 0.0
+                union = float(np.logical_or(m1, m2).sum())
+                if union > 0:
+                    iou = np.logical_and(m1, m2).sum() / union
+                    if iou > 0 and iou < 0.2:
+                        doors_rooms_map[k].append((l, iou))
+
+    for k in doors_rooms_map.keys():
+        _conn = doors_rooms_map[k]
+        _conn = sorted(_conn, key=lambda tup: tup[1], reverse=True)
+        _conn_top2 = _conn[:2]
+        if nodes[k] + 1 != 15:  # interior door
+            if len(_conn_top2) > 1:
+                l1, l2 = _conn_top2[0][0], _conn_top2[1][0]
+                if not G.has_edge(l1, l2):
+                    G.add_edge(l1, l2)
+        else:  # front door -> connect to outside node
+            if len(_conn) > 0:
+                l1 = _conn[0][0]
+                if not G.has_edge(-1, l1):
+                    G.add_edge(-1, l1)
+
     return G
 
 
 def build_access_graph_from_structure(nodes, edges, masks=None):
     """
-    Build access graph where edges exist only between rooms connected through doors.
+    Build GT access graph from graph structure (triples).
+    
+    Matches the algorithm from HouseGAN++ misc/utils.py draw_graph():
+    - Room nodes for all non-door types
+    - Outside node (-1) connected via front doors (type 15)
+    - Room-room edges where both endpoints are rooms and rel > 0
+    - Front door edges: if one endpoint is type 15 and rel > 0,
+      connect the other (non-door) room to outside (-1)
     
     Args:
         nodes: Array of room types (integer indices, 0-indexed from one-hot)
         edges: Edge triples [node1_idx, relationship, node2_idx]
-        masks: Optional generated masks to check spatial adjacency
-               If provided, validates door connections in generated layout
+        masks: Unused (kept for API compatibility)
     
     Returns:
-        NetworkX graph with only room nodes and door-based connections
+        NetworkX graph with room nodes, outside node (-1), and door-based connections
     """
-    # Convert nodes to 1-indexed room types (RPLAN IDs)
-    room_types = nodes + 1
-    
-    # Create graph
     G = nx.Graph()
-    door_connections = {}  # door_idx -> [room1, room2, ...]
-    
-    # Add only room nodes (exclude doors type 17 and front door type 15)
-    room_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_connections[k] = []
-    
-    # If masks provided, convert to bounding boxes for adjacency checking
-    bboxes = None
-    if masks is not None:
-        bboxes = []
-        for mask in masks:
-            try:
-                bb = mask_to_bb(mask)
-                # Normalize to [0, 1] range
-                bb = np.array(bb) / float(masks.shape[-1])
-                bboxes.append(bb)
-            except:
-                bboxes.append(np.array([0.0, 0.0, 0.0, 0.0]))
-        bboxes = np.array(bboxes)
-    
-    # Find connections through doors
-    # First pass: identify which rooms connect to which doors
+
+    for k, label in enumerate(nodes):
+        _type = label + 1
+        if _type >= 0 and _type not in [15, 17]:
+            G.add_node(k, label=int(_type))
+
+    G.add_node(-1, label=-1)
+
     for edge in edges:
-        # Handle both numpy arrays and scalars (use .item() for numpy arrays)
-        node1 = int(edge[0].item() if hasattr(edge[0], 'item') else edge[0])
-        rel = int(edge[1].item() if hasattr(edge[1], 'item') else edge[1])
-        node2 = int(edge[2].item() if hasattr(edge[2], 'item') else edge[2])
-        
-        # Only consider adjacent edges (rel > 0)
-        if rel > 0:
-            # Handle numpy arrays in room_types
-            type1 = int(room_types[node1].item() if hasattr(room_types[node1], 'item') else room_types[node1])
-            type2 = int(room_types[node2].item() if hasattr(room_types[node2], 'item') else room_types[node2])
-            
-            # If one node is a door (17) and the other is a room
-            if type1 == 17 and type2 not in [15, 17]:
-                # Check spatial adjacency if masks provided
-                if bboxes is None or is_adjacent(bboxes[node1], bboxes[node2]):
-                    door_connections[node1].append(node2)
-            elif type2 == 17 and type1 not in [15, 17]:
-                if bboxes is None or is_adjacent(bboxes[node1], bboxes[node2]):
-                    door_connections[node2].append(node1)
-    
-    # Second pass: connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if room1 in room_indices and room2 in room_indices:
-                    G.add_edge(room1, room2)
-    
+        k = int(edge[0].item() if hasattr(edge[0], 'item') else edge[0])
+        m = int(edge[1].item() if hasattr(edge[1], 'item') else edge[1])
+        l = int(edge[2].item() if hasattr(edge[2], 'item') else edge[2])
+
+        _type_k = int(nodes[k]) + 1
+        _type_l = int(nodes[l]) + 1
+
+        if m > 0 and (_type_k not in [15, 17] and _type_l not in [15, 17]):
+            G.add_edge(k, l)
+        elif m > 0 and (_type_k == 15 or _type_l == 15) and (_type_l != 17 and _type_k != 17):
+            if _type_k == 15:
+                G.add_edge(l, -1)
+            elif _type_l == 15:
+                G.add_edge(k, -1)
+
     return G
 
 
@@ -716,15 +682,18 @@ def visualize_comparison(
     ax_graph_gt = fig.add_subplot(gs[1, 0])
     ax_graph_gt.set_title('GT: Door Connections', fontsize=10)
     if G_true.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos_true = nx.nx_agraph.graphviz_layout(G_true, prog='neato')
         except:
             pos_true = nx.spring_layout(G_true, seed=42, k=1.5)
-        colors_true = [ID_COLOR[G_true.nodes[n]['label']] for n in G_true.nodes()]
-        nx.draw(G_true, pos_true, node_color=colors_true, node_size=1000,
-                with_labels=False, ax=ax_graph_gt, edge_color='#b8b5b4',
-                style='dotted', width=4.0, edgecolors='blue', linewidths=0.0)
+        node_colors = [ID_COLOR.get(G_true.nodes[n]['label'], '#BEBEBE') for n in G_true.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_true.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_true.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_true.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#D3A2C7' for u, v in G_true.edges()]
+        nx.draw(G_true, pos_true, node_color=node_colors, node_size=node_sizes,
+                edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
+                style='dotted', width=4.0, with_labels=False, ax=ax_graph_gt)
     ax_graph_gt.axis('off')
     
     # Top right: Predicted floorplan
@@ -739,15 +708,18 @@ def visualize_comparison(
     ax_graph_pred = fig.add_subplot(gs[1, 1])
     ax_graph_pred.set_title('Predicted: Door Connections', fontsize=10)
     if len(G_pred.nodes()) > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos_pred = nx.nx_agraph.graphviz_layout(G_pred, prog='neato')
         except:
             pos_pred = nx.spring_layout(G_pred, seed=42, k=1.5)
-        colors_pred = [ID_COLOR[G_pred.nodes[n]['label']] for n in G_pred.nodes()]
-        nx.draw(G_pred, pos_pred, node_color=colors_pred, node_size=1000,
-                with_labels=False, ax=ax_graph_pred, edge_color='#b8b5b4', 
-                style='dotted', width=4.0, edgecolors='blue', linewidths=0.0)
+        node_colors = [ID_COLOR.get(G_pred.nodes[n]['label'], '#BEBEBE') for n in G_pred.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_pred.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_pred.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_pred.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_pred.edges()]
+        nx.draw(G_pred, pos_pred, node_color=node_colors, node_size=node_sizes,
+                edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
+                style='dotted', width=4.0, with_labels=False, ax=ax_graph_pred)
     ax_graph_pred.axis('off')
     
     # Add room count and similarity info to title
@@ -1056,6 +1028,11 @@ def main():
     
     print(f"\n{'='*60}")
     print(f"Generated {len(graphs)} graph pairs")
+
+    if len(graphs) == 0:
+        print("\n⚠️  No graph pairs to evaluate. Check that the input data is non-empty.")
+        return
+
     print(f"Computing GED in parallel...\n")
     
     # Compute GED in parallel

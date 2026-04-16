@@ -31,7 +31,7 @@ VENV_PATH="$HF_ROOT/.venv"
 JSON_DIR="${1:-}"
 
 # Model checkpoint (modify this to use your trained model)
-CHECKPOINT="$HOUSEGANPP_REPO/checkpoints/ft_housegan_final.pth"
+CHECKPOINT="$HOUSEGANPP_REPO/checkpoints/pretrained.pth"
 
 # Evaluation parameters
 NUM_SAMPLES=""          # Number of samples (empty = all)
