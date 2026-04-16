@@ -257,22 +257,27 @@ def convert(json_dir, output_path, target_set=None):
 
     samples = []
     skipped = defaultdict(int)
+    skipped_ids = []
 
     for fname in tqdm(filenames, desc="Converting", unit="sample"):
         fpath = json_dir / fname
+        sample_id = Path(fname).stem
         if not fpath.exists():
             skipped['missing'] += 1
+            skipped_ids.append((sample_id, 'missing'))
             continue
 
         result = _convert_one(fpath)
         if result is None:
             skipped['error'] += 1
+            skipped_ids.append((sample_id, 'error'))
             continue
 
         if target_set is not None:
             num_rooms = sum(1 for rt in result['room_types'] if rt != 17)
             if num_rooms != target_set:
                 skipped['filtered'] += 1
+                skipped_ids.append((sample_id, 'filtered'))
                 continue
 
         samples.append(result)
@@ -284,6 +289,13 @@ def convert(json_dir, output_path, target_set=None):
     if skipped:
         parts = [f"{k}={v}" for k, v in skipped.items()]
         print(f"  Skipped: {', '.join(parts)}")
+
+    if skipped_ids:
+        skip_path = output_path.parent / (output_path.stem + '_skipped.txt')
+        with open(skip_path, 'w') as f:
+            for sid, reason in skipped_ids:
+                f.write(f"{sid}\t{reason}\n")
+        print(f"  Skipped IDs saved to {skip_path}")
 
 
 def main():

@@ -215,19 +215,24 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
     # ---- Phase 1: Read JSONs ------------------------------------------------
     subgraphs = []
     sample_ids = []
+    skipped_ids = []
     for fname in tqdm(filenames, desc="Reading JSONs"):
         fpath = json_dir / fname
+        sid = fname.replace('.json', '')
         if not fpath.exists():
+            skipped_ids.append((sid, 'missing'))
             continue
         try:
             rms_type, fp_eds, rms_bbs, eds_to_rms = _reader(str(fpath))
         except Exception:
+            skipped_ids.append((sid, 'read_error'))
             continue
         fp_size = len([x for x in rms_type if x != 15 and x != 17])
         if target_set is not None and fp_size != target_set:
+            skipped_ids.append((sid, 'filtered'))
             continue
         subgraphs.append([rms_type, rms_bbs, fp_eds, eds_to_rms])
-        sample_ids.append(fname.replace('.json', ''))
+        sample_ids.append(sid)
 
     print(f"Loaded {len(subgraphs)} samples (after filtering)")
 
@@ -242,6 +247,7 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
         try:
             graph_nodes, graph_edges, rooms_mks = _build_graph(rms_type, fp_eds, eds_to_rms)
         except Exception:
+            skipped_ids.append((sample_ids[idx], 'graph_error'))
             continue
         house = []
         for room_mask, room_type in zip(rooms_mks, graph_nodes):
@@ -267,8 +273,16 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
     kept_org_houses = []
     kept_org_graphs = []
 
+    MAX_ROOMS = 32
+    MAX_CORNERS = 32
     for h, graph, sid in tqdm(zip(org_houses, org_graphs, valid_ids),
                               total=len(org_houses), desc="Encoding features"):
+        if len(h) >= MAX_ROOMS:
+            skipped_ids.append((sid, 'too_many_rooms'))
+            continue
+        if any(len(room[0]) >= MAX_CORNERS for room in h):
+            skipped_ids.append((sid, 'too_many_corners'))
+            continue
         house = []
         corner_bounds = []
         num_points = 0
@@ -293,9 +307,11 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
             house.append(room_data)
 
         if not house:
+            skipped_ids.append((sid, 'empty_house'))
             continue
         house_layouts = np.concatenate(house, 0)
         if len(house_layouts) > max_num_points:
+            skipped_ids.append((sid, 'too_many_points'))
             continue
 
         padding = np.zeros((max_num_points - len(house_layouts), 94))
@@ -345,6 +361,13 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
     )
     print(f"Saved {len(houses)} samples to {npz_path}")
 
+    if skipped_ids:
+        skip_path = output_dir / f'rplan_{set_name}_{target_set_str}_skipped.txt'
+        with open(skip_path, 'w') as f:
+            for sid, reason in skipped_ids:
+                f.write(f"{sid}\t{reason}\n")
+        print(f"Skipped {len(skipped_ids)} samples -> {skip_path}")
+
     # ---- Build / save cndist --------------------------------------------------
     # For eval: prefer cndist from training data if train_json_dir is provided.
     if set_name == 'eval' and train_json_dir is not None:
@@ -381,11 +404,15 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
                     for room in h
                 ]
 
+            skip_sample = False
             for i, room in enumerate(h):
                 num_room_corners = num_room_corners_total[i]
+                if num_room_corners < 1 or num_room_corners >= MAX_CORNERS:
+                    skip_sample = True
+                    break
                 rtype = np.repeat(np.array([_get_one_hot(room[1], 25)]), num_room_corners, 0)
-                room_index = np.repeat(np.array([_get_one_hot(len(house) + 1, 32)]), num_room_corners, 0)
-                corner_index = np.array([_get_one_hot(x, 32) for x in range(num_room_corners)])
+                room_index = np.repeat(np.array([_get_one_hot(len(house) + 1, MAX_ROOMS)]), num_room_corners, 0)
+                corner_index = np.array([_get_one_hot(x, MAX_CORNERS) for x in range(num_room_corners)])
                 padding_mask = np.expand_dims(np.repeat(1, num_room_corners), 1)
                 connections = np.array([[ci, (ci + 1) % num_room_corners] for ci in range(num_room_corners)])
                 connections += num_points
@@ -395,6 +422,8 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
                     (np.zeros([num_room_corners, 2]), rtype, corner_index, room_index, padding_mask, connections), 1
                 )
                 house.append(room_data)
+            if skip_sample:
+                continue
 
             house_layouts = np.concatenate(house, 0)
             if np.sum([len(room[0]) for room in h]) > max_num_points:
