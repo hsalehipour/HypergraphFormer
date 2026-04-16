@@ -174,6 +174,14 @@ class Evaluator(ABC):
         if getattr(args, "max_rooms", None):
             all_files = self._filter_max_rooms(all_files, args.max_rooms)
 
+        skip_hg_path = getattr(args, "skip_covered_hypergraphs", None)
+        if skip_hg_path:
+            with open(skip_hg_path) as f:
+                covered_ids = set(json.load(f).keys())
+            before = len(all_files)
+            all_files = [f for f in all_files if f.stem not in covered_ids]
+            logger.info(f"Skipped {before - len(all_files)} samples already covered in {skip_hg_path}")
+
         if args.max_samples:
             all_files = all_files[: args.max_samples]
             logger.info(f"Limited to {args.max_samples} samples")
@@ -204,6 +212,7 @@ class Evaluator(ABC):
             sample = self._load_sample(fpath)
             result = self.evaluate_sample(sample)
             results.append(result)
+            self._save_partial(args, results)
 
             if result["success"]:
                 ged = result.get("ged")
@@ -257,6 +266,7 @@ class Evaluator(ABC):
             sample = self._batch_to_sample(batch, include_gt, include_bounds)
             result = self.evaluate_sample(sample)
             local_results.append(result)
+            self._save_partial(args, local_results, accelerator.process_index)
 
         # Save per-rank results to temp files
         tmp = Path(tempfile.gettempdir())
@@ -360,6 +370,25 @@ class Evaluator(ABC):
                "completed": len(results), "results": results}
         with open(args.output, "w") as f:
             json.dump(out, f, indent=2)
+
+    @staticmethod
+    def _save_partial(args, results, rank=None):
+        suffix = f"_rank_{rank}" if rank is not None else "_partial"
+        out_path = Path(args.output.replace(".json", f"{suffix}.json"))
+        hg_path = Path(args.output.replace(".json", f"{suffix}_hypergraphs.json"))
+        with open(out_path, "w") as f:
+            json.dump(
+                {"timestamp": datetime.now().isoformat(), "completed": len(results), "results": results},
+                f,
+                indent=2,
+            )
+        hgs = {
+            r["filename"].replace(".txt", ""): r["generated_hypergraph"]
+            for r in results
+            if r.get("generated_hypergraph") is not None
+        }
+        with open(hg_path, "w") as f:
+            json.dump(hgs, f, indent=2)
 
     def _save_final(self, args, results, *, accelerator=None):
         stats = self.compute_statistics(results)
@@ -764,6 +793,7 @@ def cli():
     parser.add_argument("--max-tokens", type=int, default=3328)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--skip-covered-hypergraphs", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--max-rooms", type=int, default=None)
 

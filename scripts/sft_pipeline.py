@@ -198,7 +198,7 @@ def main():
                        help='Output directory for fine-tuned model (default: checkpoints/qwen_hypergraph/lora_r{R}_alpha{ALPHA})')
     
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=8,
                        help='Number of training epochs (default: 3)')
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size per device (default: 1)')
@@ -243,7 +243,7 @@ def main():
             lora_suffix = f"epochs{args.epochs}_lora_r{args.lora_r}_alpha{args.lora_alpha}"
         else:
             lora_suffix = f"epochs{args.epochs}_full_finetune"
-        args.output_dir = f"checkpoints/qwen_rplan_filtered/{lora_suffix}"
+        args.output_dir = f"checkpoints/qwen_rplan_filtered_2/{lora_suffix}"
         logger.info(f"Using default output directory: {args.output_dir}")
     
     # Set CUDA_VISIBLE_DEVICES for single-GPU mode only
@@ -348,7 +348,7 @@ def main():
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         report_to=["tensorboard"],
-        save_total_limit=30,  # Keep only last 10 checkpoints
+        save_total_limit=50,  # Keep only last 10 checkpoints
         # DDP-specific settings for better multi-GPU stability
         ddp_find_unused_parameters=False,  # Set to True if you get DDP errors with LoRA
         ddp_backend="nccl" if args.multi_gpu and torch.cuda.is_available() else None,

@@ -7,6 +7,7 @@ Available metrics:
     ged       -- Graph Edit Distance between access graphs
     accuracy  -- Room-type multiset matching (bucketed by room count)
     delta     -- Shape regularity deviation via RGL mesh comparison
+    area_difference -- Relative room-area error via paired room lists
 
 Usage:
     # All metrics
@@ -62,8 +63,10 @@ from tqdm import tqdm
 
 from utils import (
     bucketed_room_accuracy,
+    compute_room_area_difference_score,
     compute_room_similarity_score,
     compute_ged_from_hypergraph,
+    produce_room_area_list,
     produce_room_list,
 )
 from utils.hypergraph import Hypergraph
@@ -71,7 +74,7 @@ from utils.hypergraph import Hypergraph
 logger = logging.getLogger(__name__)
 
 
-AVAILABLE_METRICS = ("ged", "accuracy", "delta")
+AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_difference")
 
 
 # ===================================================================
@@ -234,6 +237,53 @@ def score_delta(results, ground_truth, skip_ids):
 
 
 # ===================================================================
+# Metric: Area difference
+# ===================================================================
+
+def score_area_difference(results, ground_truth, skip_ids):
+    """Compute relative room-area error for every sample.
+
+    Pairing logic follows the same room-list grouping behavior as delta, but
+    scores per-room area error: ``abs(Area_pred - Area_gt) / Area_gt``.
+    """
+    per_sample = []
+    skipped = 0
+    errors = 0
+
+    for sample_id in tqdm(results, desc="Computing area_difference", unit="sample"):
+        if sample_id in skip_ids:
+            skipped += 1
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+
+        try:
+            bounds = gt["bounds"]
+            gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
+            gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
+            area_difference = compute_room_area_difference_score(
+                produce_room_area_list(gen_mesh),
+                produce_room_area_list(gt_mesh),
+            )
+            per_sample.append({"sample_id": sample_id, "area_difference": area_difference})
+        except Exception as e:
+            logger.warning(f"Area difference failed for {sample_id}: {e}")
+            per_sample.append({"sample_id": sample_id, "area_difference": None, "error": str(e)})
+            errors += 1
+
+    values = [r["area_difference"] for r in per_sample if r["area_difference"] is not None]
+    summary = {
+        "mean": sum(values) / len(values) if values else float("nan"),
+        "successful": len(values),
+        "total": len(results),
+        "skipped": skipped,
+        "errors": errors,
+    }
+    return {"per_sample": per_sample, "summary": summary}
+
+
+# ===================================================================
 # Reporting
 # ===================================================================
 
@@ -287,10 +337,23 @@ def _print_delta_report(result, summary_only):
         print(f"  Errors:     {s['errors']}")
 
 
+def _print_area_difference_report(result, summary_only):
+    s = result["summary"]
+    print(f"\n{'=' * 70}")
+    print("AREA DIFFERENCE (Relative Room-Area Error)")
+    print(f"{'=' * 70}")
+    print(f"  Mean:       {s['mean']:.4f}")
+    print(f"  Successful: {s['successful']}/{s['total']}")
+    print(f"  Excluded:   {s['skipped']}")
+    if s["errors"]:
+        print(f"  Errors:     {s['errors']}")
+
+
 _REPORT_PRINTERS = {
     "ged": _print_ged_report,
     "accuracy": _print_accuracy_report,
     "delta": _print_delta_report,
+    "area_difference": _print_area_difference_report,
 }
 
 
@@ -304,7 +367,7 @@ def write_csv(path, metric_results, results_keys):
     Columns: ``sample_id`` + one column per metric that has per-sample data.
     """
     col_map = {}
-    for name in ("ged", "delta"):
+    for name in ("ged", "delta", "area_difference"):
         if name in metric_results and metric_results[name]["per_sample"]:
             col_map[name] = {
                 r["sample_id"]: r.get(name)
@@ -354,7 +417,7 @@ def cli():
     parser.add_argument(
         "--metrics", nargs="+", required=True,
         choices=AVAILABLE_METRICS,
-        help="Metrics to compute (ged, accuracy, delta)",
+        help="Metrics to compute (ged, accuracy, delta, area_difference)",
     )
     parser.add_argument(
         "--correct-accessgraph",
@@ -417,6 +480,8 @@ def cli():
             )
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
+        elif metric == "area_difference":
+            metric_results["area_difference"] = score_area_difference(results, ground_truth, skip_ids)
 
     for metric in args.metrics:
         print_report(metric, metric_results[metric], args.summary_only)
