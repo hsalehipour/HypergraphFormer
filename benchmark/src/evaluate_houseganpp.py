@@ -705,8 +705,9 @@ def parse_args():
                        help="filter by number of rooms (None = no filter)")
     
     # Model parameters
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="path to trained generator checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="path to trained generator checkpoint"
+                            " (required unless --load_generations is used)")
     
     # Evaluation parameters
     parser.add_argument("--batch_size", type=int, default=1,

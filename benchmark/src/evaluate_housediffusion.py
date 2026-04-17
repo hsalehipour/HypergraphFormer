@@ -936,8 +936,9 @@ def parse_args():
                        help="path to eval NPZ file (e.g., /path/to/processed_rplan/rplan_eval_all.npz)")
     
     # Model parameters
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="path to trained diffusion model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="path to trained diffusion model checkpoint"
+                            " (required unless --load_generations is used)")
     
     # Evaluation parameters
     parser.add_argument("--batch_size", type=int, default=64,
