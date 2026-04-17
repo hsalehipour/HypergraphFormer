@@ -1176,136 +1176,6 @@ def main():
         if len(room_count_info['disconnected_masks']) > 0:
             disconnected_count += 1
     
-    # Build metric dicts from collected arrays
-
-    room_count_accuracies_array = np.array(room_count_accuracies)
-    room_count_errors_array = np.array(room_count_errors)
-    room_type_errors_array = np.array(room_type_errors)
-
-    exact_match_rate = np.mean(room_count_accuracies_array) * 100
-    mean_count_error = np.mean(room_count_errors_array)
-    median_count_error = np.median(room_count_errors_array)
-    max_count_error = np.max(room_count_errors_array)
-    mean_type_error = np.mean(room_type_errors_array)
-    median_type_error = np.median(room_type_errors_array)
-    max_type_error = np.max(room_type_errors_array)
-    disconnected_rate = (disconnected_count / len(graphs)) * 100
-
-    std_of_variation_means = 0.0
-    count_error_std_of_variation_means = 0.0
-    type_error_std_of_variation_means = 0.0
-
-    if args.num_variations > 1:
-        num_samples = len(graphs) // args.num_variations
-        if len(graphs) % args.num_variations == 0:
-            accuracies_reshaped = room_count_accuracies_array.reshape(num_samples, args.num_variations)
-            count_errors_reshaped = room_count_errors_array.reshape(num_samples, args.num_variations)
-            type_errors_reshaped = room_type_errors_array.reshape(num_samples, args.num_variations)
-
-            std_of_variation_means = np.std(np.mean(accuracies_reshaped, axis=0), ddof=1)
-            count_error_std_of_variation_means = np.std(np.mean(count_errors_reshaped, axis=0), ddof=1)
-            type_error_std_of_variation_means = np.std(np.mean(type_errors_reshaped, axis=0), ddof=1)
-
-    similarity_scores_array = np.array(similarity_scores)
-    valid_similarity_scores = similarity_scores_array[~np.isnan(similarity_scores_array)]
-
-    if len(valid_similarity_scores) > 0:
-        mean_similarity = np.mean(valid_similarity_scores)
-        median_similarity = np.median(valid_similarity_scores)
-        min_similarity = np.min(valid_similarity_scores)
-        max_similarity = np.max(valid_similarity_scores)
-        std_similarity = np.std(valid_similarity_scores)
-        valid_rate = (len(valid_similarity_scores) / len(similarity_scores_array)) * 100
-
-        similarity_std_of_variation_means = 0.0
-        if args.num_variations > 1:
-            n = len(valid_similarity_scores) // args.num_variations
-            if n > 0 and len(valid_similarity_scores) % args.num_variations == 0:
-                similarity_std_of_variation_means = float(np.std(
-                    np.mean(valid_similarity_scores.reshape(n, args.num_variations), axis=0), ddof=1))
-    else:
-        mean_similarity = np.nan
-        median_similarity = np.nan
-        min_similarity = np.nan
-        max_similarity = np.nan
-        std_similarity = np.nan
-        similarity_std_of_variation_means = np.nan
-        valid_rate = 0.0
-
-    area_difference_scores_array = np.array(area_difference_scores)
-    valid_area_diff_scores = area_difference_scores_array[~np.isnan(area_difference_scores_array)]
-
-    if len(valid_area_diff_scores) > 0:
-        mean_area_diff = np.mean(valid_area_diff_scores)
-        median_area_diff = np.median(valid_area_diff_scores)
-        min_area_diff = np.min(valid_area_diff_scores)
-        max_area_diff = np.max(valid_area_diff_scores)
-        std_area_diff = np.std(valid_area_diff_scores)
-        valid_area_rate = (len(valid_area_diff_scores) / len(area_difference_scores_array)) * 100
-
-        area_diff_std_of_variation_means = 0.0
-        if args.num_variations > 1:
-            n = len(valid_area_diff_scores) // args.num_variations
-            if n > 0 and len(valid_area_diff_scores) % args.num_variations == 0:
-                area_diff_std_of_variation_means = float(np.std(
-                    np.mean(valid_area_diff_scores.reshape(n, args.num_variations), axis=0), ddof=1))
-    else:
-        mean_area_diff = np.nan
-        median_area_diff = np.nan
-        min_area_diff = np.nan
-        max_area_diff = np.nan
-        std_area_diff = np.nan
-        area_diff_std_of_variation_means = np.nan
-        valid_area_rate = 0.0
-
-    # Build dicts and delegate reporting to score_benchmark_result
-    room_count_dict = {
-        'exact_match_rate': float(exact_match_rate),
-        'accuracy_std': float(std_of_variation_means),  # std of variation means (consistency metric)
-        'mean_count_error': float(mean_count_error),
-        'count_error_std': float(count_error_std_of_variation_means),
-        'median_count_error': float(median_count_error),
-        'max_count_error': float(max_count_error),
-        'mean_type_error': float(mean_type_error),
-        'type_error_std': float(type_error_std_of_variation_means),
-        'median_type_error': float(median_type_error),
-        'max_type_error': float(max_type_error),
-        'disconnected_samples': disconnected_count,
-        'disconnected_rate': float(disconnected_rate),
-        'all_accuracies': room_count_accuracies_array.tolist(),
-        'all_count_errors': room_count_errors_array.tolist(),
-        'all_type_errors': room_type_errors_array.tolist()
-    }
-    
-    similarity_dict = {
-        'mean': float(mean_similarity) if not np.isnan(mean_similarity) else None,
-        'median': float(median_similarity) if not np.isnan(median_similarity) else None,
-        'std': float(std_similarity) if not np.isnan(std_similarity) else None,
-        'std_of_variation_means': float(similarity_std_of_variation_means) if not np.isnan(similarity_std_of_variation_means) else None,
-        'min': float(min_similarity) if not np.isnan(min_similarity) else None,
-        'max': float(max_similarity) if not np.isnan(max_similarity) else None,
-        'valid_count': int(len(valid_similarity_scores)),
-        'valid_rate': float(valid_rate),
-        'total_matched_pairs': int(sum(matched_room_pairs)),
-        'total_unmatched_pred': int(sum(unmatched_pred_rooms)),
-        'total_unmatched_gt': int(sum(unmatched_gt_rooms)),
-        'avg_unmatched_pred': float(np.mean(unmatched_pred_rooms)),
-        'avg_unmatched_gt': float(np.mean(unmatched_gt_rooms)),
-        'all_scores': similarity_scores_array.tolist()
-    }
-    
-    area_difference_dict = {
-        'mean': float(mean_area_diff) if not np.isnan(mean_area_diff) else None,
-        'median': float(median_area_diff) if not np.isnan(median_area_diff) else None,
-        'std': float(std_area_diff) if not np.isnan(std_area_diff) else None,
-        'std_of_variation_means': float(area_diff_std_of_variation_means) if not np.isnan(area_diff_std_of_variation_means) else None,
-        'min': float(min_area_diff) if not np.isnan(min_area_diff) else None,
-        'max': float(max_area_diff) if not np.isnan(max_area_diff) else None,
-        'valid_count': int(len(valid_area_diff_scores)),
-        'valid_rate': float(valid_area_rate),
-        'all_scores': area_difference_scores_array.tolist()
-    }
-    
     score_benchmark_result(
         all_geds=np.array(all_dists),
         num_variations=args.num_variations,
@@ -1314,9 +1184,22 @@ def main():
         data_path=args.data_path,
         additional_info={
             'target_set': args.target_set,
-            'room_count_accuracy': room_count_dict,
-            'room_similarity': similarity_dict,
-            'area_difference': area_difference_dict,
+            'room_count_accuracy': {
+                'accuracies': room_count_accuracies,
+                'count_errors': room_count_errors,
+                'type_errors': room_type_errors,
+                'disconnected_count': disconnected_count,
+                'total_samples': len(graphs),
+            },
+            'room_similarity': {
+                'scores': similarity_scores,
+                'matched_room_pairs': matched_room_pairs,
+                'unmatched_pred_rooms': unmatched_pred_rooms,
+                'unmatched_gt_rooms': unmatched_gt_rooms,
+            },
+            'area_difference': {
+                'scores': area_difference_scores,
+            },
         }
     )
 
