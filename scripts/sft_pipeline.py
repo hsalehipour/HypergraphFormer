@@ -243,7 +243,7 @@ def main():
             lora_suffix = f"epochs{args.epochs}_lora_r{args.lora_r}_alpha{args.lora_alpha}"
         else:
             lora_suffix = f"epochs{args.epochs}_full_finetune"
-        args.output_dir = f"checkpoints/qwen_rplan_filtered/{lora_suffix}"
+        args.output_dir = f"checkpoints/qwen_rplan_filtered_2/{lora_suffix}"
         logger.info(f"Using default output directory: {args.output_dir}")
     
     # Set CUDA_VISIBLE_DEVICES for single-GPU mode only

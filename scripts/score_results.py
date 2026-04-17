@@ -7,43 +7,44 @@ Available metrics:
     ged       -- Graph Edit Distance between access graphs
     accuracy  -- Room-type multiset matching (bucketed by room count)
     delta     -- Shape regularity deviation via RGL mesh comparison
+    area_difference -- Relative room-area error via paired room lists
 
 Usage:
     # All metrics
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file checkpoints/model/test_hypergraphs.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics ged accuracy delta
 
     # Just GED
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics ged
 
     # GED with corrected accessgraph (mesh-adjacency corrected)
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics ged \\
         --correct-accessgraph
 
     # Accuracy with custom buckets
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics accuracy \\
         --buckets '<=4' 5 6 7 8 '>=9'
 
     # Delta with CSV output
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics delta \\
         --output-csv delta_scores.csv
 
     # Summary-only (machine-readable, for scripting)
-    python scripts/score_results.py \\
+    python scripts/score_results_corrected.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --metrics ged accuracy \\
@@ -52,26 +53,87 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import logging
+import re
+import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
 
 from utils import (
     bucketed_room_accuracy,
+    compute_room_area_difference_score,
     compute_room_similarity_score,
-    compute_ged_from_hypergraph,
+    produce_room_area_list,
     produce_room_list,
 )
 from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_difference")
 
-AVAILABLE_METRICS = ("ged", "accuracy", "delta")
+
+# ===================================================================
+# GED worker mode  (re-invoked as a subprocess for each sample)
+# ===================================================================
+
+def _ged_worker_main() -> int:
+    """Compute GED for a single sample and print results to stdout."""
+    import argparse
+    from utils import compute_ged_from_hypergraph
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--_ged-worker", action="store_true")
+    parser.add_argument("--sample-id", required=True)
+    parser.add_argument("--results-file", type=Path, required=True)
+    parser.add_argument("--test-dir", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--correct-accessgraph", action="store_true")
+    args = parser.parse_args()
+
+    def _parse_jsonish(val):
+        return json.loads(val) if isinstance(val, str) else val
+
+    with open(args.results_file) as f:
+        results = json.load(f)
+
+    sample_id = str(args.sample_id)
+    if sample_id not in results:
+        raise KeyError(f"Sample {sample_id} not found in {args.results_file}")
+
+    gt_path = args.test_dir / f"{sample_id}.txt"
+    with open(gt_path) as f:
+        raw = json.load(f)
+    gt = {
+        "accessgraph": raw.get("accessgraph", {}),
+        "bounds": _parse_jsonish(raw.get("bounds", "{}")),
+    }
+
+    bounds = gt["bounds"] if args.correct_accessgraph else None
+
+    start = time.perf_counter()
+    ged, graph_len = compute_ged_from_hypergraph(
+        gt["accessgraph"],
+        copy.deepcopy(results[sample_id]) if args.correct_accessgraph else results[sample_id],
+        sample_id,
+        timeout=int(args.timeout_seconds * 1000),
+        correct_accessgraph=args.correct_accessgraph,
+        bounds=bounds,
+    )
+    elapsed = time.perf_counter() - start
+
+    print(f"ged: {ged}")
+    print(f"graph_len: {graph_len}")
+    print(f"elapsed_seconds: {elapsed:.2f}")
+    return 0
 
 
 # ===================================================================
@@ -117,43 +179,102 @@ def load_ground_truth(test_dir):
 # Metric: GED
 # ===================================================================
 
-def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False):
+def _parse_output_field(text: str, key: str) -> str:
+    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", text, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _run_ged_subprocess(
+    sample_id: str,
+    results_file: Path,
+    test_dir: Path,
+    timeout_seconds: float,
+    correct_accessgraph: bool,
+) -> dict:
+    """Re-invoke this script in worker mode for a single sample."""
+    wall_timeout = timeout_seconds + 30.0
+    cmd = [
+        sys.executable, str(Path(__file__).resolve()),
+        "--_ged-worker",
+        "--sample-id", sample_id,
+        "--results-file", str(results_file),
+        "--test-dir", str(test_dir),
+        "--timeout-seconds", str(timeout_seconds),
+    ]
+    if correct_accessgraph:
+        cmd.append("--correct-accessgraph")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=wall_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(f"GED timed out for sample {sample_id} after {wall_timeout:.0f}s")
+        return {"sample_id": sample_id, "ged": None, "graph_len": None}
+
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    raw_ged = _parse_output_field(text, "ged")
+    raw_len = _parse_output_field(text, "graph_len")
+
+    ged = None
+    graph_len = None
+    try:
+        if raw_ged and raw_ged.lower() not in ("none", ""):
+            ged = float(raw_ged)
+    except ValueError:
+        pass
+    try:
+        if raw_len and raw_len.lower() not in ("none", ""):
+            graph_len = int(float(raw_len))
+    except ValueError:
+        pass
+
+    return {"sample_id": sample_id, "ged": ged, "graph_len": graph_len}
+
+
+def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
+              results_file: Path = None, test_dir: Path = None,
+              timeout_seconds: float = 20.0, workers: int = 64):
     """Compute GED for every sample in *results*.
+
+    Each sample runs in an isolated subprocess so timed-out GED threads never
+    accumulate and throttle subsequent computations.
 
     If *correct_accessgraph* is True, applies correct_accessgraph before GED.
     Returns ``{"per_sample": [...], "summary": {...}}``.
     """
-    import copy as _copy
+    sample_ids = [
+        sid for sid in results
+        if sid not in skip_ids and sid in ground_truth
+    ]
 
-    per_sample = []
-    skipped = 0
+    per_sample: list[dict] = []
+    desc = "Computing GED" + (" (corrected)" if correct_accessgraph else "")
 
-    for sample_id in tqdm(results, desc="Computing GED" + (" (corrected)" if correct_accessgraph else ""), unit="sample"):
-        if sample_id in skip_ids:
-            skipped += 1
-            continue
-        gt = ground_truth.get(sample_id)
-        if gt is None:
-            continue
+    if workers <= 1:
+        for sid in tqdm(sample_ids, desc=desc, unit="sample"):
+            per_sample.append(_run_ged_subprocess(
+                sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+            ))
+    else:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for sid in sample_ids:
+                f = pool.submit(
+                    _run_ged_subprocess,
+                    sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+                )
+                futures[f] = sid
 
-        bounds = None
-        if correct_accessgraph:
-            bounds = gt.get("bounds") or {}
-            if isinstance(bounds, str):
-                bounds = json.loads(bounds) if bounds else {}
-
-        ged, graph_len = compute_ged_from_hypergraph(
-            gt["accessgraph"],
-            _copy.deepcopy(results[sample_id]) if correct_accessgraph else results[sample_id],
-            sample_id,
-            correct_accessgraph=correct_accessgraph,
-            bounds=bounds,
-        )
-        per_sample.append({
-            "sample_id": sample_id,
-            "ged": ged,
-            "graph_len": graph_len,
-        })
+            pbar = tqdm(total=len(futures), desc=desc, unit="sample")
+            for f in as_completed(futures):
+                per_sample.append(f.result())
+                pbar.update(1)
+            pbar.close()
 
     values = [r["ged"] for r in per_sample if r["ged"] is not None]
     summary = {
@@ -162,7 +283,7 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False):
         "max": max(values) if values else float("nan"),
         "successful": len(values),
         "total": len(results),
-        "skipped": skipped,
+        "skipped": len(results) - len(sample_ids),
     }
     return {"per_sample": per_sample, "summary": summary}
 
@@ -234,6 +355,53 @@ def score_delta(results, ground_truth, skip_ids):
 
 
 # ===================================================================
+# Metric: Area difference
+# ===================================================================
+
+def score_area_difference(results, ground_truth, skip_ids):
+    """Compute relative room-area error for every sample.
+
+    Pairing logic follows the same room-list grouping behavior as delta, but
+    scores per-room area error: ``abs(Area_pred - Area_gt) / Area_gt``.
+    """
+    per_sample = []
+    skipped = 0
+    errors = 0
+
+    for sample_id in tqdm(results, desc="Computing area_difference", unit="sample"):
+        if sample_id in skip_ids:
+            skipped += 1
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+
+        try:
+            bounds = gt["bounds"]
+            gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
+            gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
+            area_difference = compute_room_area_difference_score(
+                produce_room_area_list(gen_mesh),
+                produce_room_area_list(gt_mesh),
+            )
+            per_sample.append({"sample_id": sample_id, "area_difference": area_difference})
+        except Exception as e:
+            logger.warning(f"Area difference failed for {sample_id}: {e}")
+            per_sample.append({"sample_id": sample_id, "area_difference": None, "error": str(e)})
+            errors += 1
+
+    values = [r["area_difference"] for r in per_sample if r["area_difference"] is not None]
+    summary = {
+        "mean": sum(values) / len(values) if values else float("nan"),
+        "successful": len(values),
+        "total": len(results),
+        "skipped": skipped,
+        "errors": errors,
+    }
+    return {"per_sample": per_sample, "summary": summary}
+
+
+# ===================================================================
 # Reporting
 # ===================================================================
 
@@ -287,10 +455,23 @@ def _print_delta_report(result, summary_only):
         print(f"  Errors:     {s['errors']}")
 
 
+def _print_area_difference_report(result, summary_only):
+    s = result["summary"]
+    print(f"\n{'=' * 70}")
+    print("AREA DIFFERENCE (Relative Room-Area Error)")
+    print(f"{'=' * 70}")
+    print(f"  Mean:       {s['mean']:.4f}")
+    print(f"  Successful: {s['successful']}/{s['total']}")
+    print(f"  Excluded:   {s['skipped']}")
+    if s["errors"]:
+        print(f"  Errors:     {s['errors']}")
+
+
 _REPORT_PRINTERS = {
     "ged": _print_ged_report,
     "accuracy": _print_accuracy_report,
     "delta": _print_delta_report,
+    "area_difference": _print_area_difference_report,
 }
 
 
@@ -304,7 +485,7 @@ def write_csv(path, metric_results, results_keys):
     Columns: ``sample_id`` + one column per metric that has per-sample data.
     """
     col_map = {}
-    for name in ("ged", "delta"):
+    for name in ("ged", "delta", "area_difference"):
         if name in metric_results and metric_results[name]["per_sample"]:
             col_map[name] = {
                 r["sample_id"]: r.get(name)
@@ -336,6 +517,10 @@ def write_csv(path, metric_results, results_keys):
 def cli():
     import argparse
 
+    # Worker mode: re-invoked as subprocess to compute GED for a single sample.
+    if "--_ged-worker" in sys.argv:
+        sys.exit(_ged_worker_main())
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
@@ -354,12 +539,20 @@ def cli():
     parser.add_argument(
         "--metrics", nargs="+", required=True,
         choices=AVAILABLE_METRICS,
-        help="Metrics to compute (ged, accuracy, delta)",
+        help="Metrics to compute (ged, accuracy, delta, area_difference)",
     )
     parser.add_argument(
         "--correct-accessgraph",
         action="store_true",
         help="Apply correct_accessgraph before GED (only affects ged metric).",
+    )
+    parser.add_argument(
+        "--ged-timeout", type=float, default=20.0,
+        help="Per-sample GED timeout in seconds (default: 20)",
+    )
+    parser.add_argument(
+        "--ged-workers", type=int, default=64,
+        help="Number of parallel GED subprocesses (default: 64)",
     )
     parser.add_argument(
         "--skip-ids-file", default=None,
@@ -410,6 +603,10 @@ def cli():
             metric_results["ged"] = score_ged(
                 results, ground_truth, skip_ids,
                 correct_accessgraph=args.correct_accessgraph,
+                results_file=results_path,
+                test_dir=Path(args.test_dir),
+                timeout_seconds=args.ged_timeout,
+                workers=args.ged_workers,
             )
         elif metric == "accuracy":
             metric_results["accuracy"] = score_accuracy(
@@ -417,6 +614,8 @@ def cli():
             )
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
+        elif metric == "area_difference":
+            metric_results["area_difference"] = score_area_difference(results, ground_truth, skip_ids)
 
     for metric in args.metrics:
         print_report(metric, metric_results[metric], args.summary_only)

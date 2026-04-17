@@ -19,8 +19,10 @@ from .metrics import (
     ged_between_graphs,
     compute_ged_from_hypergraph,
     compute_room_similarity_score,
+    compute_room_area_difference_score,
     room_type_accuracy,
     compute_room_type_accuracy,
     bucketed_room_accuracy,
     produce_room_list,
+    produce_room_area_list,
 )
