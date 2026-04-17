@@ -17,13 +17,13 @@ Split-line priorities:
 
 Modes:
   Debug (default) — renders PNG visualisations:
-    python -m rplan.rplan_to_hypergraph_native --sample 3951
-    python -m rplan.rplan_to_hypergraph_native --sample 3951 57395
-    python -m rplan.rplan_to_hypergraph_native --max-samples 100
+    python -m rplan.rplan_to_hypergraph --sample 3951
+    python -m rplan.rplan_to_hypergraph --sample 3951 57395
+    python -m rplan.rplan_to_hypergraph --max-samples 100
 
   Export — writes hypergraph JSON files (same format as dataset/hypergraph):
-    python -m rplan.rplan_to_hypergraph_native --export
-    python -m rplan.rplan_to_hypergraph_native --sample 3951 --export
+    python -m rplan.rplan_to_hypergraph --export
+    python -m rplan.rplan_to_hypergraph --sample 3951 --export
 """
 
 import argparse

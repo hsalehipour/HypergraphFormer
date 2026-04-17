@@ -1178,11 +1178,6 @@ class HypergraphPlotter:
                                   components=None, node_labels=None):
         """Plot an access graph on a specific *ax*.
 
-        Styling follows the conventions established in
-        ``benchmark/utils/visualize_hypergraph_pickle.py``
-        (``draw_access_graph_from_pickle``) and
-        ``benchmark/src/evaluate_houseganpp.py`` (``visualize_comparison``).
-
         Args:
             ag_dict: Access-graph dict with ``nodes`` and ``edges`` keys
                      (as returned by :pyattr:`Hypergraph.access_graph`).

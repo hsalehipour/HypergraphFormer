@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Evaluate House-Diffusion on the Hypergraph1K Dataset.
+Evaluate House-Diffusion floorplan generation.
 
-Generates floorplans and computes three metrics against ground truth:
+Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
+  4. Area Difference -- Relative room-area error between paired rooms
+
+Expects a pre-processed NPZ file via --data_path.  To convert from
+RPLAN JSON files, use benchmark/utils/convert_json_to_npz.py first
+(the shell wrapper eval_housediffusion.sh does this automatically).
 
 Supports caching generated outputs for reproducible re-evaluation.
 """
@@ -19,7 +24,6 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-from scipy import ndimage
 from PIL import Image, ImageDraw
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely import make_valid
@@ -29,7 +33,7 @@ import pickle
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
 from benchmark.src.evaluate_houseganpp import draw_masks
-from benchmark.utils.ged_statistics import compute_and_save_ged_statistics
+from benchmark.utils.score_benchmark_result import score_benchmark_result
 from house_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -58,6 +62,7 @@ ID_COLOR = {
     6: '#ED6D87',       # foyer; Pinkish (same as living)
     10: '#FF9FBB',      # extra; Light pink
     17: '#b8b5b4',      # door; light grey
+    -1: 'white',        # outside node (matches original House-Diffusion script)
 }
 
 # # Colors for visualization (RPLAN standard)
@@ -425,59 +430,136 @@ def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
     }
 
 
+def compute_room_area_difference_score_polygons(pred_polygons, gt_polygons):
+    """Compute mean relative room-area error using polygon-based representation.
+
+    Pairing logic mirrors :func:`compute_room_similarity_score_polygons`:
+    rooms grouped by type, sorted by area descending, paired largest-first.
+    Per-pair error is ``abs(area_pred - area_gt) / area_gt``.
+    """
+    pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
+    gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
+
+    pred_by_type = {}
+    gt_by_type = {}
+    for room in pred_rooms:
+        pred_by_type.setdefault(room['room_type'], []).append(room)
+    for room in gt_rooms:
+        gt_by_type.setdefault(room['room_type'], []).append(room)
+
+    area_errors = []
+    matched_pairs = 0
+    unmatched_pred_count = 0
+    unmatched_gt_count = 0
+
+    for room_type in set(pred_by_type.keys()) | set(gt_by_type.keys()):
+        pred_of_type = sorted(pred_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
+        gt_of_type = sorted(gt_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
+        num_to_match = min(len(pred_of_type), len(gt_of_type))
+        unmatched_pred_count += len(pred_of_type) - num_to_match
+        unmatched_gt_count += len(gt_of_type) - num_to_match
+
+        for pred_room, gt_room in zip(pred_of_type[:num_to_match], gt_of_type[:num_to_match]):
+            area_gt = gt_room['area']
+            if area_gt > 0:
+                area_errors.append(abs(pred_room['area'] - area_gt) / area_gt)
+                matched_pairs += 1
+
+    avg_error = np.mean(area_errors) if area_errors else np.nan
+
+    return {
+        'area_difference_score': avg_error,
+        'matched_pairs': matched_pairs,
+        'unmatched_pred': unmatched_pred_count,
+        'unmatched_gt': unmatched_gt_count,
+        'per_room_scores': area_errors,
+    }
+
+
 def build_access_graph_from_polygons(polygons):
     """
-    Build access graph directly from polygon representation using computational geometry.
+    Build access graph from polygon representation using IoU-based door detection.
     
-    More accurate than mask-based approach - uses actual polygon intersections.
+    Matches the algorithm from House-Diffusion's original image_sample.py:
+    - For each door, compute IoU with every room polygon
+    - Accept connections where 0 < IoU < 0.2
+    - Interior doors (type 17): connect the top-2 rooms by IoU
+    - Front doors (type 15): connect the top-1 room to an outside node (-1)
     
     Args:
         polygons: List of dicts with 'coords', 'room_type', 'room_idx'
     
     Returns:
-        NetworkX graph with room nodes and door-based connections
+        NetworkX graph with room nodes, an outside node (-1), and door-based connections
     """
+    from collections import defaultdict
+
     G = nx.Graph()
     
-    # Separate rooms and doors
+    # Separate rooms, interior doors, and front doors
     rooms = []
-    doors = []
+    interior_doors = []
+    front_doors = []
     
     for i, poly_data in enumerate(polygons):
         room_type = poly_data['room_type']
         coords = poly_data['coords']
         
+        try:
+            poly = ShapelyPolygon(coords)
+            if not poly.is_valid:
+                poly = make_valid(poly)
+        except Exception:
+            continue
+        
         if room_type == 17:  # interior door
-            doors.append({'idx': i, 'coords': coords, 'polygon': ShapelyPolygon(coords)})
-        elif room_type not in [15]:  # exclude front doors
-            rooms.append({'idx': i, 'coords': coords, 'room_type': room_type, 'polygon': ShapelyPolygon(coords)})
+            interior_doors.append({'idx': i, 'room_type': room_type, 'polygon': poly})
+        elif room_type == 15:  # front door
+            front_doors.append({'idx': i, 'room_type': room_type, 'polygon': poly})
+        else:
+            rooms.append({'idx': i, 'room_type': room_type, 'polygon': poly})
             G.add_node(i, label=int(room_type))
     
-    # For each door, find which rooms it connects
-    for door in doors:
+    # Add outside node (matches original script's node -1)
+    G.add_node(-1, label=-1)
+    
+    all_doors = interior_doors + front_doors
+    
+    # For each door, compute IoU with every room and collect candidates
+    doors_rooms_map = defaultdict(list)
+    for door in all_doors:
         door_poly = door['polygon']
-        if not door_poly.is_valid:
-            door_poly = make_valid(door_poly)
-        
-        connected_rooms = []
-        
         for room in rooms:
             room_poly = room['polygon']
-            if not room_poly.is_valid:
-                room_poly = make_valid(room_poly)
-            
-            # Check if door and room intersect (share boundary or overlap)
-            if door_poly.intersects(room_poly):
-                intersection = door_poly.intersection(room_poly)
-                # Require meaningful intersection (not just a point)
-                if intersection.area > 0 or (hasattr(intersection, 'length') and intersection.length > 0):
-                    connected_rooms.append(room['idx'])
+            try:
+                intersection_area = door_poly.intersection(room_poly).area
+                union_area = door_poly.union(room_poly).area
+                if union_area > 0:
+                    iou = intersection_area / union_area
+                    if iou > 0 and iou < 0.2:
+                        doors_rooms_map[door['idx']].append((room['idx'], iou))
+            except Exception:
+                continue
+    
+    # Connect rooms through doors (matching original top-K selection)
+    for door in all_doors:
+        k = door['idx']
+        if k not in doors_rooms_map:
+            continue
+        conn = doors_rooms_map[k]
+        conn = sorted(conn, key=lambda tup: tup[1], reverse=True)
         
-        # Connect all pairs of rooms that share this door
-        for i, room1_idx in enumerate(connected_rooms):
-            for room2_idx in connected_rooms[i+1:]:
-                if not G.has_edge(room1_idx, room2_idx):
-                    G.add_edge(room1_idx, room2_idx)
+        if door['room_type'] == 17:  # interior door -> connect top-2 rooms
+            conn_top2 = conn[:2]
+            if len(conn_top2) > 1:
+                l1, l2 = conn_top2[0][0], conn_top2[1][0]
+                if not G.has_edge(l1, l2):
+                    G.add_edge(l1, l2)
+        elif door['room_type'] == 15:  # front door -> connect top-1 room to outside
+            if len(conn) > 0:
+                l1 = conn[0][0]
+                if not G.has_edge(-1, l1):
+                    G.add_edge(-1, l1)
     
     return G
 
@@ -583,112 +665,88 @@ def corners_to_masks(coords, room_types_onehot, room_indices_onehot, padding_mas
     return np.array(masks_list), np.array(room_types_list)
 
 
-def build_access_graph_from_masks(room_types, masks):
-    """
-    Build access graph from generated masks by detecting door connections.
-    
-    Extracts which rooms are connected through doors in the generated layout.
-    Uses same logic as HouseGAN++ version.
-    
-    Args:
-        room_types: Array of room type IDs (RPLAN format, 1-indexed)
-        masks: Generated masks for each room/door
-    
-    Returns:
-        NetworkX graph with only room nodes and door-based connections
-    """
-    # Create graph
-    G = nx.Graph()
-    door_connections = {}  # door_idx -> [connected_room_indices]
-    
-    # Identify room and door nodes
-    room_indices = []
-    door_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_indices.append(k)
-            door_connections[k] = []
-    
-    # For each door, find which rooms it connects
-    for door_idx in door_indices:
-        door_mask = masks[door_idx] > 0
-        
-        # Check which rooms are adjacent to this door
-        for room_idx in room_indices:
-            room_mask = masks[room_idx] > 0
-            
-            # Check if door and room are adjacent (share boundary)
-            # Dilate door mask and check for overlap with room
-            dilated_door = ndimage.binary_dilation(door_mask, iterations=2)
-            
-            if np.any(dilated_door & room_mask):
-                door_connections[door_idx].append(room_idx)
-    
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if not G.has_edge(room1, room2):
-                    G.add_edge(room1, room2)
-    
-    return G
-
 
 def build_access_graph_from_ground_truth(graph_data, room_types):
     """
     Build access graph from ground truth graph data.
     
+    Matches the algorithm from House-Diffusion's original get_graph():
+    - Room nodes for all non-door types
+    - Outside node (-1) connected via front doors (type 15)
+    - Interior doors (type 17) connect pairs of rooms
+    - Direct room-room edges where both endpoints are rooms
+    
     Args:
         graph_data: Ground truth graph triples [N, 3] with [node1, rel, node2]
                    where rel > 0 indicates adjacency
-        room_types: Array of room type IDs
+        room_types: Array of room type IDs (RPLAN format after reverse mapping)
     
     Returns:
-        NetworkX graph with room nodes and door connections
+        NetworkX graph with room nodes, outside node (-1), and door-based connections
     """
     G = nx.Graph()
     
-    # Add room nodes (exclude doors type 17 and front door type 15)
     room_indices = []
-    door_indices = []
+    interior_door_indices = []
+    front_door_indices = []
     for k, room_type in enumerate(room_types):
         if room_type not in [15, 17]:
             G.add_node(k, label=int(room_type))
             room_indices.append(k)
         elif room_type == 17:
-            door_indices.append(k)
+            interior_door_indices.append(k)
+        elif room_type == 15:
+            front_door_indices.append(k)
     
-    # Build door connections map
-    door_connections = {door_idx: [] for door_idx in door_indices}
+    # Add outside node (matches original script's node -1)
+    G.add_node(-1, label=-1)
     
-    # Parse edges from graph data
+    room_set = set(room_indices)
+    interior_door_set = set(interior_door_indices)
+    front_door_set = set(front_door_indices)
+    
+    # Build door connections maps
+    interior_door_connections = {idx: [] for idx in interior_door_indices}
+    front_door_connections = {idx: [] for idx in front_door_indices}
+    
     for edge in graph_data:
         if len(edge) != 3:
             continue
         node1, rel, node2 = int(edge[0]), edge[1], int(edge[2])
         
-        # Only consider positive relationships (adjacent)
         if rel <= 0:
             continue
         
-        # Check if this edge involves a door
-        if node1 in door_indices:
-            if node2 in room_indices:
-                door_connections[node1].append(node2)
-        elif node2 in door_indices:
-            if node1 in room_indices:
-                door_connections[node2].append(node1)
+        # Both endpoints are rooms -> direct edge (original script does this too)
+        if node1 in room_set and node2 in room_set:
+            if not G.has_edge(node1, node2):
+                G.add_edge(node1, node2)
+            continue
+        
+        # Interior door connects rooms
+        if node1 in interior_door_set and node2 in room_set:
+            interior_door_connections[node1].append(node2)
+        elif node2 in interior_door_set and node1 in room_set:
+            interior_door_connections[node2].append(node1)
+        
+        # Front door connects room to outside
+        if node1 in front_door_set and node2 in room_set:
+            front_door_connections[node1].append(node2)
+        elif node2 in front_door_set and node1 in room_set:
+            front_door_connections[node2].append(node1)
     
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
+    # Connect rooms that share an interior door
+    for door_idx, connected_rooms in interior_door_connections.items():
         for i, room1 in enumerate(connected_rooms):
             for room2 in connected_rooms[i+1:]:
                 if not G.has_edge(room1, room2):
                     G.add_edge(room1, room2)
+    
+    # Connect rooms to outside via front doors
+    for door_idx, connected_rooms in front_door_connections.items():
+        for room_idx in connected_rooms:
+            if not G.has_edge(-1, room_idx):
+                G.add_edge(-1, room_idx)
     
     return G
 
@@ -731,16 +789,18 @@ def visualize_comparison(
     ax_graph_gt = fig.add_subplot(gs[1, 0])
     ax_graph_gt.set_title('GT: Door Connections', fontsize=10)
     if G_true.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos = nx.nx_agraph.graphviz_layout(G_true, prog='neato')
         except:
             pos = nx.spring_layout(G_true, seed=42, k=1.5)
         
-        colors = [ID_COLOR.get(G_true.nodes[node]['label'], '#BEBEBE') 
-                 for node in G_true.nodes()]
-        nx.draw(G_true, pos, node_color=colors, node_size=1000,
-               edgecolors='blue', linewidths=0.0, edge_color='#b8b5b4',
+        node_colors = [ID_COLOR.get(G_true.nodes[n]['label'], '#BEBEBE') for n in G_true.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_true.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_true.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_true.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_true.edges()]
+        nx.draw(G_true, pos, node_color=node_colors, node_size=node_sizes,
+               edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
                style='dotted', width=4.0, with_labels=False, ax=ax_graph_gt)
     ax_graph_gt.axis('off')
     
@@ -756,16 +816,18 @@ def visualize_comparison(
     ax_graph_pred = fig.add_subplot(gs[1, 1])
     ax_graph_pred.set_title('Predicted: Door Connections', fontsize=10)
     if G_pred.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos = nx.nx_agraph.graphviz_layout(G_pred, prog='neato')
         except:
             pos = nx.spring_layout(G_pred, seed=42, k=1.5)
         
-        colors = [ID_COLOR.get(G_pred.nodes[node]['label'], '#BEBEBE')
-                 for node in G_pred.nodes()]
-        nx.draw(G_pred, pos, node_color=colors, node_size=1000,
-               edgecolors='blue', linewidths=0.0, edge_color='#b8b5b4', 
+        node_colors = [ID_COLOR.get(G_pred.nodes[n]['label'], '#BEBEBE') for n in G_pred.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_pred.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_pred.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_pred.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_pred.edges()]
+        nx.draw(G_pred, pos, node_color=node_colors, node_size=node_sizes,
+               edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
                style='dotted', width=4.0, with_labels=False, ax=ax_graph_pred)
     ax_graph_pred.axis('off')
     
@@ -874,12 +936,13 @@ def parse_args():
                        help="path to eval NPZ file (e.g., /path/to/processed_rplan/rplan_eval_all.npz)")
     
     # Model parameters
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="path to trained diffusion model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="path to trained diffusion model checkpoint"
+                            " (required unless --load_generations is used)")
     
     # Evaluation parameters
-    parser.add_argument("--batch_size", type=int, default=1,
-                       help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=64,
+                       help="size of the batches (64 matches House-Diffusion's default)")
     parser.add_argument("--num_samples", type=int, default=None,
                        help="number of samples to evaluate (None = auto-detect from NPZ file)")
     parser.add_argument("--num_variations", type=int, default=1,
@@ -910,28 +973,65 @@ def parse_args():
     return parser.parse_args()
 
 
-def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array=None):
-    """
-    Post-process a sample from House-Diffusion.
-    
-    Args:
-        sample_data: Dict with sample data
-        sample_ids_array: Optional numpy array of sample IDs from NPZ file
-    
-    Returns:
-        Dict with post-processed sample data
-    """
+def _make_results_dict():
+    """Return a fresh results accumulator."""
+    return {
+        'all_geds': [],
+        'ged_pairs': [],
+        'room_count_accuracies': [],
+        'room_count_errors': [],
+        'room_type_errors': [],
+        'similarity_scores': [],
+        'area_difference_scores': [],
+        'unmatched_pred_rooms': [],
+        'unmatched_gt_rooms': [],
+        'matched_room_pairs': [],
+        'hidden_room_count': 0,
+    }
 
-    # Upper bound for GED computation
+
+def _ged_worker(pair):
+    """Compute GED for a single (G_pred, G_true, idx, upper_bound) tuple."""
+    G_pred, G_true, sample_idx, upper_bound = pair
+    ged, _ = ged_between_graphs(
+        G_pred, G_true, sample_idx,
+        timeout=10000, upper_bound=upper_bound
+    )
+    return ged if ged is not None else np.nan
+
+
+def _parallel_ged(ged_pairs):
+    """Run all GED computations in parallel using joblib."""
+    import multiprocessing
+    from joblib import Parallel, delayed
+
+    num_cores = multiprocessing.cpu_count()
+    print(f"\nComputing GED for {len(ged_pairs)} pairs using {num_cores} cores...")
+
+    all_geds = Parallel(n_jobs=num_cores)(
+        delayed(_ged_worker)(pair)
+        for pair in tqdm(ged_pairs, desc="Computing GED")
+    )
+    return all_geds
+
+
+def postprocess_sample(sample_data, results, save_graphs, output_dir,
+                       sample_ids_array=None):
+    """Post-process a sample: compute all metrics except GED.
+
+    GED graph pairs are collected into *results['ged_pairs']* so that
+    the caller can run them in parallel after all samples are processed.
+
+    Returns:
+        The updated *results* dict.
+    """
     ged_upper_bound = 40
 
-    # Get sample index and ID
     sample_idx = sample_data['sample_idx']
     sample_id = None
     if sample_ids_array is not None and sample_idx < len(sample_ids_array):
         sample_id = sample_ids_array[sample_idx]
-            
-    # Convert to polygons (for access graph) and masks (for visualization)
+
     gt_polygons = corners_to_polygons_and_types(
         sample_data['gt_coords'],
         sample_data['gt_room_types_oh'],
@@ -948,44 +1048,38 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         image_size=256
     )
 
-    # Build ground truth access graph from polygons
     G_true = build_access_graph_from_polygons(gt_polygons)
 
-    # Clear variation_geds
-    results['variation_geds'] = []
+    syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
+    syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
+    syn_padding_mask = sample_data.get('syn_padding_mask', sample_data['gt_padding_mask'])
 
-    # Process each variation
     for var_data in sample_data['variations']:
         var_idx = var_data['variation_idx']
-        
-        # Convert to polygons (for access graph) and masks (for visualization)
+
         pred_polygons = corners_to_polygons_and_types(
             var_data['pred_coords'],
-            sample_data['gt_room_types_oh'],  # Use GT conditioning
-            sample_data['gt_room_indices_oh'],
-            sample_data['gt_padding_mask'],
-            image_size=256
-        )
-        
-        pred_masks, pred_room_types = corners_to_masks(
-            var_data['pred_coords'],
-            sample_data['gt_room_types_oh'],  # Use GT conditioning
-            sample_data['gt_room_indices_oh'],
-            sample_data['gt_padding_mask'],
+            syn_room_types_oh,
+            syn_room_indices_oh,
+            syn_padding_mask,
             image_size=256
         )
 
-        # Build predicted access graph directly from polygons (more accurate!)
+        pred_masks, pred_room_types = corners_to_masks(
+            var_data['pred_coords'],
+            syn_room_types_oh,
+            syn_room_indices_oh,
+            syn_padding_mask,
+            image_size=256
+        )
+
         G_pred = build_access_graph_from_polygons(pred_polygons)
-        
-        # Count actual rooms in generated polygons (accounting for hidden/overlapped regions)
+
         room_count_info = count_actual_rooms_from_polygons(pred_polygons)
-        
-        # Track hidden rooms
+
         if len(room_count_info['hidden_rooms']) > 0:
             results['hidden_room_count'] += 1
-        
-        # Compute room count and type accuracy
+
         room_count_metric = room_type_accuracy(
             room_count_info['expected_room_types'],
             room_count_info['actual_room_types']
@@ -993,8 +1087,7 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         results['room_count_accuracies'].append(room_count_metric['accuracy'])
         results['room_count_errors'].append(room_count_metric['count_error'])
         results['room_type_errors'].append(room_count_metric['type_error'])
-        
-        # Compute room similarity score
+
         similarity_result = compute_room_similarity_score_polygons(
             pred_polygons, gt_polygons
         )
@@ -1002,30 +1095,26 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         results['unmatched_pred_rooms'].append(similarity_result['unmatched_pred'])
         results['unmatched_gt_rooms'].append(similarity_result['unmatched_gt'])
         results['matched_room_pairs'].append(similarity_result['matched_pairs'])
-        
-        # Compute GED
-        ged, graph_len = ged_between_graphs(
-            G_pred, G_true, sample_idx,
-            timeout=10000, upper_bound=ged_upper_bound
-        )
-        
-        if ged is not None:
-            results['variation_geds'].append(ged)
-        else:
-            results['variation_geds'].append(np.nan)
 
-    
-        # Save visualization for first variation
+        area_diff_result = compute_room_area_difference_score_polygons(
+            pred_polygons, gt_polygons
+        )
+        results['area_difference_scores'].append(area_diff_result['area_difference_score'])
+
+        results['ged_pairs'].append(
+            (G_pred, G_true, sample_idx, ged_upper_bound)
+        )
+
         if var_idx == 0 and save_graphs:
             visualize_comparison(
                 gt_masks, gt_room_types,
                 pred_masks, pred_room_types,
-                G_true, G_pred, ged, sample_idx, output_dir,
+                G_true, G_pred, None, sample_idx, output_dir,
                 room_count_info=room_count_info,
                 similarity_result=similarity_result,
                 sample_id=sample_id
             )
-        
+
     return results
 
 def load_and_process_cached_samples(cached_data_path, num_variations, save_graphs, output_dir, sample_ids_array=None):
@@ -1047,236 +1136,43 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
     
     pbar = tqdm(total=len(cached_data['samples']), desc="Processing cached")
 
-    # Storage for results
-    results = {
-        'variation_geds': [],
-        'all_geds': [],
-        'room_count_accuracies': [],
-        'room_count_errors': [],
-        'room_type_errors': [],
-        'similarity_scores': [],
-        'unmatched_pred_rooms': [],
-        'unmatched_gt_rooms': [],
-        'matched_room_pairs': [],
-        'hidden_room_count': 0,
-    }
+    results = _make_results_dict()
     sample_count = 0
 
     try:
         for sample_data in cached_data['samples']:
-            # Post-process each sample
-            results = postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array)           
+            results = postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array)
             sample_count += 1
-                
-            # Record results (always extend, even with NaNs)
-            # This ensures we always have num_variations entries per sample
-            results['all_geds'].extend(results['variation_geds'])
-                
             pbar.update(1)
-    
+
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted by user")
     finally:
         pbar.close()
+
+    results['all_geds'] = _parallel_ged(results['ged_pairs'])
     return results
 
-def print_and_save_data_statistics(results, num_variations):
-    """
-    Compute and print statistics for the dataset.
-    """
-
-    # Get results
-    room_count_accuracies = results['room_count_accuracies']
-    room_count_errors = results['room_count_errors']
-    room_type_errors = results['room_type_errors']
-    similarity_scores = results['similarity_scores']
-    unmatched_pred_rooms = results['unmatched_pred_rooms']
-    unmatched_gt_rooms = results['unmatched_gt_rooms']
-    matched_room_pairs = results['matched_room_pairs']
-    hidden_room_count = results['hidden_room_count']
-
-    # Print room count accuracy statistics
-    print(f"\n{'='*60}")
-    print("ROOM COUNT AND TYPE ACCURACY STATISTICS")
-    print(f"{'='*60}")
-    
-    room_count_accuracies_array = np.array(room_count_accuracies)
-    room_count_errors_array = np.array(room_count_errors)
-    room_type_errors_array = np.array(room_type_errors)
-    
-    # Overall statistics (across all samples and variations)
-    exact_match_rate = np.mean(room_count_accuracies_array) * 100
-    mean_count_error = np.mean(room_count_errors_array)
-    median_count_error = np.median(room_count_errors_array)
-    max_count_error = np.max(room_count_errors_array)
-    mean_type_error = np.mean(room_type_errors_array)
-    median_type_error = np.median(room_type_errors_array)
-    max_type_error = np.max(room_type_errors_array)
-    hidden_rate = (hidden_room_count / len(room_count_accuracies)) * 100
-    
-    # Compute STD of variation means (same method as GED statistics)
-    # This measures if different generation runs produce systematically different results
-    std_of_variation_means = 0.0
-    count_error_std_of_variation_means = 0.0
-    type_error_std_of_variation_means = 0.0
-    
-    if num_variations > 1:
-        num_samples_processed = len(room_count_accuracies) // num_variations
-        if len(room_count_accuracies) % num_variations == 0:
-            accuracies_reshaped = room_count_accuracies_array.reshape(num_samples_processed, num_variations)
-            count_errors_reshaped = room_count_errors_array.reshape(num_samples_processed, num_variations)
-            type_errors_reshaped = room_type_errors_array.reshape(num_samples_processed, num_variations)
-            
-            # Mean per variation (averaged across all samples) - same as GED calculation
-            means_per_variation = np.mean(accuracies_reshaped, axis=0)
-            count_error_means_per_variation = np.mean(count_errors_reshaped, axis=0)
-            type_error_means_per_variation = np.mean(type_errors_reshaped, axis=0)
-            
-            # STD of variation means with ddof=1 (sample std) - same as GED calculation
-            std_of_variation_means = np.std(means_per_variation, ddof=1)
-            count_error_std_of_variation_means = np.std(count_error_means_per_variation, ddof=1)
-            type_error_std_of_variation_means = np.std(type_error_means_per_variation, ddof=1)
-            
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Accuracy STD of variation means: {std_of_variation_means:.3f} ({std_of_variation_means*100:.1f}%)")
-            print(f"   • Mean per variation: {means_per_variation}")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Count error STD of variation means: {count_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Type error STD of variation means: {type_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-        else:
-            # Fallback if num_variations doesn't divide evenly
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-    else:
-        # Single variation case
-        print(f"\n📊 Room Count and Type Accuracy:")
-        print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-        print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-        print(f"   • Median count error: {median_count_error:.1f} rooms")
-        print(f"   • Max count error: {max_count_error:.0f} rooms")
-        print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-        print(f"   • Median type error: {median_type_error:.1f} rooms")
-        print(f"   • Max type error: {max_type_error:.0f} rooms")
-        print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-    
-    print(f"\n💭 Interpretation:")
-    print(f"   This measures how accurately the model predicts both the number and types of rooms.")
-    print(f"   Accuracy = 1.0 only if both count and type distribution match perfectly.")
-    print(f"   {exact_match_rate:.1f}% of predictions have exactly the right room count and types.")
-    print(f"   Note: Hidden rooms (completely overlapped by other polygons) are excluded from count.")
-    
-    # Print room similarity score statistics
-    print(f"\n{'='*60}")
-    print("ROOM SIMILARITY SCORE STATISTICS")
-    print(f"{'='*60}")
-    
-    similarity_scores_array = np.array(similarity_scores)
-    # Filter out NaN values (no rooms to compare)
-    valid_similarity_scores = similarity_scores_array[~np.isnan(similarity_scores_array)]
-    
-    if len(valid_similarity_scores) > 0:
-        mean_similarity = np.mean(valid_similarity_scores)
-        median_similarity = np.median(valid_similarity_scores)
-        min_similarity = np.min(valid_similarity_scores)
-        max_similarity = np.max(valid_similarity_scores)
-        std_similarity = np.std(valid_similarity_scores)
-        valid_rate = (len(valid_similarity_scores) / len(similarity_scores_array)) * 100
-        
-        print(f"\n📊 Room Similarity Score (δ = abs(1 - (L_SA * L_B)/(L_A * L_SB))):")
-        print(f"   • Mean: {mean_similarity:.4f} (lower is better, 0 = perfect match)")
-        print(f"   • Median: {median_similarity:.4f}")
-        print(f"   • STD: {std_similarity:.4f}")
-        print(f"   • Range: [{min_similarity:.4f}, {max_similarity:.4f}]")
-        print(f"   • Valid samples: {len(valid_similarity_scores)}/{len(similarity_scores_array)} ({valid_rate:.1f}%)")
-        
-        # Report unmatched room statistics
-        total_unmatched_pred = sum(unmatched_pred_rooms)
-        total_unmatched_gt = sum(unmatched_gt_rooms)
-        total_matched_pairs = sum(matched_room_pairs)
-        avg_unmatched_pred = np.mean(unmatched_pred_rooms)
-        avg_unmatched_gt = np.mean(unmatched_gt_rooms)
-        
-        print(f"\n📊 Room Matching Statistics:")
-        print(f"   • Total matched room pairs: {total_matched_pairs}")
-        print(f"   • Total unmatched pred rooms: {total_unmatched_pred} (avg: {avg_unmatched_pred:.2f} per sample)")
-        print(f"   • Total unmatched GT rooms: {total_unmatched_gt} (avg: {avg_unmatched_gt:.2f} per sample)")
-        
-        print(f"\n💭 Interpretation:")
-        print(f"   This measures geometric similarity between predicted and GT rooms.")
-        print(f"   Lower scores indicate better shape matching (0 = identical shapes).")
-        print(f"   Compares common rooms when counts differ (extras are ignored).")
-        
-        # Compute STD of variation means if applicable
-        similarity_std_of_variation_means = 0.0
-        if num_variations > 1:
-            num_samples_processed = len(valid_similarity_scores) // num_variations
-            if num_samples_processed > 0 and len(valid_similarity_scores) % num_variations == 0:
-                sim_reshaped = valid_similarity_scores.reshape(num_samples_processed, num_variations)
-                sim_means_per_variation = np.mean(sim_reshaped, axis=0)
-                similarity_std_of_variation_means = np.std(sim_means_per_variation, ddof=1)
-                print(f"\n   • STD of variation means: {similarity_std_of_variation_means:.4f}")
-                print(f"   • Mean per variation: {sim_means_per_variation}")
-    else:
-        mean_similarity = np.nan
-        median_similarity = np.nan
-        std_similarity = np.nan
-        min_similarity = np.nan
-        max_similarity = np.nan
-        similarity_std_of_variation_means = np.nan
-        valid_rate = 0.0
-        
-        print(f"\n⚠️  No valid similarity scores (no rooms to compare)")
-    
-    # Compute and save statistics using shared function
-    room_count_dict = {
-        'exact_match_rate': float(exact_match_rate),
-        'accuracy_std': float(std_of_variation_means),  # std of variation means (consistency metric)
-        'mean_count_error': float(mean_count_error),
-        'count_error_std': float(count_error_std_of_variation_means),
-        'median_count_error': float(median_count_error),
-        'max_count_error': float(max_count_error),
-        'mean_type_error': float(mean_type_error),
-        'type_error_std': float(type_error_std_of_variation_means),
-        'median_type_error': float(median_type_error),
-        'max_type_error': float(max_type_error),
-        'hidden_samples': hidden_room_count,
-        'hidden_rate': float(hidden_rate),
-        'all_accuracies': room_count_accuracies_array.tolist(),
-        'all_count_errors': room_count_errors_array.tolist(),
-        'all_type_errors': room_type_errors_array.tolist()
+def _build_additional_info(results):
+    """Package raw per-sample arrays for ``score_benchmark_result``."""
+    return {
+        'room_count_accuracy': {
+            'accuracies': results['room_count_accuracies'],
+            'count_errors': results['room_count_errors'],
+            'type_errors': results['room_type_errors'],
+            'hidden_count': results['hidden_room_count'],
+            'total_samples': len(results['room_count_accuracies']),
+        },
+        'room_similarity': {
+            'scores': results['similarity_scores'],
+            'matched_room_pairs': results['matched_room_pairs'],
+            'unmatched_pred_rooms': results['unmatched_pred_rooms'],
+            'unmatched_gt_rooms': results['unmatched_gt_rooms'],
+        },
+        'area_difference': {
+            'scores': results['area_difference_scores'],
+        },
     }
-    
-    similarity_dict = {
-        'mean': float(mean_similarity) if not np.isnan(mean_similarity) else None,
-        'median': float(median_similarity) if not np.isnan(median_similarity) else None,
-        'std': float(std_similarity) if not np.isnan(std_similarity) else None,
-        'std_of_variation_means': float(similarity_std_of_variation_means) if not np.isnan(similarity_std_of_variation_means) else None,
-        'min': float(min_similarity) if not np.isnan(min_similarity) else None,
-        'max': float(max_similarity) if not np.isnan(max_similarity) else None,
-        'valid_count': int(len(valid_similarity_scores)),
-        'valid_rate': float(valid_rate),
-        'total_matched_pairs': int(sum(matched_room_pairs)),
-        'total_unmatched_pred': int(sum(unmatched_pred_rooms)),
-        'total_unmatched_gt': int(sum(unmatched_gt_rooms)),
-        'avg_unmatched_pred': float(np.mean(unmatched_pred_rooms)),
-        'avg_unmatched_gt': float(np.mean(unmatched_gt_rooms)),
-        'all_scores': similarity_scores_array.tolist()
-    }
-    return room_count_dict, similarity_dict
     
 
 def main():
@@ -1467,19 +1363,7 @@ def main():
         if save_mode:
             cache_samples = []
         
-        # Initialize results storage (same structure as load_and_process_cached_samples)
-        results = {
-            'variation_geds': [],
-            'all_geds': [],
-            'room_count_accuracies': [],
-            'room_count_errors': [],
-            'room_type_errors': [],
-            'similarity_scores': [],
-            'unmatched_pred_rooms': [],
-            'unmatched_gt_rooms': [],
-            'matched_room_pairs': [],
-            'hidden_room_count': 0,
-        }
+        results = _make_results_dict()
         
         # Process samples
         pbar = tqdm(total=total_samples if total_samples != float('inf') else None)
@@ -1499,24 +1383,44 @@ def main():
                     model_kwargs[key] = model_kwargs[key].to(device)
                 
                 batch_size_actual = data_sample.shape[0]
-                
-                # Process each sample in batch
+
+                # Generate all variations for the full batch at once
+                batch_pred_coords = []  # [num_variations][batch_size_actual] of [2, num_points]
+                for var_idx in range(args.num_variations):
+                    with torch.no_grad():
+                        pred_sample = sample_fn(
+                            model,
+                            data_sample.shape,
+                            clip_denoised=args.clip_denoised,
+                            model_kwargs=model_kwargs,
+                            analog_bit=args.analog_bit,
+                        )
+                    # pred_sample shape: [timesteps, batch, 2, num_points]
+                    batch_pred_coords.append(pred_sample[-1].cpu().numpy())  # [batch, 2, num_points]
+                    del pred_sample
+                    torch.cuda.empty_cache()
+
+                # Post-process each sample in the batch
                 for batch_idx in range(batch_size_actual):
                     if sample_count >= total_samples:
                         break
 
-                    # Extract ground truth for this sample
-                    gt_sample = data_sample[batch_idx:batch_idx+1]
-                    gt_kwargs = {k: v[batch_idx:batch_idx+1] for k, v in model_kwargs.items()}
+                    gt_coords = data_sample[batch_idx].cpu().numpy()  # [2, num_points]
+                    gt_room_types_oh = model_kwargs['room_types'][batch_idx].cpu().numpy()
+                    gt_room_indices_oh = model_kwargs['room_indices'][batch_idx].cpu().numpy()
+                    gt_padding_mask = (1 - model_kwargs['src_key_padding_mask'][batch_idx].cpu().numpy()).astype(int)
 
-                    # Extract data for this sample
-                    gt_coords = gt_sample[0].cpu().numpy()  # [2, num_points]
-                    gt_room_types_oh = gt_kwargs['room_types'][0].cpu().numpy()  # [num_points, 25]
-                    gt_room_indices_oh = gt_kwargs['room_indices'][0].cpu().numpy()  # [num_points, 32]
-                    gt_padding_mask = (1 - gt_kwargs['src_key_padding_mask'][0].cpu().numpy()).astype(int)  # [num_points]
+                    syn_room_types_oh = model_kwargs['syn_room_types'][batch_idx].cpu().numpy()
+                    syn_room_indices_oh = model_kwargs['syn_room_indices'][batch_idx].cpu().numpy()
+                    syn_padding_mask = (1 - model_kwargs['syn_src_key_padding_mask'][batch_idx].cpu().numpy()).astype(int)
 
-                    # Storage for this sample's variations
                     sample_variations = []
+                    for var_idx in range(args.num_variations):
+                        sample_variations.append({
+                            'variation_idx': var_idx,
+                            'pred_coords': batch_pred_coords[var_idx][batch_idx].copy(),
+                        })
+
                     sample_data = {
                         'sample_idx': sample_count,
                         'variations': sample_variations,
@@ -1524,37 +1428,13 @@ def main():
                         'gt_room_types_oh': gt_room_types_oh,
                         'gt_room_indices_oh': gt_room_indices_oh,
                         'gt_padding_mask': gt_padding_mask,
+                        'syn_room_types_oh': syn_room_types_oh,
+                        'syn_room_indices_oh': syn_room_indices_oh,
+                        'syn_padding_mask': syn_padding_mask,
                     }
 
-                    for var_idx in range(args.num_variations):
-                        # Generate sample
-                        with torch.no_grad():
-                            pred_sample = sample_fn(
-                                model,
-                                gt_sample.shape,
-                                clip_denoised=args.clip_denoised,
-                                model_kwargs=gt_kwargs,
-                                analog_bit=args.analog_bit,
-                            )
-
-                        # pred_sample shape: [timesteps, batch, 2, num_points]
-                        pred_coords = pred_sample[-1, 0].cpu().numpy()  # [2, num_points]
-
-                        del pred_sample
-                        torch.cuda.empty_cache()
-
-                        sample_variations.append({
-                            'variation_idx': var_idx,
-                            'pred_coords': pred_coords.copy(),
-                        })
-
-                    # Postprocess sample's variations
                     results = postprocess_sample(sample_data, results, args.save_graphs, args.out, sample_ids_array)
 
-                    # Record results (always extend, even with NaNs)
-                    results['all_geds'].extend(results['variation_geds'])
-
-                    # After all variations for this sample, store in cache if enabled
                     if save_mode:
                         cache_samples.append({
                             'sample_idx': sample_count,
@@ -1562,6 +1442,9 @@ def main():
                             'gt_room_types_oh': gt_room_types_oh.copy(),
                             'gt_room_indices_oh': gt_room_indices_oh.copy(),
                             'gt_padding_mask': gt_padding_mask.copy(),
+                            'syn_room_types_oh': syn_room_types_oh.copy(),
+                            'syn_room_indices_oh': syn_room_indices_oh.copy(),
+                            'syn_padding_mask': syn_padding_mask.copy(),
                             'variations': sample_variations
                         })
 
@@ -1588,21 +1471,16 @@ def main():
                 'version': '1.0'
             }
             save_generations_housediffusion(args.save_generations, metadata, cache_samples)
-    
-    # Print and save data statistics
-    room_count_dict, similarity_dict = print_and_save_data_statistics(results, args.num_variations)
 
-    # Save GED statistics
-    compute_and_save_ged_statistics(
+        results['all_geds'] = _parallel_ged(results['ged_pairs'])
+    
+    score_benchmark_result(
         all_geds=np.array(results['all_geds']),
         num_variations=args.num_variations,
         output_dir=args.out,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
-        additional_info={
-            'room_count_accuracy': room_count_dict,
-            'room_similarity': similarity_dict
-        }
+        additional_info=_build_additional_info(results),
     )
     
     return 0

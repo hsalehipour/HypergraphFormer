@@ -53,9 +53,6 @@ events.out.tfevents*
 # directories
 checkpoints/
 
-dataset/hypergraph/*
-!dataset/hypergraph/train.json
-!dataset/hypergraph/validation.json
-!dataset/hypergraph/test.json
-!dataset/hypergraph/*.py
+!dataset/wmr24/wmr24.json
 *.code-workspace
+_debug/

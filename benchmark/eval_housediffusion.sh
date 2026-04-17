@@ -4,10 +4,13 @@
 # House-Diffusion Evaluation Script
 # ============================================
 # Generates floorplans and computes metrics (GED, room accuracy, delta)
-# against the Hypergraph1K eval set.
+# from a directory of RPLAN JSON files (produced by Housegan-data-reader).
+#
+# Automatically converts JSON -> NPZ (if not already cached) using
+# benchmark/utils/convert_json_to_npz.py, then runs evaluation.
 #
 # Usage:
-#   ./eval_housediffusion.sh
+#   ./eval_housediffusion.sh /path/to/json_dir
 # ============================================
 
 set -e
@@ -24,14 +27,14 @@ HOUSEDIFFUSION_REPO="$REPOS_DIR/house_diffusion"
 # Virtual environment
 VENV_PATH="$HF_ROOT/.venv"
 
-# Data path (eval NPZ from house_diffusion)
-EVAL_NPZ="$HOUSEDIFFUSION_REPO/processed_rplan/rplan_eval_all.npz"
+# Data path -- directory of RPLAN JSON files
+JSON_DIR="${1:-}"
 
 # Model checkpoint
-CHECKPOINT="$HOUSEDIFFUSION_REPO/runs/ft_housediffusion_v1/model795000.pt"
+CHECKPOINT="$HOUSEDIFFUSION_REPO/checkpoints/pretrained_model250000.pt"
 
 # Evaluation parameters
-NUM_SAMPLES=""          # Number of samples (empty = all from NPZ)
+NUM_SAMPLES=""          # Number of samples (empty = all)
 NUM_VARIATIONS=1        # Number of generation variations per sample
 
 # Output directory
@@ -48,7 +51,7 @@ LOAD_GENERATIONS=""     # Path to load previously generated outputs pickle
 echo "============================================"
 echo "House-Diffusion Evaluation"
 echo "============================================"
-echo "  Data:           $EVAL_NPZ"
+echo "  JSON dir:       $JSON_DIR"
 echo "  Checkpoint:     $CHECKPOINT"
 echo "  Variations:     $NUM_VARIATIONS"
 echo "  Output:         $OUTPUT_DIR"
@@ -58,16 +61,24 @@ echo ""
 # Verify Prerequisites
 # ============================================
 
+if [ -z "$JSON_DIR" ]; then
+    echo "Usage: $0 <json_dir>"
+    echo ""
+    echo "  json_dir  Directory containing RPLAN JSON files"
+    echo "            (produced by Housegan-data-reader's batch_raster_to_json.py)"
+    exit 1
+fi
+
+if [ ! -d "$JSON_DIR" ]; then
+    echo "✗ JSON directory not found: $JSON_DIR"
+    exit 1
+fi
+
 if [ -n "$CHECKPOINT" ] && [ -z "$LOAD_GENERATIONS" ] && [ ! -f "$CHECKPOINT" ]; then
     echo "✗ Checkpoint not found: $CHECKPOINT"
     echo ""
     echo "Available checkpoints:"
-    ls -1 "$HOUSEDIFFUSION_REPO"/runs/*/model*.pt 2>/dev/null | head -10 || echo "  None found"
-    exit 1
-fi
-
-if [ ! -f "$EVAL_NPZ" ]; then
-    echo "✗ Evaluation NPZ not found: $EVAL_NPZ"
+    ls -1 "$HOUSEDIFFUSION_REPO"/checkpoints/*.pt 2>/dev/null | head -10 || echo "  None found"
     exit 1
 fi
 
@@ -91,6 +102,40 @@ echo "✓ PYTHONPATH configured"
 
 mkdir -p "$OUTPUT_DIR"
 echo "✓ Output directory: $OUTPUT_DIR"
+echo ""
+
+# ============================================
+# JSON -> NPZ Conversion (if needed)
+# ============================================
+
+# Resolve JSON_DIR to absolute path for consistent NPZ placement
+JSON_DIR="$(cd "$JSON_DIR" && pwd)"
+DATASET_ROOT="$(dirname "$JSON_DIR")"
+NPZ_DIR="$DATASET_ROOT/processed_rplan"
+EVAL_NPZ="$NPZ_DIR/rplan_eval_all.npz"
+CNDIST_NPZ="$NPZ_DIR/rplan_train_all_cndist.npz"
+SYN_NPZ="$NPZ_DIR/rplan_eval_all_syn.npz"
+
+# Train JSON dir: sibling "train/" directory (for building cndist from training data)
+TRAIN_JSON_DIR="$DATASET_ROOT/train"
+
+if [ -f "$EVAL_NPZ" ] && [ -f "$CNDIST_NPZ" ] && [ -f "$SYN_NPZ" ]; then
+    echo "✓ Using cached NPZ files in $NPZ_DIR"
+else
+    CONVERT_CMD="python3 \"$BENCHMARK_DIR/utils/convert_json_to_npz.py\" \
+        --json_dir \"$JSON_DIR\" \
+        --output_dir \"$NPZ_DIR\""
+    if [ -d "$TRAIN_JSON_DIR" ]; then
+        echo "Using train data from $TRAIN_JSON_DIR for corner distribution"
+        CONVERT_CMD="$CONVERT_CMD --train_json_dir \"$TRAIN_JSON_DIR\""
+    else
+        echo "Warning: Train directory not found at $TRAIN_JSON_DIR"
+        echo "  Corner distribution will be built from eval data (less accurate)"
+    fi
+    echo "Converting JSON -> NPZ ..."
+    eval $CONVERT_CMD
+    echo "✓ NPZ conversion complete"
+fi
 echo ""
 
 # ============================================

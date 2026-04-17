@@ -13,7 +13,7 @@ and geometric subdivisions, enabling generation of floor plans for arbitrary,
 user-specified boundaries.  Reinforcement learning fine-tuning with GRPO
 further improves structural consistency and semantic accuracy.
 
-Evaluated on the **Hypergraph1k** dataset (~1,000 architect-designed floor
+Evaluated on the **WMR24** dataset (~1,000 architect-designed floor
 plans from Zurich, New York, and Singapore), HypergraphFormer achieves a GED
 of **1.45** and room-set accuracy of **94.2%**, outperforming HouseDiffusion
 and HouseGAN++ while requiring significantly less training data.
@@ -82,6 +82,8 @@ HypergraphFormer/
 │   │
 │   │  # Data preparation (--mode jsonl | eval-format | room-lists)
 │   ├── data_preparation.py          JSON → JSONL, eval-format .txt, or room-list JSONs
+│   ├── data_preparation_access.py   Prepare access-graph .txt files from RPLAN
+│   │                                      dataset_access for evaluator.py
 │   │
 │   │  # Training
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
@@ -94,14 +96,13 @@ HypergraphFormer/
 │   ├── evaluator.py                 Unified evaluator (trained, rooms-only,
 │   │                                      fewshot-qwen, fewshot-gpt)
 │   │
-│   │  # Post-inference scoring (--metrics ged accuracy delta)
+│   │  # Post-inference scoring (--metrics ged accuracy delta area_difference)
 │   └── score_results.py             Score saved results against ground truth
 │
 ├── rplan/                          # ── RPLAN dataset processing ───────
 │   ├── build_dataset_access.py      Build access graphs from DiffPlanner + original PNGs
 │   ├── rplan_to_hypergraph.py       Native Python BSP conversion (with look-ahead
 │   │                                      and evolutionary search)
-│   ├── rplan_to_hypergraph_rgl.py   RGL-based BSP conversion (C# geometry library)
 │   ├── postprocess_hypergraphs.py   Fix disconnected access graphs
 │   ├── visualize_rplan_hypergraph.py            Visualize BSP + RGL mesh
 │   ├── visualize_disconnected_accessgraphs.py   Visualize disconnected samples
@@ -110,22 +111,26 @@ HypergraphFormer/
 ├── utils/                          # ── Shared utility library ─────────
 │   ├── __init__.py                     Public API re-exports
 │   ├── utils.py                        Validation, JSON extraction, timeout
-│   ├── metrics.py                      GED, delta, room-type accuracy, produce_room_list
+│   ├── metrics.py                      GED, delta, area difference, room-type accuracy,
+│   │                                        produce_room_list
 │   ├── hypergraph.py                   Hypergraph class, HypergraphPlotter
 │   ├── prompts.py                      BSP rules, prompt templates
 │   ├── data_loading.py                 Dataset helpers, example loading
 │   └── benchmark_qwen_inference.py     Inference timing benchmark
 │
 ├── dataset/                        # ── Raw datasets ───────────────────
-│   ├── hypergraph/                      Hypergraph1k: train.json, validation.json, test.json
+│   ├── wmr24/                           WMR24: wmr24.json + HouseGAN++ conversions
+│   │   ├── wmr24.json                       Full dataset (hypergraph format)
+│   │   └── wmr24_housegan_json/             Converted for baseline evaluation
+│   │       ├── processed_rplan/                 NPZ files (House-Diffusion)
+│   │       └── processed_rplan_pickles/         Pickle files (HouseGAN++)
 │   ├── rplan/                           RPLAN data (see "Preparing the RPLAN Dataset")
 │   │   ├── dataset_original/               RPLAN floorplan PNGs (downloaded)
 │   │   ├── dataset_diffplanner/            DiffPlanner JSON splits (downloaded)
 │   │   ├── dataset_access/                 Access graphs (built from above)
 │   │   ├── dataset_hypergraph_la0/         BSP hypergraphs (exported)
 │   │   └── dataset_hypergraph_la0_fixed/   Post-processed (access graphs fixed)
-│   ├── msd/                             Modified Swiss Dwellings CSV
-│   └── furniture_json/                  Furniture placement data
+│   └── msd/                             Modified Swiss Dwellings CSV
 │
 ├── eval_format/                    # ── Prepared evaluation data ───────
 │   ├── train/                          779 .txt files (accessgraph + hypergraph)
@@ -140,14 +145,20 @@ HypergraphFormer/
 │   └── notebooks/                      MSD exploration notebooks
 │
 ├── benchmark/                      # HouseGAN++ & House-Diffusion baselines
-│   ├── eval_houseganpp.sh
-│   ├── eval_housediffusion.sh
-│   ├── finetune_houseganpp.sh
-│   ├── finetune_housediffusion.sh
+│   ├── eval_houseganpp.sh              Evaluate HouseGAN++
+│   ├── eval_housediffusion.sh          Evaluate House-Diffusion
+│   ├── setup_houseganpp.sh             Setup HouseGAN++ environment + data conversion
+│   ├── setup_housediffusion.sh         Setup House-Diffusion environment + data conversion
 │   ├── utils/
-│   │   ├── convert_hypergraph_to_rplan.py
-│   │   └── convert_hypergraph_to_diffplanner.py
+│   │   ├── convert_hypergraph_to_housegan_json.py   WMR24 JSON → HouseGAN++ JSON
+│   │   ├── convert_json_to_pickle.py                HouseGAN++ JSON → pickle
+│   │   ├── convert_json_to_npz.py                   HouseGAN++ JSON → NPZ
+│   │   ├── score_benchmark_result.py                Compute & save benchmark metrics
+│   │   └── analyze_metrics_by_room_count.py         Post-eval metric binning
 │   └── src/
+│       ├── dataset_loader.py            Shared PyTorch dataset module
+│       ├── evaluate_houseganpp.py       HouseGAN++ evaluation
+│       └── evaluate_housediffusion.py   House-Diffusion evaluation
 │
 ├── notebooks/                      # Jupyter notebooks
 │   └── generate_and_visualize_hypergraphs.ipynb
@@ -361,15 +372,15 @@ python scripts/evaluator.py --mode fewshot-gpt \
 
 ### 6. Score saved results (post-inference)
 
-Compute any combination of GED, accuracy, and delta metrics on saved
-`*_hypergraphs.json` files:
+Compute any combination of GED, accuracy, delta, and area difference
+metrics on saved `*_hypergraphs.json` files:
 
 ```bash
 # All metrics at once
 python scripts/score_results.py \
     --results-file path/to/results_test_hypergraphs.json \
     --test-dir dataset/hypergraph/test \
-    --metrics ged accuracy delta
+    --metrics ged accuracy delta area_difference
 
 # Just GED
 python scripts/score_results.py \
@@ -399,7 +410,12 @@ python scripts/score_results.py \
     --summary-only
 ```
 
-### 7. Generate a single hypergraph (interactive)
+### 7. Benchmark against baselines (HouseGAN++, House-Diffusion)
+
+See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
+the HouseGAN++ and House-Diffusion baselines on the WMR24 dataset.
+
+### 8. Generate a single hypergraph (interactive)
 
 ```bash
 # With Qwen (local, streaming progress bar)
@@ -411,7 +427,7 @@ python scripts/fewshot_generator.py --backend gpt \
     --from-dataset --examples-dir eval_format/train
 ```
 
-### 8. Run batch few-shot experiments
+### 9. Run batch few-shot experiments
 
 `run_fewshot_experiments.sh` automates running `fewshot_generator.py` across
 multiple shot counts and rounds, with optional post-run scoring:
@@ -440,11 +456,12 @@ bash run_fewshot_experiments.sh --score-only \
 | Concept | Description |
 |---|---|
 | **Hypergraph** | A reduced-order representation of a floor plan consisting of a BSP tree (spatial hierarchy) combined with an access graph (room connectivity). Each intermediate node encodes area and splitting angle; leaf nodes correspond to rooms and store their type and connections. |
-| **Access Graph** | A graph where nodes represent rooms (labelled by type) and edges represent adjacency (doors / open connections). Serves as the input condition for generation. |
+| **Access Graph** | A graph where nodes represent rooms (labelled by type) and edges represent door-based connections. Serves as the input condition for generation. |
 | **BSP Tree** | Binary Space Partition — the root represents the full apartment; each split recursively divides a region into two sub-regions along an axis-aligned angle until individual rooms are obtained. |
 | **GED** | Graph Edit Distance — minimum-cost sequence of vertex and edge edits to transform one access graph into another, used as the primary structural similarity metric. |
 | **Room-Set Accuracy** | Fraction of test samples where the generated floor plan exactly matches the ground-truth room composition (count and types). |
 | **Geometric Compactness Deviation (\(\delta\))** | Per-room shape deviation measuring how much a generated room polygon departs from the compactness of its ground-truth counterpart. |
+| **Area Difference** | Relative room-area error between paired predicted and ground-truth rooms, averaged per sample. |
 | **LoRA** | Low-Rank Adaptation — parameter-efficient fine-tuning; default configuration: rank 64, alpha 128. |
 | **GRPO** | Group Relative Policy Optimization — RL algorithm used in the second training stage to optimize metric-based rewards (accuracy, GED, compactness). |
 
@@ -458,7 +475,7 @@ The `utils/` package provides shared helpers used by the pipeline scripts:
 |---|---|
 | `utils/hypergraph.py` | `Hypergraph` class (validation, transformers, RGL integration, parsing, access-graph component analysis), `HypergraphPlotter` (mesh sliver filtering, `unique_id`-based face labelling) |
 | `utils/utils.py` | `validate_hypergraph`, `TimeoutException`, `time_limit`, JSON extraction helpers |
-| `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `room_type_accuracy`, `compute_room_type_accuracy`, `bucketed_room_accuracy`, `produce_room_list` |
+| `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `compute_room_area_difference_score`, `room_type_accuracy`, `bucketed_room_accuracy`, `produce_room_list` |
 | `utils/prompts.py` | BSP rules text, prompt templates (`create_structured_prompt`, `create_simple_prompt`, etc.) |
 | `utils/data_loading.py` | `load_example_hypergraphs`, `load_target_from_dataset`, `save_training_data`, `log_slow_generation`, `HypergraphDataset`, `collate_fn` |
 | `utils/benchmark_qwen_inference.py` | Inference timing benchmark for Qwen models |
@@ -523,23 +540,23 @@ cd benchmark && ./setup_houseganpp.sh
 
 ## Datasets
 
-### Hypergraph1k Dataset
+### WMR24 Dataset
 
-The **Hypergraph1k** dataset, introduced in the paper, comprises ~1,100
+The **WMR24** dataset (Weber, Mueller, Roth 2024) comprises ~1,100
 architect-designed, real-world residential floor plans from three geographic
 regions (Zurich, New York, Singapore), ranging from studios to 6-bedroom
-apartments.  It is split 7:1:1 into train / validation / test sets.
+apartments.
 
-| Region | Train | Val | Test | Mean Area (m^2) |
-|---|---|---|---|---|
-| New York | 326 | 70 | 76 | 65.1 |
-| Zurich | 305 | 64 | 71 | 82.1 |
-| Singapore | 149 | 33 | 20 | 77.4 |
-| **Total** | **780** | **167** | **167** | **74.0** |
+| Region | Total | Mean Area (m²) |
+|---|---|---|
+| New York | 472 | 65.1 |
+| Zurich | 440 | 82.1 |
+| Singapore | 202 | 77.4 |
+| **Total** | **~1,100** | **74.0** |
 
-- **Location**: `dataset/hypergraph/`
-- **Format**: Pre-split JSON files (`train.json`, `validation.json`, `test.json`)
-- **Use**: Primary dataset for training and evaluation
+- **Location**: `dataset/wmr24/wmr24.json`
+- **Format**: Single JSON array of hypergraph records (database, id, area, bounds, facade, circulation, split)
+- **Use**: Primary dataset for training, evaluation, and baseline benchmarking
 
 ### RPLAN Dataset
 
@@ -575,7 +592,7 @@ hypergraph using the pipeline described in
 
 ## Citation
 
-If you use this code or the Hypergraph1k dataset, please cite:
+If you use this code or the WMR24 dataset, please cite:
 
 ```bibtex
 @inproceedings{hypergraphformer2026,
@@ -591,5 +608,5 @@ If you use this code or the Hypergraph1k dataset, please cite:
 ---
 
 **Project**: HypergraphFormer
-**Last Updated**: 2026-04-10
+**Last Updated**: 2026-04-16
 **Python**: 3.9+
