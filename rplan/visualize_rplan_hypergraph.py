@@ -72,6 +72,29 @@ def load_split(dataset_dir: Path, split: str):
     return items
 
 
+def load_results(dataset_dir: Path, splits: list[str], results_file: Path):
+    by_id = {}
+    for split in splits:
+        for item in load_split(dataset_dir, split):
+            by_id[str(item["id"])] = item
+
+    with open(results_file, "r", encoding="utf-8") as f:
+        results = json.load(f)
+
+    items = []
+    for sample_id, hg_dict in results.items():
+        base = by_id.get(str(sample_id), {})
+        items.append({
+            "index": base.get("index", -1),
+            "id": str(sample_id),
+            "database": base.get("database", "?"),
+            "area": base.get("area", 0),
+            "hg_dict": hg_dict,
+            "bounds": base.get("bounds", {}),
+        })
+    return items
+
+
 # ── Visualisation ──────────────────────────────────────────────────────
 
 def _inject_outside_node(ag: dict, hg_dict: dict) -> dict:
@@ -228,6 +251,10 @@ def main():
         "--disconnected-only", action="store_true",
         help="Only visualise samples with disconnected access graphs",
     )
+    parser.add_argument(
+        "--results-file", type=str, default=None,
+        help="Path to results_*_hypergraphs.json to visualise generated hypergraphs",
+    )
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
@@ -235,6 +262,46 @@ def main():
     plotter = HypergraphPlotter()
 
     requested_names = set(args.sample) if args.sample else None
+
+    if args.results_file:
+        logger.info("Loading generated results ...")
+        items = load_results(dataset_dir, args.split, Path(args.results_file))
+        logger.info("  %d generated samples", len(items))
+
+        if requested_names is not None:
+            items = [it for it in items if str(it["id"]) in requested_names]
+            if not items:
+                logger.info("  No matching samples found for --sample %s",
+                            " ".join(args.sample))
+                return 0
+
+        rendered = 0
+        disconnected = 0
+        for item in items:
+            hg = Hypergraph(item["hg_dict"])
+            n_comp = len(hg.access_graph_components())
+            if n_comp >= 2:
+                disconnected += 1
+
+            if args.disconnected_only and n_comp < 2:
+                continue
+
+            saved = visualize_item(item, plotter, output_dir)
+            rendered += 1
+            status = f"  {item['id']}: {n_comp} component(s)"
+            if saved:
+                status += f"  -> {saved}"
+            logger.info(status)
+
+            if args.max and rendered >= args.max:
+                logger.info("  Reached --max %d, stopping.", args.max)
+                break
+
+        logger.info(
+            "  results: rendered %d, disconnected %d / %d total",
+            rendered, disconnected, len(items),
+        )
+        return 0
 
     for split in args.split:
         logger.info("Loading %s ...", split)
