@@ -35,7 +35,6 @@ from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
 from benchmark.src.dataset_loader import Hypergraph1kDataset, collate_fn
 from benchmark.utils.ged_statistics import compute_and_save_ged_statistics
-from benchmark.utils.visualize_hypergraph_pickle import draw_floorplan_from_pickle
 from houseganpp.misc.utils import _init_input
 from houseganpp.models.models import Generator
 
@@ -58,6 +57,41 @@ ID_COLOR = {
     17: '#b8b5b4',      # door; light grey
     -1: 'white',        # outside node (matches original HouseGAN++ script)
 }
+
+def draw_floorplan_from_pickle(sample, output_size=512):
+    """
+    Draw a floor plan visualization from pickle sample data.
+    
+    Args:
+        sample: Dictionary containing 'polygons' and 'room_types'
+        output_size: Output image size in pixels (default: 512 for high quality)
+        
+    Returns:
+        PIL Image object
+    """
+    # Extract data
+    room_types = sample['room_types']
+    polygons = sample['polygons']
+    
+    # Create high-resolution image
+    img = Image.new('RGB', (output_size, output_size), 'white')
+    draw_obj = ImageDraw.Draw(img)
+    
+    # Draw each room/door polygon
+    for i, (room_type, polygon) in enumerate(zip(room_types, polygons)):
+        if len(polygon) < 3:
+            continue
+        
+        # Polygons are in normalized [0, 64] coordinates, scale to output size
+        scaled_poly = [(x * output_size / 64.0, y * output_size / 64.0) for x, y in polygon]
+        
+        # Get color for this room type
+        color = ID_COLOR.get(room_type, '#FFFFFF')
+        
+        # Draw filled polygon with outline
+        draw_obj.polygon(scaled_poly, fill=color, outline='black', width=3)
+    
+    return img
 
 def draw_masks(masks, room_types, image_size=256):
     """
