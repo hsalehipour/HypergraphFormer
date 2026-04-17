@@ -40,6 +40,7 @@ from pathlib import Path
 
 import torch
 from tqdm import tqdm
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from utils.hypergraph import Hypergraph
 from scripts.fewshot_generator import QwenGenerator, GPTGenerator
@@ -153,6 +154,74 @@ class Evaluator(ABC):
             result["error"] = str(e)
         return result
 
+    def evaluate_batch(self, samples: list[dict]) -> list[dict]:
+        if len(samples) == 1:
+            return [self.evaluate_sample(samples[0])]
+
+        timeout = getattr(self.args, "timeout", None)
+
+        results = [self.build_result_template(sample) for sample in samples]
+
+        try:
+            prompts = [self.create_prompt(sample) for sample in samples]
+            batch_res = self.generator.generate_batch(
+                prompts,
+                max_tokens=self.args.max_tokens,
+                temperature=self.args.temperature,
+                timeout=timeout,
+            )
+        except Exception as e:
+            for result in results:
+                result["error"] = str(e)
+            return results
+
+        for sample, prompt, res, result in zip(samples, prompts, batch_res, results):
+            try:
+                result["num_input_tokens"] = res.input_tokens
+                result["generation_time"] = res.generation_time
+
+                if res.timed_out:
+                    result["error"] = f"Generation timed out after {timeout}s"
+                    result["timed_out"] = True
+                    self._log_slow(sample, res)
+                    continue
+
+                if res.generation_time > getattr(self.args, "slow_gen_threshold", 1e9):
+                    self._log_slow(sample, res)
+
+                hg = self.extract_hypergraph(res.text)
+                if hg is None:
+                    logger.warning(f"JSON extraction failed for {sample['filename']}, retrying...")
+                    res2 = self.generator.generate(
+                        prompt,
+                        max_tokens=self.args.max_tokens,
+                        temperature=self.args.temperature,
+                        timeout=timeout,
+                    )
+                    result["generation_time"] += res2.generation_time
+                    if res2.timed_out:
+                        result["error"] = f"Generation timed out after {timeout}s (retry)"
+                        result["timed_out"] = True
+                        continue
+                    hg = self.extract_hypergraph(res2.text)
+                    if hg is None:
+                        result["error"] = "Failed to extract JSON from response (after retry)"
+                        continue
+                    result["retried"] = True
+
+                is_valid, passed, failed, ged_info = hg.validate(accessgraph=None, debug=True)
+                result["validation"] = {
+                    "is_valid": is_valid,
+                    "passed_checks": passed,
+                    "failed_checks": failed,
+                }
+                result["_ged_info"] = ged_info
+                self.score_result(result, hg, sample)
+            except Exception as e:
+                result["error"] = str(e)
+
+        return results
+
     # -- run loop ----------------------------------------------------------
 
     def run(self) -> int:
@@ -173,6 +242,14 @@ class Evaluator(ABC):
         # Max-rooms filter
         if getattr(args, "max_rooms", None):
             all_files = self._filter_max_rooms(all_files, args.max_rooms)
+
+        skip_hg_path = getattr(args, "skip_covered_hypergraphs", None)
+        if skip_hg_path:
+            with open(skip_hg_path) as f:
+                covered_ids = set(json.load(f).keys())
+            before = len(all_files)
+            all_files = [f for f in all_files if f.stem not in covered_ids]
+            logger.info(f"Skipped {before - len(all_files)} samples already covered in {skip_hg_path}")
 
         if args.max_samples:
             all_files = all_files[: args.max_samples]
@@ -199,21 +276,27 @@ class Evaluator(ABC):
     def _run_single(self, args, files_to_process, existing_results, all_files):
         results = list(existing_results)
         start = time.time()
+        batch_size = max(1, getattr(args, "batch_size", 1))
+        processed = 0
 
-        for i, fpath in enumerate(tqdm(files_to_process, desc="Evaluating"), 1):
-            sample = self._load_sample(fpath)
-            result = self.evaluate_sample(sample)
-            results.append(result)
+        for batch_start in tqdm(range(0, len(files_to_process), batch_size), desc="Evaluating"):
+            batch_files = files_to_process[batch_start: batch_start + batch_size]
+            samples = [self._load_sample(fpath) for fpath in batch_files]
+            batch_results = self.evaluate_batch(samples)
+            for fpath, result in zip(batch_files, batch_results):
+                processed += 1
+                results.append(result)
+                self._save_partial(args, results)
 
-            if result["success"]:
-                ged = result.get("ged")
-                msg = f"GED: {ged:.2f}" if ged is not None else "OK"
-                logger.info(f"  [{i}/{len(files_to_process)}] {fpath.name} -- {msg}")
-            else:
-                logger.info(f"  [{i}/{len(files_to_process)}] {fpath.name} -- FAILED: {result.get('error', '')[:80]}")
+                if result["success"]:
+                    ged = result.get("ged")
+                    msg = f"GED: {ged:.2f}" if ged is not None else "OK"
+                    logger.info(f"  [{processed}/{len(files_to_process)}] {fpath.name} -- {msg}")
+                else:
+                    logger.info(f"  [{processed}/{len(files_to_process)}] {fpath.name} -- FAILED: {result.get('error', '')[:80]}")
 
-            if i % 5 == 0:
-                self._save_checkpoint(args, results, all_files)
+                if processed % 5 == 0:
+                    self._save_checkpoint(args, results, all_files)
 
         elapsed = time.time() - start
         logger.info(f"Total time: {elapsed / 60:.1f} min")
@@ -242,7 +325,7 @@ class Evaluator(ABC):
             include_ground_truth=include_gt,
             include_bounds=include_bounds,
         )
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=getattr(args, "shuffle", False),
+        dataloader = DataLoader(dataset, batch_size=max(1, getattr(args, "batch_size", 1)), shuffle=getattr(args, "shuffle", False),
                                 num_workers=0, collate_fn=collate_fn)
 
         model = accelerator.prepare(self._raw_model)
@@ -254,9 +337,10 @@ class Evaluator(ABC):
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating",
                                                disable=not accelerator.is_main_process)):
-            sample = self._batch_to_sample(batch, include_gt, include_bounds)
-            result = self.evaluate_sample(sample)
-            local_results.append(result)
+            samples = self._batch_to_samples(batch, include_gt, include_bounds)
+            batch_results = self.evaluate_batch(samples)
+            local_results.extend(batch_results)
+            self._save_partial(args, local_results, accelerator.process_index)
 
         # Save per-rank results to temp files
         tmp = Path(tempfile.gettempdir())
@@ -333,18 +417,22 @@ class Evaluator(ABC):
         }
 
     @staticmethod
-    def _batch_to_sample(batch, include_gt, include_bounds):
-        sample = {
-            "filename": batch["filename"][0],
-            "accessgraph": batch["accessgraph"][0],
-            "num_nodes": batch["num_nodes"][0].item() if torch.is_tensor(batch["num_nodes"][0]) else batch["num_nodes"][0],
-            "num_edges": batch["num_edges"][0].item() if torch.is_tensor(batch["num_edges"][0]) else batch["num_edges"][0],
-        }
-        if include_gt:
-            sample["ground_truth"] = batch["ground_truth"][0]
-        if include_bounds and "bounds" in batch:
-            sample["bounds"] = batch.get("bounds", [{}])[0]
-        return sample
+    def _batch_to_samples(batch, include_gt, include_bounds):
+        batch_len = len(batch["filename"])
+        samples = []
+        for i in range(batch_len):
+            sample = {
+                "filename": batch["filename"][i],
+                "accessgraph": batch["accessgraph"][i],
+                "num_nodes": batch["num_nodes"][i].item() if torch.is_tensor(batch["num_nodes"][i]) else batch["num_nodes"][i],
+                "num_edges": batch["num_edges"][i].item() if torch.is_tensor(batch["num_edges"][i]) else batch["num_edges"][i],
+            }
+            if include_gt:
+                sample["ground_truth"] = batch["ground_truth"][i]
+            if include_bounds and "bounds" in batch:
+                sample["bounds"] = batch.get("bounds", [{}])[i]
+            samples.append(sample)
+        return samples
 
     def _log_slow(self, sample, res):
         from utils.data_loading import log_slow_generation
@@ -360,6 +448,26 @@ class Evaluator(ABC):
                "completed": len(results), "results": results}
         with open(args.output, "w") as f:
             json.dump(out, f, indent=2)
+
+    @staticmethod
+    def _save_partial(args, results, rank=None):
+        suffix = f"_rank_{rank}" if rank is not None else "_partial"
+        out_path = Path(args.output.replace(".json", f"{suffix}.json"))
+        hg_path = Path(args.output.replace(".json", f"{suffix}_hypergraphs.json"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(
+                {"timestamp": datetime.now().isoformat(), "completed": len(results), "results": results},
+                f,
+                indent=2,
+            )
+        hgs = {
+            r["filename"].replace(".txt", ""): r["generated_hypergraph"]
+            for r in results
+            if r.get("generated_hypergraph") is not None
+        }
+        with open(hg_path, "w") as f:
+            json.dump(hgs, f, indent=2)
 
     def _save_final(self, args, results, *, accelerator=None):
         stats = self.compute_statistics(results)
@@ -749,6 +857,7 @@ MODE_MAP = {
 }
 
 
+@record
 def cli():
     import argparse
 
@@ -764,6 +873,8 @@ def cli():
     parser.add_argument("--max-tokens", type=int, default=3328)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--skip-covered-hypergraphs", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--max-rooms", type=int, default=None)
 

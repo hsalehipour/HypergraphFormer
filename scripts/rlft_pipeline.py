@@ -41,12 +41,13 @@ LORA_ADAPTER_PATH = "checkpoints/qwen_hypergraph_filtered/checkpoint-300"
 
 DATA_DIR = _PROJECT_ROOT / "dataset/hypergraph"
 RL_DATA_DIR = DATA_DIR / "rl"
-OUTPUT_DIR = _PROJECT_ROOT / "checkpoints/retrain_grpo_hypergraph_2"
-DEBUG_DIR = _PROJECT_ROOT / "checkpoints/retrain_grpo_hypergraph_2/debug_rewards"
+SFT_DATA_DIR = DATA_DIR / "sft"
+OUTPUT_DIR = _PROJECT_ROOT / "checkpoints/grpo_graph_check_ged_2"
+DEBUG_DIR = _PROJECT_ROOT / "checkpoints/grpo_graph_check_ged_2/debug_rewards"
 
 
 # ===========================================================================
-# Boundary-mesh helper
+# Boundary-mesh helper  (was geometry_validation_utils.sample_to_boundary_mesh)
 # ===========================================================================
 
 def sample_to_boundary_mesh(sample):
@@ -69,12 +70,13 @@ def sample_to_boundary_mesh(sample):
     polygon_array = np.array(polygon)
 
     boundary_mesh = Hypergraph._polygon_to_boundary_mesh(polygon, RGL, Collections)
+    boundary_face = boundary_mesh.faceList[0]
 
-    return boundary_mesh, polygon_array
+    return boundary_mesh, boundary_face, polygon_array
 
 
 # ===========================================================================
-# Reward module
+# Reward module  (was rl_reward.py)
 # ===========================================================================
 
 GROUND_TRUTH_TRAIN = None
@@ -135,11 +137,13 @@ def _save_reward_debug(apt_id, hypergraph, polygon, reward, scores,
 def create_accuracy_reward(mode="room_reward_delta_soft"):
     """Factory that returns a GRPO-compatible reward function.
 
-    Supported *mode* values: ``'room_reward_delta_soft'``, ``'room_reward_delta'``.
+    Supported *mode* values: ``'room_reward_delta_soft'``, ``'room_reward_delta'``,
+    ``'room_reward_delta_ged'``.
     """
-    if mode not in {"room_reward_delta_soft", "room_reward_delta"}:
+    if mode not in {"room_reward_delta_soft", "room_reward_delta", "room_reward_delta_ged"}:
         raise ValueError(
-            f"Only modes 'room_reward_delta_soft' and 'room_reward_delta' "
+            f"Only modes 'room_reward_delta_soft', 'room_reward_delta', and "
+            f"'room_reward_delta_ged' "
             f"are supported (got {mode!r})"
         )
 
@@ -152,9 +156,9 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
         def _penalty(kind: str) -> float:
             if mode == "room_reward_delta":
                 return {
-                    "json": -0.3, "struct": -0.25, "mismatch": -0.25,
-                    "room_reward_fail": -0.3, "unexpected": -0.3,
-                }.get(kind, -0.3)
+                    "json": -0.6, "struct": -0.6, "mismatch": -0.25,
+                    "room_reward_fail": -0.6, "unexpected": -0.6,
+                }.get(kind, -0.6)
             return {
                 "json": -0.6, "struct": -0.5, "mismatch": -0.25,
                 "room_reward_fail": -0.2, "unexpected": -0.6,
@@ -189,7 +193,7 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                 gt_entry = gt_data[idx]
                 apt_id = gt_entry.get("id", f"idx_{idx}")
 
-                boundary_mesh, polygon_array = sample_to_boundary_mesh(gt_entry)
+                boundary_mesh, _, polygon_array = sample_to_boundary_mesh(gt_entry)
                 polygon = polygon_array.tolist()
 
                 try:
@@ -226,11 +230,10 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
 
                 # ----- room-list computation --------------------------------
                 def compute_room_list_and_gt():
-                    data_dir = _PROJECT_ROOT / "dataset" / "hypergraph"
                     if is_validation:
-                        room_lists_path = data_dir / "validation_filtered_room_lists" / "all_room_lists.json"
+                        room_lists_path = RL_DATA_DIR / "validation_reduced_room_lists" / "all_room_lists.json"
                     else:
-                        room_lists_path = data_dir / "train_filtered_room_lists" / "all_room_lists.json"
+                        room_lists_path = RL_DATA_DIR / "train_reduced_room_lists" / "all_room_lists.json"
 
                     room_list_gt = None
                     if room_lists_path.exists():
@@ -254,6 +257,35 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                     generated_mesh = _RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
                     room_list = produce_room_list(generated_mesh)
                     return room_list, room_list_gt
+
+                def canonical_access_graph(access_graph):
+                    nodes = sorted(
+                        (str(k), str(v).strip().lower())
+                        for k, v in (access_graph.get("nodes") or {}).items()
+                    )
+                    edges = sorted({
+                        tuple(sorted((str(e[0]), str(e[1]))))
+                        for e in (access_graph.get("edges") or [])
+                        if isinstance(e, (list, tuple)) and len(e) == 2
+                    })
+                    return {"nodes": nodes, "edges": edges}
+
+                def canonical_room_names(room_list):
+                    return sorted(
+                        str(t[0]).strip().lower()
+                        for t in (room_list or [])
+                    )
+
+                def normalized_ged_between_access_graphs(access_graph_a, access_graph_b, sample_id):
+                    from utils.metrics import accessgraph_dict_to_nx, ged_between_graphs
+
+                    G_a = accessgraph_dict_to_nx(access_graph_a)
+                    G_b = accessgraph_dict_to_nx(access_graph_b)
+                    ged, _ = ged_between_graphs(G_a, G_b, sample_id, timeout=5000, upper_bound=10) # set to 2000, 10 to be faster
+                    if ged is None:
+                        return None
+                    max_possible_edits = max(len(G_a.nodes()), len(G_b.nodes())) + max(len(G_a.edges()), len(G_b.edges()))
+                    return ged / max_possible_edits if max_possible_edits > 0 else 0.0
 
                 # ----- mode dispatch ----------------------------------------
                 def run_room_reward_delta_soft():
@@ -279,13 +311,41 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                     try:
                         room_list, room_list_gt = compute_room_list_and_gt()
                         delta_metric_val = compute_room_similarity_score(room_list, room_list_gt, strict=True)
-                        return delta_metric_val, room_list, room_list_gt
+                        gt_hg_raw = gt_entry.get("split")
+                        gt_hypergraph = json.loads(gt_hg_raw) if isinstance(gt_hg_raw, str) else gt_hg_raw
+                        if gt_hypergraph is None:
+                            raise Exception("GT hypergraph is None")
+                        gt_access_graph = Hypergraph(gt_hypergraph).access_graph
+                        bounds = gt_entry.get("bounds", {})
+                        bounds = json.loads(bounds) if isinstance(bounds, str) else bounds
+                        corrected_access_graph = Hypergraph(hypergraph).correct_accessgraph(bounds)
+                        corrected_matches_gt = canonical_access_graph(corrected_access_graph) == canonical_access_graph(gt_access_graph)
+                        return delta_metric_val, room_list, room_list_gt, corrected_matches_gt
                     except Exception as e:
                         raise Exception(f"Error in room_reward_delta: {e}")
+
+                def run_room_reward_delta_ged():
+                    try:
+                        room_list, room_list_gt = compute_room_list_and_gt()
+                        delta_metric_val = compute_room_similarity_score(room_list, room_list_gt, strict=True)
+                        gt_hg_raw = gt_entry.get("split")
+                        gt_hypergraph = json.loads(gt_hg_raw) if isinstance(gt_hg_raw, str) else gt_hg_raw
+                        if gt_hypergraph is None:
+                            raise Exception("GT hypergraph is None")
+                        gt_access_graph = Hypergraph(gt_hypergraph).access_graph
+                        bounds = gt_entry.get("bounds", {})
+                        bounds = json.loads(bounds) if isinstance(bounds, str) else bounds
+                        corrected_access_graph = Hypergraph(hypergraph).correct_accessgraph(bounds)
+                        normalized_ged = normalized_ged_between_access_graphs(corrected_access_graph, gt_access_graph, apt_id)
+                        return delta_metric_val, room_list, room_list_gt, normalized_ged
+                    except Exception as e:
+                        raise Exception(f"Error in room_reward_delta_ged: {e}")
 
                 try:
                     if mode == "room_reward_delta_soft":
                         result = run_room_reward_delta_soft()
+                    elif mode == "room_reward_delta_ged":
+                        result = run_room_reward_delta_ged()
                     else:
                         result = run_room_reward_delta()
                     err = None
@@ -335,11 +395,11 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                             "ged": ged,
                             "ged_failed": False,
                         }
-                else:
-                    delta_metric_val, room_list, room_list_gt = result
+                elif mode == "room_reward_delta":
+                    delta_metric_val, room_list, room_list_gt, corrected_matches_gt = result
                     if room_list_gt is not None:
-                        rooms_generated = [t[0] for t in room_list] if room_list else []
-                        rooms_gt = [t[0] for t in room_list_gt] if room_list_gt else []
+                        rooms_generated = canonical_room_names(room_list)
+                        rooms_gt = canonical_room_names(room_list_gt)
                         if rooms_generated != rooms_gt:
                             error_msg = f"Room list mismatch: generated={rooms_generated}, gt={rooms_gt}"
                             logger.info(f"⚠️  {apt_id}: {error_msg}")
@@ -348,13 +408,52 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
                                                error_msg, is_validation, raw_completion=completion)
                             rewards.append(reward)
                             continue
-                    mode_reward = -delta_metric_val
+                    if not corrected_matches_gt:
+                        error_msg = "Corrected access graph does not match ground truth access graph"
+                        logger.info(f"⚠️  {apt_id}: {error_msg}")
+                        reward = _penalty("mismatch")
+                        _save_reward_debug(apt_id, hypergraph, polygon, reward, None,
+                                           error_msg, is_validation, raw_completion=completion)
+                        rewards.append(reward)
+                        continue
+                    mode_reward = 0
                     scores = {
                         "room_list": room_list,
                         "room_list_gt": room_list_gt,
                         "delta_metric": delta_metric_val,
                         "ged": None,
                         "ged_failed": True,
+                        "corrected_matches_gt": corrected_matches_gt,
+                    }
+                else:
+                    delta_metric_val, room_list, room_list_gt, normalized_ged = result
+                    if room_list_gt is not None:
+                        rooms_generated = canonical_room_names(room_list)
+                        rooms_gt = canonical_room_names(room_list_gt)
+                        if rooms_generated != rooms_gt:
+                            error_msg = f"Room list mismatch: generated={rooms_generated}, gt={rooms_gt}"
+                            logger.info(f"⚠️  {apt_id}: {error_msg}")
+                            reward = _penalty("mismatch")
+                            _save_reward_debug(apt_id, hypergraph, polygon, reward, None,
+                                               error_msg, is_validation, raw_completion=completion)
+                            rewards.append(reward)
+                            continue
+                    if normalized_ged is None:
+                        error_msg = "Normalized GED computation failed"
+                        logger.info(f"⚠️  {apt_id}: {error_msg}")
+                        reward = _penalty("room_reward_fail")
+                        _save_reward_debug(apt_id, hypergraph, polygon, reward, None,
+                                           error_msg, is_validation, raw_completion=completion)
+                        rewards.append(reward)
+                        continue
+                    mode_reward = -normalized_ged / 2
+                    scores = {
+                        "room_list": room_list,
+                        "room_list_gt": room_list_gt,
+                        "delta_metric": delta_metric_val,
+                        "ged": None,
+                        "ged_failed": True,
+                        "normalized_ged": normalized_ged,
                     }
 
                 reward += mode_reward
@@ -385,7 +484,7 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
 
 
 # ===========================================================================
-# Data helpers
+# Data helpers  (was in fine_tune_rl_qwen.py)
 # ===========================================================================
 
 def load_ground_truth_data():
@@ -528,7 +627,7 @@ def main(args):
 
     # Initialise the reward module
     init_reward_module(train_gt, val_gt, DEBUG_DIR, RGL)
-    accuracy_reward = create_accuracy_reward(mode="room_reward_delta")
+    accuracy_reward = create_accuracy_reward(mode="room_reward_delta_ged")
     logger.info("✅ Reward module initialised")
 
     # Load tokenizer
@@ -560,8 +659,8 @@ def main(args):
     # Load dataset
     logger.info("Loading dataset...")
     dataset = load_dataset("json", data_files={
-        "train": str(RL_DATA_DIR / "train_reduced.jsonl"),
-        "validation": str(RL_DATA_DIR / "validation_reduced.jsonl"),
+        "train": str(SFT_DATA_DIR / "train_reduced.jsonl"),
+        "validation": str(SFT_DATA_DIR / "validation_reduced.jsonl"),
     })
 
     if "orig_idx" not in dataset["train"].column_names or "orig_idx" not in dataset["validation"].column_names:
@@ -584,7 +683,7 @@ def main(args):
         with_indices=True, desc="Converting validation to prompts",
     )
 
-    eval_dataset = val_data.select(range(min(4, len(val_data))))
+    eval_dataset = val_data.select(range(min(16, len(val_data))))
     logger.info(f"Using {len(eval_dataset)} samples for evaluation")
 
     batch_size = 1
@@ -596,6 +695,7 @@ def main(args):
         report_to=["tensorboard"],
         log_completions=False,
         num_generations=4,
+        num_generations_eval=1,
         max_completion_length=3600,
         temperature=0.7,
         top_k=50,
