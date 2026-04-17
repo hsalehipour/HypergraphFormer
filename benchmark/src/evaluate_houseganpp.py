@@ -31,8 +31,7 @@ import webcolors
 import cv2
 from PIL import Image, ImageDraw
 
-from utils.metrics import ged_between_graphs
-from utils.metrics import room_type_accuracy
+from utils.metrics import ged_between_graphs, room_type_accuracy
 from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
 from benchmark.utils.score_benchmark_result import score_benchmark_result
 from houseganpp.misc.utils import _init_input

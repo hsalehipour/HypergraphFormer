@@ -1,9 +1,10 @@
 """
 Metric functions for evaluating hypergraph generation quality.
 
-Provides three canonical metrics:
+Provides canonical metrics:
 - GED (Graph Edit Distance): structural similarity between access graphs
 - Delta metric: shape regularity deviation between room lists
+- Area difference: relative room-area error between paired room lists
 - Room-type accuracy: multiset comparison of room types
 """
 
@@ -25,6 +26,29 @@ def produce_room_list(generated_mesh):
         face = generated_mesh.faceList[i]
         square_perimeter = 4 * math.sqrt(face.Area)
         room_data.append((face.merge_id, face.Perimeter, square_perimeter))
+
+    def _sort_key(room_tuple):
+        roomname = room_tuple[0].lower()
+        if 'bath' in roomname:
+            roomname = 'bathroom'
+        try:
+            return ROOM_ORDER.index(roomname)
+        except ValueError:
+            return len(ROOM_ORDER)
+
+    return sorted(room_data, key=_sort_key)
+
+
+def produce_room_area_list(generated_mesh):
+    """Extract a sorted list of ``(room_name, area)`` tuples from an RGL mesh.
+
+    The ordering follows :data:`ROOM_ORDER` and is intended for metrics that
+    pair rooms by category, similar to :func:`produce_room_list`.
+    """
+    room_data = []
+    for i in range(generated_mesh.faceList.Count):
+        face = generated_mesh.faceList[i]
+        room_data.append((face.merge_id, face.Area))
 
     def _sort_key(room_tuple):
         roomname = room_tuple[0].lower()
@@ -243,6 +267,67 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
     if len(list_of_sigmas) == 0:
         return 0.6
     return sum(list_of_sigmas) / len(list_of_sigmas)
+
+
+def compute_room_area_difference_score(room_list_A, room_list_B, strict=False, duplicate_mismatched=False, area_sorting=True):
+    """Compute mean relative area error between paired rooms.
+
+    Each room list is a list of ``(room_name, area)`` tuples. Pairing logic
+    mirrors :func:`compute_room_similarity_score`: strict mode requires exact
+    room-name order; soft mode groups by room category and pairs within each
+    group, optionally sorting by area.
+    """
+    if strict:
+        rooms_A = [t[0] for t in room_list_A]
+        rooms_B = [t[0] for t in room_list_B]
+        if rooms_A != rooms_B:
+            return 0.25
+        sigmas = []
+        for i in range(len(room_list_A)):
+            area_A = room_list_A[i][1]
+            area_B = room_list_B[i][1]
+            if area_B == 0:
+                continue
+            sigmas.append(abs(area_A - area_B) / area_B)
+        return sum(sigmas) / len(sigmas) if sigmas else 0.6
+
+    rooms_by_category_A = {}
+    rooms_by_category_B = {}
+    for room_tuple in room_list_A:
+        rooms_by_category_A.setdefault(room_tuple[0], []).append(room_tuple)
+    for room_tuple in room_list_B:
+        rooms_by_category_B.setdefault(room_tuple[0], []).append(room_tuple)
+
+    all_categories = set(rooms_by_category_A.keys()) | set(rooms_by_category_B.keys())
+    sigmas = []
+    for category in all_categories:
+        sublist_A = rooms_by_category_A.get(category, [])
+        sublist_B = rooms_by_category_B.get(category, [])
+        if area_sorting:
+            sublist_A = sorted(sublist_A, key=lambda x: x[1], reverse=True)
+            sublist_B = sorted(sublist_B, key=lambda x: x[1], reverse=True)
+        count_A = len(sublist_A)
+        count_B = len(sublist_B)
+        if count_A == 0 or count_B == 0:
+            continue
+        if duplicate_mismatched:
+            if count_A > count_B:
+                sublist_B = (sublist_B * ((count_A // count_B) + 1))[:count_A]
+            elif count_B > count_A:
+                sublist_A = (sublist_A * ((count_B // count_A) + 1))[:count_B]
+            n_pairs = max(count_A, count_B)
+        else:
+            n_pairs = min(count_A, count_B)
+        for i in range(n_pairs):
+            area_A = sublist_A[i][1]
+            area_B = sublist_B[i][1]
+            if area_B == 0:
+                continue
+            sigmas.append(abs(area_A - area_B) / area_B)
+
+    if len(sigmas) == 0:
+        return 0.6
+    return sum(sigmas) / len(sigmas)
 
 
 def room_type_accuracy(expected_room_types, generated_room_types):
