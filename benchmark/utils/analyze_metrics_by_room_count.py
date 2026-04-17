@@ -351,14 +351,14 @@ Examples:
   python analyze_metrics_by_room_count.py \\
       --model houseganpp \\
       --cache_pickle cached_gen_5var/cache_houseganpp_pretrained.pkl \\
-      --results_npz ged_results_houseganpp_pretrain2/ged_results.npz \\
+      --results_npz ged_results_houseganpp_pretrain2/benchmark_results.npz \\
       --num_variations 5
   
   # House-Diffusion
   python analyze_metrics_by_room_count.py \\
       --model housediffusion \\
       --cache_pickle cached_gen_5var/cache_housediffusion_pretrained.pkl \\
-      --results_npz ged_results_housediffusion_pretrained2/ged_results.npz \\
+      --results_npz ged_results_housediffusion_pretrained2/benchmark_results.npz \\
       --num_variations 5
         """
     )
@@ -368,7 +368,7 @@ Examples:
     parser.add_argument("--cache_pickle", type=str, required=True,
                        help="Path to cached generations pickle file")
     parser.add_argument("--results_npz", type=str, required=True,
-                       help="Path to results NPZ file (ged_results.npz from evaluate_houseganpp.py or similar)")
+                       help="Path to results NPZ file (benchmark_results.npz from evaluate_houseganpp.py or similar)")
     parser.add_argument("--num_variations", type=int, required=True,
                        help="Number of variations per sample used during evaluation")
     parser.add_argument("--output_json", type=str, default=None,

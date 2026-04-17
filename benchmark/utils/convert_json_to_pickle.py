@@ -7,7 +7,7 @@ Source: per-sample JSON files produced by Housegan-data-reader
         each containing {room_type, boxes, edges, ed_rm}.
 
 Target: a single pickle file (list of dicts) loadable by
-        benchmark.src.dataset_loader.Hypergraph1kDataset with keys:
+        benchmark.src.dataset_loader.BenchmarkDataset with keys:
             id       : str   -- sample identifier (filename stem)
             polygons : list[list[tuple[int,int]]]  -- one polygon per node,
                        coordinates in [0, target_size] (default 64)

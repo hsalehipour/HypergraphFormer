@@ -32,7 +32,7 @@ import pickle
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
 from benchmark.src.evaluate_houseganpp import draw_masks
-from benchmark.utils.ged_statistics import compute_and_save_ged_statistics
+from benchmark.utils.score_benchmark_result import score_benchmark_result
 from house_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -1615,7 +1615,7 @@ def main():
     room_count_dict, similarity_dict = print_and_save_data_statistics(results, args.num_variations)
 
     # Save GED statistics
-    compute_and_save_ged_statistics(
+    score_benchmark_result(
         all_geds=np.array(results['all_geds']),
         num_variations=args.num_variations,
         output_dir=args.out,

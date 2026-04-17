@@ -13,7 +13,7 @@ and geometric subdivisions, enabling generation of floor plans for arbitrary,
 user-specified boundaries.  Reinforcement learning fine-tuning with GRPO
 further improves structural consistency and semantic accuracy.
 
-Evaluated on the **Hypergraph1k** dataset (~1,000 architect-designed floor
+Evaluated on the **WSM24** dataset (~1,000 architect-designed floor
 plans from Zurich, New York, and Singapore), HypergraphFormer achieves a GED
 of **1.45** and room-set accuracy of **94.2%**, outperforming HouseDiffusion
 and HouseGAN++ while requiring significantly less training data.
@@ -117,7 +117,7 @@ HypergraphFormer/
 │   └── benchmark_qwen_inference.py     Inference timing benchmark
 │
 ├── dataset/                        # ── Raw datasets ───────────────────
-│   ├── hypergraph/                      Hypergraph1k: train.json, validation.json, test.json
+│   ├── hypergraph/                      WSM24: train.json, validation.json, test.json
 │   ├── rplan/                           RPLAN data (see "Preparing the RPLAN Dataset")
 │   │   ├── dataset_original/               RPLAN floorplan PNGs (downloaded)
 │   │   ├── dataset_diffplanner/            DiffPlanner JSON splits (downloaded)
@@ -523,9 +523,9 @@ cd benchmark && ./setup_houseganpp.sh
 
 ## Datasets
 
-### Hypergraph1k Dataset
+### WSM24 Dataset
 
-The **Hypergraph1k** dataset, introduced in the paper, comprises ~1,100
+The **WSM24** dataset, introduced in the paper, comprises ~1,100
 architect-designed, real-world residential floor plans from three geographic
 regions (Zurich, New York, Singapore), ranging from studios to 6-bedroom
 apartments.  It is split 7:1:1 into train / validation / test sets.
@@ -575,7 +575,7 @@ hypergraph using the pipeline described in
 
 ## Citation
 
-If you use this code or the Hypergraph1k dataset, please cite:
+If you use this code or the WSM24 dataset, please cite:
 
 ```bibtex
 @inproceedings{hypergraphformer2026,

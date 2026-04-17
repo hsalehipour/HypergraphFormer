@@ -33,8 +33,8 @@ from PIL import Image, ImageDraw
 
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
-from benchmark.src.dataset_loader import Hypergraph1kDataset, collate_fn
-from benchmark.utils.ged_statistics import compute_and_save_ged_statistics
+from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
+from benchmark.utils.score_benchmark_result import score_benchmark_result
 from houseganpp.misc.utils import _init_input
 from houseganpp.models.models import Generator
 
@@ -935,7 +935,7 @@ def main():
         
         # Load dataset
         print("\nLoading dataset...")
-        fp_dataset_test = Hypergraph1kDataset(args.data_path, target_set=args.target_set, split='test')
+        fp_dataset_test = BenchmarkDataset(args.data_path, target_set=args.target_set, split='test')
         fp_loader = DataLoader(
             fp_dataset_test,
             batch_size=args.batch_size,
@@ -1297,7 +1297,7 @@ def main():
         'all_scores': similarity_scores_array.tolist()
     }
     
-    compute_and_save_ged_statistics(
+    score_benchmark_result(
         all_geds=np.array(all_dists),
         num_variations=args.num_variations,
         output_dir=args.out,

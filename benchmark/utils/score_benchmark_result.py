@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Shared utilities for computing and saving GED statistics.
+Shared utilities for scoring and saving benchmark results.
 
-This module provides consistent post-processing of GED results across
-different model evaluation scripts (HouseGAN++, House-Diffusion, etc.).
+This module provides consistent post-processing of evaluation results
+(GED, room accuracy, similarity) across different model evaluation
+scripts (HouseGAN++, House-Diffusion, etc.).
 """
 
 import os
 import numpy as np
 
 
-def compute_and_save_ged_statistics(all_geds, num_variations, output_dir, 
-                                    checkpoint_path=None, data_path=None, 
-                                    additional_info=None):
+def score_benchmark_result(all_geds, num_variations, output_dir,
+                           checkpoint_path=None, data_path=None,
+                           additional_info=None):
     """
-    Compute statistics for GED results and save to NPZ file.
-    
+    Compute statistics for benchmark results and save to NPZ file.
+
     This function provides consistent processing across all evaluation scripts:
     - Handles NaN values from timeouts/failures
     - Computes std of variation means (consistency metric)
     - Prints comprehensive statistics
     - Saves results in standardized NPZ format
-    
+
     Args:
         all_geds: numpy array of all GED values (may contain np.nan)
         num_variations: number of generation variations per sample
@@ -29,7 +30,7 @@ def compute_and_save_ged_statistics(all_geds, num_variations, output_dir,
         checkpoint_path: optional path to model checkpoint (for text file)
         data_path: optional path to data file (for text file)
         additional_info: optional dict with additional info to save
-        
+
     Returns:
         dict: Statistics dictionary with keys:
             - geds: all GED values
@@ -88,7 +89,7 @@ def compute_and_save_ged_statistics(all_geds, num_variations, output_dir,
         print(f"  Mean per variation: {means_per_variation}")
     
     # Save results to NPZ
-    results_file = os.path.join(output_dir, 'ged_results.npz')
+    results_file = os.path.join(output_dir, 'benchmark_results.npz')
     save_dict = {
         'geds': all_geds,
         'mean': mean_ged,
@@ -107,7 +108,7 @@ def compute_and_save_ged_statistics(all_geds, num_variations, output_dir,
     
     # Optionally save text summary
     if checkpoint_path or data_path:
-        text_file = os.path.join(output_dir, 'ged_results.txt')
+        text_file = os.path.join(output_dir, 'benchmark_results.txt')
         with open(text_file, 'w') as f:
             f.write("GED Results: Access Graph Evaluation\n")
             f.write("=" * 80 + "\n\n")

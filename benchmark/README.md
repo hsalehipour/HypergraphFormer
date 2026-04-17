@@ -193,15 +193,15 @@ Generates floorplans and computes the same three metrics (GED, room accuracy, de
 
 **Key Components:**
 
-1. **`Hypergraph1kDataset` Class** — Loads pickle files, builds room masks from polygons, one-hot encodes room types (RPLAN format), creates adjacency edge lists. Supports train/val/test splits with room-count filtering.
+1. **`BenchmarkDataset` Class** — Loads pickle files, builds room masks from polygons, one-hot encodes room types (RPLAN format), creates adjacency edge lists. Supports train/val/test splits with room-count filtering.
 
 2. **`collate_fn` Function** — Batches samples with variable numbers of rooms. Concatenates masks, nodes, and edges with proper index adjustment.
 
 **Usage:**
 ```python
-from dataset_loader import Hypergraph1kDataset, collate_fn
+from dataset_loader import BenchmarkDataset, collate_fn
 
-dataset = Hypergraph1kDataset('train_data.pkl', target_set=None, split='train')
+dataset = BenchmarkDataset('train_data.pkl', target_set=None, split='train')
 loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
 ```
 
@@ -213,7 +213,7 @@ loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
 
 **Key Features:**
 - WGAN-GP training (Wasserstein GAN with gradient penalty)
-- Uses shared `Hypergraph1kDataset` from `dataset_loader.py`
+- Uses shared `BenchmarkDataset` from `dataset_loader.py`
 - TensorBoard logging (losses, images)
 - Periodic validation visualization and checkpoint saving
 
@@ -294,11 +294,11 @@ Remaps room types to match House-Diffusion's encoding (e.g., front_door type 15 
 
 ---
 
-### `utils/ged_statistics.py`
+### `utils/score_benchmark_result.py`
 
-**Purpose:** Shared utilities for computing and saving GED statistics consistently across evaluation scripts.
+**Purpose:** Shared utilities for scoring and saving benchmark results consistently across evaluation scripts.
 
-Provides `compute_and_save_ged_statistics` which post-processes raw GED arrays (handling NaN/timeout values, computing mean/std/median), and saves results to both NPZ and JSON formats.
+Provides `score_benchmark_result` which post-processes raw GED arrays (handling NaN/timeout values, computing mean/std/median), and saves results to both NPZ and text formats.
 
 ---
 
@@ -313,7 +313,7 @@ Takes cached generation pickle files and result NPZ files from `evaluate_housega
 python utils/analyze_metrics_by_room_count.py \
     --model houseganpp \
     --cache_pickle cached_gen/cache.pkl \
-    --results_npz ged_results/ged_results.npz \
+    --results_npz ged_results/benchmark_results.npz \
     --num_variations 5 \
     --output_json binned_stats.json
 ```
@@ -403,7 +403,7 @@ benchmark/
 │   ├── analyze_metrics_by_room_count.py # Post-evaluation metric binning by room count
 │   ├── convert_hypergraph_to_rplan.py   # Hypergraph1K JSON → HouseGAN++ pickle
 │   ├── convert_pickle_to_npz.py         # HouseGAN++ pickle → House-Diffusion NPZ
-│   ├── ged_statistics.py                # Shared GED statistics computation
+│   ├── score_benchmark_result.py        # Shared benchmark scoring and saving
 │   ├── visualize_hypergraph_pickle.py   # Pickle visualization
 │   └── visualize_rplan_json.py          # RPLAN JSON visualization
 │

@@ -1,4 +1,4 @@
-"""Hypergrph1K Dataset loader for HouseGAN++."""
+"""Benchmark Dataset loader for HouseGAN++."""
 
 import pickle
 import numpy as np
@@ -12,8 +12,8 @@ from PIL import Image, ImageDraw
 NUM_ROOM_TYPES = 19
 
 
-class Hypergraph1kDataset(Dataset):
-    """Dataset loader for Hypergrph1K Dataset in HouseGAN++ format."""
+class BenchmarkDataset(Dataset):
+    """Dataset loader for Benchmark Dataset in HouseGAN++ format."""
     
     def __init__(self, pickle_path, target_set=None, split='train'):
         """

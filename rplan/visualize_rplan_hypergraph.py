@@ -2,9 +2,9 @@
 """
 Visualise RPLAN samples exported in hypergraph format.
 
-Loads the JSON files produced by ``rplan_to_hypergraph_native.py --export``
-and renders each sample using the same RGL-based ``Hypergraph`` /
-``HypergraphPlotter`` pipeline used for the Hypergraph1k benchmark.
+Loads the JSON files produced by ``rplan_to_hypergraph.py --export``
+and renders each sample using RGL-based ``Hypergraph`` /
+``HypergraphPlotter`` pipeline.
 
 For every sample two panels are produced:
 
