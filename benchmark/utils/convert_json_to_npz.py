@@ -275,6 +275,7 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
 
     MAX_ROOMS = 32
     MAX_CORNERS = 32
+    MAX_GRAPH_EDGES = 200
     for h, graph, sid in tqdm(zip(org_houses, org_graphs, valid_ids),
                               total=len(org_houses), desc="Encoding features"):
         if len(h) >= MAX_ROOMS:
@@ -282,6 +283,9 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
             continue
         if any(len(room[0]) >= MAX_CORNERS for room in h):
             skipped_ids.append((sid, 'too_many_corners'))
+            continue
+        if len(graph) > MAX_GRAPH_EDGES:
+            skipped_ids.append((sid, 'too_many_graph_edges'))
             continue
         house = []
         corner_bounds = []
