@@ -1,11 +1,15 @@
-# Benchmark: HouseGAN++ & House-Diffusion on the Hypergraph1K Dataset
+# Benchmark: HouseGAN++ & House-Diffusion on the WMR24 Dataset
 
-This benchmark provides a complete workflow for training and evaluating both **HouseGAN++** and **House-Diffusion** on the Hypergraph1K dataset. The implementation includes automated setup scripts, data conversion utilities, evaluation pipelines with three metrics (GED, room accuracy, delta), and visualization tools.
+This benchmark evaluates **HouseGAN++** and **House-Diffusion** on the WMR24
+dataset.  It includes automated setup scripts, data conversion utilities, and
+evaluation pipelines with four metrics: GED, room accuracy, delta (geometric
+similarity), and area difference.
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [Quick Start: HouseGAN++](#quick-start-houseganpp)
 - [Quick Start: House-Diffusion](#quick-start-house-diffusion)
+- [Evaluation Metrics](#evaluation-metrics)
 - [Shell Scripts](#shell-scripts)
 - [Core Scripts](#core-scripts)
 - [Utility Scripts](#utility-scripts)
@@ -14,7 +18,7 @@ This benchmark provides a complete workflow for training and evaluating both **H
 
 ---
 
-## 🚀 Quick Start: HouseGAN++
+## Quick Start: HouseGAN++
 
 ### 1. One-Command Setup
 
@@ -27,21 +31,9 @@ This will:
 - Clone the HouseGAN++ repository (if needed)
 - Create a Python virtual environment
 - Install all dependencies
-- Convert the Hypergraph1K dataset to HouseGAN++ format
+- Convert the WMR24 dataset to HouseGAN++ format (JSON → pickle)
 
-### 2. Train the Model
-
-```bash
-cd benchmark
-./finetune_houseganpp.sh
-```
-
-Monitor training with TensorBoard:
-```bash
-tensorboard --logdir=../houseganpp/runs/ft_houseganpp_v1
-```
-
-### 3. Evaluate the Model
+### 2. Evaluate
 
 ```bash
 cd benchmark
@@ -54,16 +46,19 @@ cd benchmark
 source ../.venv/bin/activate
 
 python src/evaluate_houseganpp.py \
-    --data_path dataset/Hypergraph_to_RPLAN/test/test_data.pkl \
-    --checkpoint ../houseganpp/checkpoints/ft_housegan_final.pth \
-    --out test_results \
-    --num_samples 20 \
+    --data_path /path/to/test_data.pkl \
+    --checkpoint ../houseganpp/checkpoints/pretrained.pth \
+    --out eval_results_houseganpp \
+    --num_variations 5 \
     --save_graphs
 ```
 
+Results are saved to `eval_results_houseganpp/benchmark_results.npz` and
+`benchmark_results.txt`.  Comparison images go into `eval_results_houseganpp/fig/`.
+
 ---
 
-## 🚀 Quick Start: House-Diffusion
+## Quick Start: House-Diffusion
 
 ### 1. One-Command Setup
 
@@ -76,342 +71,262 @@ This will:
 - Verify the `house_diffusion` repository exists
 - Create/reuse the shared virtual environment
 - Install House-Diffusion dependencies and package
-- Reuse Hypergraph-to-RPLAN data (from HouseGAN++ setup) or convert fresh
-- Convert pickle data to NPZ format for House-Diffusion
+- Reuse HouseGAN++ JSON data (or convert fresh) and build NPZ files
 
-### 2. Train the Model
-
-```bash
-cd benchmark
-./finetune_housediffusion.sh
-```
-
-### 3. Evaluate the Model
+### 2. Evaluate
 
 ```bash
 cd benchmark
 ./eval_housediffusion.sh
 ```
 
----
-
-## 🔧 Shell Scripts
-
-### `setup_houseganpp.sh`
-
-**Purpose:** Complete automated setup for HouseGAN++ training on the Hypergraph1K dataset.
-
-**What it does:**
-
-1. **Clones HouseGAN++ Repository** from `https://github.com/hsalehipour/houseganpp`
-2. **Creates Virtual Environment** with all Python dependencies
-3. **Converts Hypergraph1K Dataset** to HouseGAN++ pickle format (64×64 normalized polygons)
-
-**Output:**
-```
-benchmark/dataset/Hypergraph_to_RPLAN/
-├── train/train_data.pkl
-├── validation/validation_data.pkl
-└── test/test_data.pkl
-```
+Results are saved to `eval_results_housediffusion/benchmark_results.npz`.
 
 ---
 
-### `setup_housediffusion.sh`
+## Evaluation Metrics
 
-**Purpose:** Complete automated setup for House-Diffusion training on the Hypergraph1K dataset.
+Both evaluation scripts compute four metrics and delegate all statistics
+computation, printing, and file output to `utils/score_benchmark_result.py`:
 
-**What it does:**
+| Metric | Description |
+|---|---|
+| **GED** | Graph Edit Distance between predicted and ground-truth door-based access graphs. Computed with a 10 s timeout per pair; timed-out cases are recorded as NaN. |
+| **Room Count Accuracy** | Exact match rate, mean count error, and mean type error between predicted and expected room sets. |
+| **Delta (Room Similarity)** | Geometric shape similarity between matched predicted and ground-truth room pairs, based on area and perimeter ratios. |
+| **Area Difference** | Mean relative room-area error between paired predicted and ground-truth rooms of the same type. |
 
-1. **Verifies** the `house_diffusion` repo exists alongside the project
-2. **Creates/reuses** the shared virtual environment
-3. **Installs** House-Diffusion as a package
-4. **Converts** Hypergraph1K data to RPLAN pickle format (reuses existing if available)
-5. **Converts** pickle files to NPZ format expected by House-Diffusion's `RPlanhgDataset`
+All metrics are saved to `benchmark_results.npz` and optionally to a
+human-readable `benchmark_results.txt` summary.
 
----
+### Inspecting results
 
-### `finetune_houseganpp.sh`
-
-**Purpose:** Launch fine-tuning of HouseGAN++ on the Hypergraph1K dataset.
-
-**Configuration:**
 ```bash
-TRAIN_DATA="dataset/Hypergraph_to_RPLAN/train/train_data.pkl"
-VAL_DATA="dataset/Hypergraph_to_RPLAN/validation/validation_data.pkl"
-CHECKPOINT="houseganpp/checkpoints/pretrained.pth"
-EXP_FOLDER="ft_houseganpp_v1"
-N_EPOCHS=1000
-BATCH_SIZE=4
-```
-
-**Outputs:**
-- **Checkpoints:** `houseganpp/checkpoints/ft_houseganpp_v1_{step}.pth`
-- **Visualizations:** `houseganpp/exps/ft_houseganpp_v1/`
-- **TensorBoard Logs:** `houseganpp/runs/ft_houseganpp_v1/`
-- **Final Model:** `houseganpp/checkpoints/ft_houseganpp_final.pth`
-
----
-
-### `finetune_housediffusion.sh`
-
-**Purpose:** Launch fine-tuning of House-Diffusion on the Hypergraph1K dataset using converted NPZ data.
-
----
-
-### `eval_houseganpp.sh`
-
-**Purpose:** Evaluate a trained HouseGAN++ model on the Hypergraph1K test dataset.
-
-**Configuration:**
-```bash
-TEST_DATA="dataset/Hypergraph_to_RPLAN/test/test_data.pkl"
-CHECKPOINT="../houseganpp/checkpoints/ft_housegan_final.pth"
-OUTPUT_DIR="test_results"
-MAX_SAMPLES=20
-```
-
-**Outputs:**
-- **Comparison plots:** `test_results/comparison_{i:04d}.png`
-- **Statistics JSON:** `test_results/ged_statistics.json` (GED, room accuracy, delta metrics)
-
----
-
-### `eval_housediffusion.sh`
-
-**Purpose:** Evaluate a trained House-Diffusion model on the Hypergraph1K test dataset.
-
-Generates floorplans and computes the same three metrics (GED, room accuracy, delta) as the HouseGAN++ evaluation.
-
----
-
-## 📝 Core Scripts
-
-### `src/dataset_loader.py`
-
-**Purpose:** Shared PyTorch dataset and collation functions for loading Hypergraph1K data in HouseGAN++ format.
-
-**Key Components:**
-
-1. **`BenchmarkDataset` Class** — Loads pickle files, builds room masks from polygons, one-hot encodes room types (RPLAN format), creates adjacency edge lists. Supports train/val/test splits with room-count filtering.
-
-2. **`collate_fn` Function** — Batches samples with variable numbers of rooms. Concatenates masks, nodes, and edges with proper index adjustment.
-
-**Usage:**
-```python
-from dataset_loader import BenchmarkDataset, collate_fn
-
-dataset = BenchmarkDataset('train_data.pkl', target_set=None, split='train')
-loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
-```
-
----
-
-### `src/finetune_houseganpp.py`
-
-**Purpose:** Fine-tune HouseGAN++ generator and discriminator on the Hypergraph1K dataset.
-
-**Key Features:**
-- WGAN-GP training (Wasserstein GAN with gradient penalty)
-- Uses shared `BenchmarkDataset` from `dataset_loader.py`
-- TensorBoard logging (losses, images)
-- Periodic validation visualization and checkpoint saving
-
----
-
-### `src/finetune_housediffusion.py`
-
-**Purpose:** Fine-tune House-Diffusion on the Hypergraph1K dataset using pre-converted NPZ data.
-
-**Key Features:**
-- Loads data from `processed_rplan/rplan_{set_name}_{target_set}.npz`
-- Resumes from a pretrained House-Diffusion checkpoint
-- Configurable model architecture (base channels, attention resolutions)
-
----
-
-### `src/evaluate_houseganpp.py`
-
-**Purpose:** Evaluate HouseGAN++ on the Hypergraph1K test dataset with three metrics.
-
-**Key Features:**
-
-1. **Incremental Generation** — Generates floorplans room-by-room using HouseGAN++'s iterative refinement. Supports multiple variations per sample.
-
-2. **Three Metrics:**
-   - **GED**: Graph Edit Distance between predicted and GT access graphs
-   - **Room Accuracy**: Room count and type distribution matching
-   - **Delta**: Geometric shape similarity between matched room pairs
-
-3. **Generation Caching** — `--save_generations` / `--load_generations` for reproducible re-evaluation without re-running inference.
-
-4. **Visualization** — `--save_graphs` produces side-by-side GT vs predicted comparison images.
-
----
-
-### `src/evaluate_housediffusion.py`
-
-**Purpose:** Evaluate House-Diffusion on the Hypergraph1K test dataset with the same three metrics (GED, room accuracy, delta).
-
-**Key Features:**
-- Generates floorplans using House-Diffusion's diffusion sampling process
-- Extracts room polygons from generated outputs
-- Builds predicted access graphs from spatial adjacency
-- Computes GED, room accuracy, and delta against ground truth
-- Supports generation caching (`--save_generations` / `--load_generations`)
-
----
-
-## 🔍 Utility Scripts
-
-### `utils/convert_hypergraph_to_rplan.py`
-
-**Purpose:** Convert Hypergraph1K JSON format to HouseGAN++ pickle format.
-
-**Key Functions:**
-- `extract_polygons_and_room_types` — Extracts room boundaries, maps Hypergraph1K room types to RPLAN IDs
-- `extract_doors` — Extracts door polygons, computes positions and orientations
-- `normalize_polygons` — Centers and scales polygons to target grid (64×64)
-- `build_adjacency_triples` — Constructs adjacency matrix with adjacent (1) and non-adjacent (-1) relationships
-
-**Usage:**
-```bash
-python utils/convert_hypergraph_to_rplan.py \
-    --input /path/to/dataset/hypergraph \
-    --output /path/to/Hypergraph_to_RPLAN \
-    --splits train validation test \
-    --target-size 64 \
-    --verbose
-```
-
----
-
-### `utils/convert_pickle_to_npz.py`
-
-**Purpose:** Convert HouseGAN++ pickle files to House-Diffusion's NPZ format.
-
-Remaps room types to match House-Diffusion's encoding (e.g., front_door type 15 → 11) and structures the data as expected by House-Diffusion's `RPlanhgDataset`.
-
----
-
-### `utils/score_benchmark_result.py`
-
-**Purpose:** Shared utilities for scoring and saving benchmark results consistently across evaluation scripts.
-
-Provides `score_benchmark_result` which post-processes raw GED arrays (handling NaN/timeout values, computing mean/std/median), and saves results to both NPZ and text formats.
-
----
-
-### `utils/analyze_metrics_by_room_count.py`
-
-**Purpose:** Post-evaluation analysis that bins GED and room accuracy metrics by room count.
-
-Takes cached generation pickle files and result NPZ files from `evaluate_houseganpp.py` or `evaluate_housediffusion.py`, groups samples into bins (`<=4`, `5`, `6`, `7`, `8`, `>8` rooms), and computes per-bin statistics (mean, std, median, min, max).
-
-**Usage:**
-```bash
-python utils/analyze_metrics_by_room_count.py \
+# Bin metrics by room count (auto-detects all available metrics in the NPZ)
+python benchmark/utils/analyze_metrics_by_room_count.py \
     --model houseganpp \
-    --cache_pickle cached_gen/cache.pkl \
-    --results_npz ged_results/benchmark_results.npz \
+    --cache_pickle eval_results_houseganpp/generations.pkl \
+    --results_npz eval_results_houseganpp/benchmark_results.npz
+
+# Explicit variation count + JSON export
+python benchmark/utils/analyze_metrics_by_room_count.py \
+    --model housediffusion \
+    --cache_pickle eval_results_housediffusion/generations.pkl \
+    --results_npz eval_results_housediffusion/benchmark_results.npz \
     --num_variations 5 \
     --output_json binned_stats.json
 ```
 
 ---
 
-### `utils/visualize_hypergraph_pickle.py`
+## Shell Scripts
 
-**Purpose:** Visualize Hypergraph1K dataset samples from pickle files.
+### `setup_houseganpp.sh`
 
-Renders floor plans with colored room polygons, doors, and room boundaries. Provides `draw_floorplan_from_pickle` for programmatic use and a CLI for quick inspection.
+Complete automated setup for HouseGAN++ evaluation on the WMR24 dataset.
+
+1. Clones HouseGAN++ from `https://github.com/hsalehipour/houseganpp`
+2. Creates a virtual environment with all Python dependencies
+3. Converts WMR24 hypergraph JSON → HouseGAN++ JSON → pickle format
+
+### `setup_housediffusion.sh`
+
+Complete automated setup for House-Diffusion evaluation on the WMR24 dataset.
+
+1. Verifies the `house_diffusion` repo exists alongside the project
+2. Creates/reuses the shared virtual environment
+3. Installs House-Diffusion as a package
+4. Converts WMR24 data to HouseGAN++ JSON (reuses existing if available)
+5. Converts JSON data to NPZ format expected by House-Diffusion
+
+### `eval_houseganpp.sh`
+
+Evaluate a trained HouseGAN++ model.  Supports generation caching via
+`--save_generations` / `--load_generations` for reproducible re-evaluation.
+
+### `eval_housediffusion.sh`
+
+Evaluate a trained House-Diffusion model.  Same caching support as above.
 
 ---
 
-### `utils/visualize_rplan_json.py`
+## Core Scripts
 
-**Purpose:** Visualize original RPLAN JSON format samples.
+### `src/dataset_loader.py`
 
-Reconstructs polygons from edge segments and renders color-coded floor plans.
+Shared PyTorch dataset and collation functions for loading WMR24 data in
+HouseGAN++ format.
+
+- **`BenchmarkDataset`** — Loads pickle files, builds room masks from
+  polygons, one-hot encodes room types (RPLAN format), creates adjacency edge
+  lists. Supports room-count filtering via `target_set`.
+- **`collate_fn`** — Batches samples with variable numbers of rooms,
+  concatenating masks, nodes, and edges with proper index adjustment.
+
+### `src/evaluate_houseganpp.py`
+
+Evaluate HouseGAN++ with four metrics (GED, room accuracy, delta, area
+difference).
+
+- Incremental generation — generates floorplans room-by-room using
+  HouseGAN++'s iterative refinement
+- Builds door-based access graphs from generated masks (IoU-based door
+  detection) and from ground-truth structure (graph triples)
+- Multiple variations per sample for consistency measurement
+- `--save_graphs` produces side-by-side GT vs predicted comparison images
+- Generation caching via `--save_generations` / `--load_generations`
+
+### `src/evaluate_housediffusion.py`
+
+Evaluate House-Diffusion with the same four metrics.
+
+- Generates floorplans using diffusion sampling
+- Extracts room polygons from generated outputs
+- Builds predicted access graphs from polygon adjacency
+- Generation caching for reproducible re-evaluation
 
 ---
 
-## 📊 Dataset Format
+## Utility Scripts
 
-### Input: Hypergraph1K Format
+### `utils/convert_hypergraph_to_housegan_json.py`
+
+Convert WMR24 hypergraph JSON format to HouseGAN++-compatible JSON files.
+Extracts room polygons, door positions, and adjacency triples from the
+BSP-tree representation using the RGL geometry library.
+
+### `utils/convert_json_to_pickle.py`
+
+Convert HouseGAN++ JSON files to pickle format used by `BenchmarkDataset`.
+Normalizes polygons to a target grid (64x64), maps room types to RPLAN IDs,
+and builds adjacency triples.
+
+### `utils/convert_json_to_npz.py`
+
+Convert HouseGAN++ JSON files to NPZ format expected by House-Diffusion's
+`RPlanhgDataset`.  Remaps room types and structures the data as `houses`,
+`graphs`, `door_masks`, `self_masks`, `gen_masks`, and `ids` arrays.
+
+### `utils/score_benchmark_result.py`
+
+Compute, report, and persist benchmark evaluation metrics.  Accepts raw
+per-sample score arrays from evaluation scripts and handles all statistics
+(mean, median, std, variation consistency, etc.), console output, text-file
+summaries, and NPZ serialisation.  Both evaluation scripts pass raw arrays
+here; no statistics are computed in the evaluation scripts themselves.
+
+### `utils/analyze_metrics_by_room_count.py`
+
+Post-evaluation analysis that bins all available metrics by room count.
+Automatically discovers every per-sample score array in the
+`benchmark_results.npz` (GED, accuracy, count error, type error, similarity,
+area difference) and groups samples into bins (\(\leq 4\), 5, 6, 7, 8,
+\(> 8\) rooms).  `num_variations` is auto-detected from the NPZ when
+omitted.
+
+---
+
+## Dataset Format
+
+### Input: WMR24 Hypergraph Format
+
+Each entry in `dataset/wmr24/wmr24.json`:
+
 ```json
 {
-    "id": "sample_001",
-    "bounds": [...],
-    "split": [...],
-    "room_types": [0, 1, 2, ...]
+    "database": "zurich",
+    "id": "ch-z-0020",
+    "area": 32.73,
+    "bedrooms": 1,
+    "bathrooms": 1,
+    "bounds": { "corners": [...], ... },
+    "facade": [...],
+    "circulation": [...],
+    "split": { "name": "root", "children": [...], ... }
 }
 ```
 
-### Output: HouseGAN++ Pickle Format
-```python
+### Intermediate: HouseGAN++ JSON (per sample)
+
+Produced by `convert_hypergraph_to_housegan_json.py`:
+
+```json
 {
-    'id': 'sample_001',
-    'polygons': [
-        [(x1, y1), (x2, y2), ...],
-        [(x1, y1), (x2, y2), ...],
-        ...
-    ],
-    'room_types': [1, 2, 3, ...],
-    'triples': [
-        [0, 1, 1],
-        [0, -1, 2],
-        ...
-    ]
+    "id": "ch-z-0020",
+    "room_type": [1, 6, 2, 4, 17, 17, 17],
+    "boxes": [...],
+    "edges": [[0, 1, 1], [0, 1, 2], [1, -1, 3], ...]
 }
 ```
+
+### HouseGAN++ Pickle Format
+
+Produced by `convert_json_to_pickle.py`:
+
+```python
+{
+    'id': 'ch-z-0020',
+    'polygons': [[(x1, y1), (x2, y2), ...], ...],
+    'room_types': [1, 6, 2, 4, 17, 17, 17],
+    'triples': [[0, 1, 1], [0, -1, 2], ...]
+}
+```
+
+### House-Diffusion NPZ Format
+
+Produced by `convert_json_to_npz.py`:
+
+| Key | Shape | Description |
+|---|---|---|
+| `houses` | `(N, 100, 94)` | Packed room geometry (corners + one-hot types) |
+| `graphs` | `(N,)` object | Adjacency triples per sample |
+| `door_masks` | `(N, 100, 100)` | Door adjacency matrices |
+| `self_masks` | `(N, 100, 100)` | Self-connection masks |
+| `gen_masks` | `(N, 100, 100)` | Generation masks |
+| `ids` | `(N,)` object | Sample ID strings |
 
 ### Room Type Mapping
 
-| Hypergraph1K Type | RPLAN ID | Room Type      | Color Code |
-|-------------------|----------|----------------|------------|
-| 0                 | 1        | Living Room    | #EE4D4D    |
-| 1                 | 3        | Bedroom        | #C67C7B    |
-| 2                 | 2        | Kitchen        | #FFD274    |
-| 3                 | 4        | Bathroom       | #BEBEBE    |
-| 10                | 6        | Foyer/Entrance | #E397D9    |
-| 11                | 10       | Extra/Storage  | #9D9D9D    |
-| 17                | 17       | Interior Door  | #5B5B5B    |
+| WMR24 mergeid | RPLAN ID | Room Type | HouseGAN++ Color |
+|---|---|---|---|
+| living | 1 | Living Room | #ED6D87 |
+| bed | 3 | Bedroom | #5B448C |
+| kitchen | 2 | Kitchen | #F0E34F |
+| bath | 4 | Bathroom | #5D9AD4 |
+| foyer | 6 | Entrance | #FFA17A |
+| extra | 10 | Storage | #B0B0B0 |
+| — | 17 | Interior Door | #888888 |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 benchmark/
 ├── README.md                            # This file
 ├── setup_houseganpp.sh                  # HouseGAN++ automated setup
 ├── setup_housediffusion.sh              # House-Diffusion automated setup
-├── finetune_houseganpp.sh               # HouseGAN++ training launcher
-├── finetune_housediffusion.sh           # House-Diffusion training launcher
 ├── eval_houseganpp.sh                   # HouseGAN++ evaluation launcher
 ├── eval_housediffusion.sh               # House-Diffusion evaluation launcher
 │
 ├── src/                                 # Core Python scripts
 │   ├── dataset_loader.py                # Shared PyTorch dataset module
-│   ├── evaluate_houseganpp.py           # HouseGAN++ evaluation (GED, accuracy, delta)
-│   ├── evaluate_housediffusion.py       # House-Diffusion evaluation (GED, accuracy, delta)
-│   ├── finetune_houseganpp.py           # HouseGAN++ fine-tuning
-│   └── finetune_housediffusion.py       # House-Diffusion fine-tuning
+│   ├── evaluate_houseganpp.py           # HouseGAN++ evaluation (4 metrics)
+│   └── evaluate_housediffusion.py       # House-Diffusion evaluation (4 metrics)
 │
 ├── utils/                               # Utility and conversion scripts
-│   ├── analyze_metrics_by_room_count.py # Post-evaluation metric binning by room count
-│   ├── convert_hypergraph_to_rplan.py   # Hypergraph1K JSON → HouseGAN++ pickle
-│   ├── convert_pickle_to_npz.py         # HouseGAN++ pickle → House-Diffusion NPZ
-│   ├── score_benchmark_result.py        # Shared benchmark scoring and saving
-│   ├── visualize_hypergraph_pickle.py   # Pickle visualization
-│   └── visualize_rplan_json.py          # RPLAN JSON visualization
+│   ├── convert_hypergraph_to_housegan_json.py  # WMR24 JSON → HouseGAN++ JSON
+│   ├── convert_json_to_pickle.py               # HouseGAN++ JSON → pickle
+│   ├── convert_json_to_npz.py                  # HouseGAN++ JSON → NPZ
+│   ├── score_benchmark_result.py               # Shared benchmark scoring & saving
+│   ├── analyze_metrics_by_room_count.py        # Post-eval metric binning
+│   └── visualize_rplan_json.py                 # RPLAN JSON visualization
 │
-└── dataset/                             # Generated datasets
-    └── Hypergraph_to_RPLAN/
-        ├── train/train_data.pkl
-        ├── validation/validation_data.pkl
-        └── test/test_data.pkl
+└── eval_results_*/                      # Output directories (per experiment)
+    ├── benchmark_results.npz                # All metric arrays + summary dicts
+    ├── benchmark_results.txt                # Human-readable summary
+    ├── fig/                                 # Comparison images (if --save_graphs)
+    └── generations*.pkl                     # Cached generations (if --save_generations)
 ```
 
 ---
