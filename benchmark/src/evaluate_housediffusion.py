@@ -973,28 +973,65 @@ def parse_args():
     return parser.parse_args()
 
 
-def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array=None):
-    """
-    Post-process a sample from House-Diffusion.
-    
-    Args:
-        sample_data: Dict with sample data
-        sample_ids_array: Optional numpy array of sample IDs from NPZ file
-    
-    Returns:
-        Dict with post-processed sample data
-    """
+def _make_results_dict():
+    """Return a fresh results accumulator."""
+    return {
+        'all_geds': [],
+        'ged_pairs': [],
+        'room_count_accuracies': [],
+        'room_count_errors': [],
+        'room_type_errors': [],
+        'similarity_scores': [],
+        'area_difference_scores': [],
+        'unmatched_pred_rooms': [],
+        'unmatched_gt_rooms': [],
+        'matched_room_pairs': [],
+        'hidden_room_count': 0,
+    }
 
-    # Upper bound for GED computation
+
+def _ged_worker(pair):
+    """Compute GED for a single (G_pred, G_true, idx, upper_bound) tuple."""
+    G_pred, G_true, sample_idx, upper_bound = pair
+    ged, _ = ged_between_graphs(
+        G_pred, G_true, sample_idx,
+        timeout=10000, upper_bound=upper_bound
+    )
+    return ged if ged is not None else np.nan
+
+
+def _parallel_ged(ged_pairs):
+    """Run all GED computations in parallel using joblib."""
+    import multiprocessing
+    from joblib import Parallel, delayed
+
+    num_cores = multiprocessing.cpu_count()
+    print(f"\nComputing GED for {len(ged_pairs)} pairs using {num_cores} cores...")
+
+    all_geds = Parallel(n_jobs=num_cores)(
+        delayed(_ged_worker)(pair)
+        for pair in tqdm(ged_pairs, desc="Computing GED")
+    )
+    return all_geds
+
+
+def postprocess_sample(sample_data, results, save_graphs, output_dir,
+                       sample_ids_array=None):
+    """Post-process a sample: compute all metrics except GED.
+
+    GED graph pairs are collected into *results['ged_pairs']* so that
+    the caller can run them in parallel after all samples are processed.
+
+    Returns:
+        The updated *results* dict.
+    """
     ged_upper_bound = 40
 
-    # Get sample index and ID
     sample_idx = sample_data['sample_idx']
     sample_id = None
     if sample_ids_array is not None and sample_idx < len(sample_ids_array):
         sample_id = sample_ids_array[sample_idx]
-            
-    # Convert to polygons (for access graph) and masks (for visualization)
+
     gt_polygons = corners_to_polygons_and_types(
         sample_data['gt_coords'],
         sample_data['gt_room_types_oh'],
@@ -1011,24 +1048,15 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         image_size=256
     )
 
-    # Build ground truth access graph from polygons
     G_true = build_access_graph_from_polygons(gt_polygons)
 
-    # Clear variation_geds
-    results['variation_geds'] = []
-
-    # Use syn conditioning for predictions (the model generates using syn_ keys
-    # which have different corner counts than GT). Fall back to GT if syn not available.
     syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
     syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
     syn_padding_mask = sample_data.get('syn_padding_mask', sample_data['gt_padding_mask'])
 
-    # Process each variation
     for var_data in sample_data['variations']:
         var_idx = var_data['variation_idx']
-        
-        # Convert to polygons (for access graph) and masks (for visualization)
-        # Predictions must use syn_ conditioning (matches the structure the model generated)
+
         pred_polygons = corners_to_polygons_and_types(
             var_data['pred_coords'],
             syn_room_types_oh,
@@ -1036,7 +1064,7 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
             syn_padding_mask,
             image_size=256
         )
-        
+
         pred_masks, pred_room_types = corners_to_masks(
             var_data['pred_coords'],
             syn_room_types_oh,
@@ -1045,17 +1073,13 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
             image_size=256
         )
 
-        # Build predicted access graph directly from polygons (more accurate!)
         G_pred = build_access_graph_from_polygons(pred_polygons)
-        
-        # Count actual rooms in generated polygons (accounting for hidden/overlapped regions)
+
         room_count_info = count_actual_rooms_from_polygons(pred_polygons)
-        
-        # Track hidden rooms
+
         if len(room_count_info['hidden_rooms']) > 0:
             results['hidden_room_count'] += 1
-        
-        # Compute room count and type accuracy
+
         room_count_metric = room_type_accuracy(
             room_count_info['expected_room_types'],
             room_count_info['actual_room_types']
@@ -1063,8 +1087,7 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         results['room_count_accuracies'].append(room_count_metric['accuracy'])
         results['room_count_errors'].append(room_count_metric['count_error'])
         results['room_type_errors'].append(room_count_metric['type_error'])
-        
-        # Compute room similarity score
+
         similarity_result = compute_room_similarity_score_polygons(
             pred_polygons, gt_polygons
         )
@@ -1072,36 +1095,26 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         results['unmatched_pred_rooms'].append(similarity_result['unmatched_pred'])
         results['unmatched_gt_rooms'].append(similarity_result['unmatched_gt'])
         results['matched_room_pairs'].append(similarity_result['matched_pairs'])
-        
-        # Compute room area difference
+
         area_diff_result = compute_room_area_difference_score_polygons(
             pred_polygons, gt_polygons
         )
         results['area_difference_scores'].append(area_diff_result['area_difference_score'])
-        
-        # Compute GED
-        ged, graph_len = ged_between_graphs(
-            G_pred, G_true, sample_idx,
-            timeout=10000, upper_bound=ged_upper_bound
-        )
-        
-        if ged is not None:
-            results['variation_geds'].append(ged)
-        else:
-            results['variation_geds'].append(np.nan)
 
-    
-        # Save visualization for first variation
+        results['ged_pairs'].append(
+            (G_pred, G_true, sample_idx, ged_upper_bound)
+        )
+
         if var_idx == 0 and save_graphs:
             visualize_comparison(
                 gt_masks, gt_room_types,
                 pred_masks, pred_room_types,
-                G_true, G_pred, ged, sample_idx, output_dir,
+                G_true, G_pred, None, sample_idx, output_dir,
                 room_count_info=room_count_info,
                 similarity_result=similarity_result,
                 sample_id=sample_id
             )
-        
+
     return results
 
 def load_and_process_cached_samples(cached_data_path, num_variations, save_graphs, output_dir, sample_ids_array=None):
@@ -1123,38 +1136,21 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
     
     pbar = tqdm(total=len(cached_data['samples']), desc="Processing cached")
 
-    # Storage for results
-    results = {
-        'variation_geds': [],
-        'all_geds': [],
-        'room_count_accuracies': [],
-        'room_count_errors': [],
-        'room_type_errors': [],
-        'similarity_scores': [],
-        'area_difference_scores': [],
-        'unmatched_pred_rooms': [],
-        'unmatched_gt_rooms': [],
-        'matched_room_pairs': [],
-        'hidden_room_count': 0,
-    }
+    results = _make_results_dict()
     sample_count = 0
 
     try:
         for sample_data in cached_data['samples']:
-            # Post-process each sample
-            results = postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array)           
+            results = postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids_array)
             sample_count += 1
-                
-            # Record results (always extend, even with NaNs)
-            # This ensures we always have num_variations entries per sample
-            results['all_geds'].extend(results['variation_geds'])
-                
             pbar.update(1)
-    
+
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted by user")
     finally:
         pbar.close()
+
+    results['all_geds'] = _parallel_ged(results['ged_pairs'])
     return results
 
 def _build_additional_info(results):
@@ -1367,20 +1363,7 @@ def main():
         if save_mode:
             cache_samples = []
         
-        # Initialize results storage (same structure as load_and_process_cached_samples)
-        results = {
-            'variation_geds': [],
-            'all_geds': [],
-            'room_count_accuracies': [],
-            'room_count_errors': [],
-            'room_type_errors': [],
-            'similarity_scores': [],
-            'area_difference_scores': [],
-            'unmatched_pred_rooms': [],
-            'unmatched_gt_rooms': [],
-            'matched_room_pairs': [],
-            'hidden_room_count': 0,
-        }
+        results = _make_results_dict()
         
         # Process samples
         pbar = tqdm(total=total_samples if total_samples != float('inf') else None)
@@ -1451,7 +1434,6 @@ def main():
                     }
 
                     results = postprocess_sample(sample_data, results, args.save_graphs, args.out, sample_ids_array)
-                    results['all_geds'].extend(results['variation_geds'])
 
                     if save_mode:
                         cache_samples.append({
@@ -1489,6 +1471,8 @@ def main():
                 'version': '1.0'
             }
             save_generations_housediffusion(args.save_generations, metadata, cache_samples)
+
+        results['all_geds'] = _parallel_ged(results['ged_pairs'])
     
     score_benchmark_result(
         all_geds=np.array(results['all_geds']),
