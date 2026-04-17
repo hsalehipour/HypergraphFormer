@@ -395,42 +395,43 @@ def convert(json_dir, output_dir, set_name='eval', target_set=None, train_json_d
 
         for h, graph in tqdm(zip(kept_org_houses, kept_org_graphs),
                              total=len(kept_org_houses), desc="Building syn data"):
-            house = []
-            corner_bounds = []
-            num_points = 0
-            num_room_corners_total = [
-                train_cnumber_dist[room[1]][random.randint(0, len(train_cnumber_dist[room[1]]) - 1)]
-                for room in h
-            ]
-            while np.sum(num_room_corners_total) >= max_num_points:
+            max_retries = 50
+            for _attempt in range(max_retries):
+                house = []
+                corner_bounds = []
+                num_points = 0
                 num_room_corners_total = [
                     train_cnumber_dist[room[1]][random.randint(0, len(train_cnumber_dist[room[1]]) - 1)]
                     for room in h
                 ]
+                if np.sum(num_room_corners_total) >= max_num_points:
+                    continue
 
-            skip_sample = False
-            for i, room in enumerate(h):
-                num_room_corners = num_room_corners_total[i]
-                if num_room_corners < 1 or num_room_corners >= MAX_CORNERS:
-                    skip_sample = True
-                    break
-                rtype = np.repeat(np.array([_get_one_hot(room[1], 25)]), num_room_corners, 0)
-                room_index = np.repeat(np.array([_get_one_hot(len(house) + 1, MAX_ROOMS)]), num_room_corners, 0)
-                corner_index = np.array([_get_one_hot(x, MAX_CORNERS) for x in range(num_room_corners)])
-                padding_mask = np.expand_dims(np.repeat(1, num_room_corners), 1)
-                connections = np.array([[ci, (ci + 1) % num_room_corners] for ci in range(num_room_corners)])
-                connections += num_points
-                corner_bounds.append([num_points, num_points + num_room_corners])
-                num_points += num_room_corners
-                room_data = np.concatenate(
-                    (np.zeros([num_room_corners, 2]), rtype, corner_index, room_index, padding_mask, connections), 1
-                )
-                house.append(room_data)
-            if skip_sample:
-                continue
+                skip_sample = False
+                for i, room in enumerate(h):
+                    num_room_corners = num_room_corners_total[i]
+                    if num_room_corners < 1 or num_room_corners >= MAX_CORNERS:
+                        skip_sample = True
+                        break
+                    rtype = np.repeat(np.array([_get_one_hot(room[1], 25)]), num_room_corners, 0)
+                    room_index = np.repeat(np.array([_get_one_hot(len(house) + 1, MAX_ROOMS)]), num_room_corners, 0)
+                    corner_index = np.array([_get_one_hot(x, MAX_CORNERS) for x in range(num_room_corners)])
+                    padding_mask = np.expand_dims(np.repeat(1, num_room_corners), 1)
+                    connections = np.array([[ci, (ci + 1) % num_room_corners] for ci in range(num_room_corners)])
+                    connections += num_points
+                    corner_bounds.append([num_points, num_points + num_room_corners])
+                    num_points += num_room_corners
+                    room_data = np.concatenate(
+                        (np.zeros([num_room_corners, 2]), rtype, corner_index, room_index, padding_mask, connections), 1
+                    )
+                    house.append(room_data)
+                if skip_sample:
+                    continue
 
-            house_layouts = np.concatenate(house, 0)
-            if np.sum([len(room[0]) for room in h]) > max_num_points:
+                house_layouts = np.concatenate(house, 0)
+                break
+            else:
+                print(f"WARNING: Could not generate valid syn for a sample after {max_retries} retries, skipping")
                 continue
             padding = np.zeros((max_num_points - len(house_layouts), 94))
             gen_mask = np.ones((max_num_points, max_num_points))
