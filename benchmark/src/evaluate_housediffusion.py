@@ -2,10 +2,11 @@
 """
 Evaluate House-Diffusion floorplan generation.
 
-Generates floorplans and computes three metrics against ground truth:
+Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
+  4. Area Difference -- Relative room-area error between paired rooms
 
 Expects a pre-processed NPZ file via --data_path.  To convert from
 RPLAN JSON files, use benchmark/utils/convert_json_to_npz.py first
@@ -426,6 +427,52 @@ def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
         'unmatched_pred': unmatched_pred_count,
         'unmatched_gt': unmatched_gt_count,
         'per_room_scores': similarity_scores
+    }
+
+
+def compute_room_area_difference_score_polygons(pred_polygons, gt_polygons):
+    """Compute mean relative room-area error using polygon-based representation.
+
+    Pairing logic mirrors :func:`compute_room_similarity_score_polygons`:
+    rooms grouped by type, sorted by area descending, paired largest-first.
+    Per-pair error is ``abs(area_pred - area_gt) / area_gt``.
+    """
+    pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
+    gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
+
+    pred_by_type = {}
+    gt_by_type = {}
+    for room in pred_rooms:
+        pred_by_type.setdefault(room['room_type'], []).append(room)
+    for room in gt_rooms:
+        gt_by_type.setdefault(room['room_type'], []).append(room)
+
+    area_errors = []
+    matched_pairs = 0
+    unmatched_pred_count = 0
+    unmatched_gt_count = 0
+
+    for room_type in set(pred_by_type.keys()) | set(gt_by_type.keys()):
+        pred_of_type = sorted(pred_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
+        gt_of_type = sorted(gt_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
+        num_to_match = min(len(pred_of_type), len(gt_of_type))
+        unmatched_pred_count += len(pred_of_type) - num_to_match
+        unmatched_gt_count += len(gt_of_type) - num_to_match
+
+        for pred_room, gt_room in zip(pred_of_type[:num_to_match], gt_of_type[:num_to_match]):
+            area_gt = gt_room['area']
+            if area_gt > 0:
+                area_errors.append(abs(pred_room['area'] - area_gt) / area_gt)
+                matched_pairs += 1
+
+    avg_error = np.mean(area_errors) if area_errors else np.nan
+
+    return {
+        'area_difference_score': avg_error,
+        'matched_pairs': matched_pairs,
+        'unmatched_pred': unmatched_pred_count,
+        'unmatched_gt': unmatched_gt_count,
+        'per_room_scores': area_errors,
     }
 
 
@@ -1025,6 +1072,12 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir, sample_ids
         results['unmatched_gt_rooms'].append(similarity_result['unmatched_gt'])
         results['matched_room_pairs'].append(similarity_result['matched_pairs'])
         
+        # Compute room area difference
+        area_diff_result = compute_room_area_difference_score_polygons(
+            pred_polygons, gt_polygons
+        )
+        results['area_difference_scores'].append(area_diff_result['area_difference_score'])
+        
         # Compute GED
         ged, graph_len = ged_between_graphs(
             G_pred, G_true, sample_idx,
@@ -1077,6 +1130,7 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
         'room_count_errors': [],
         'room_type_errors': [],
         'similarity_scores': [],
+        'area_difference_scores': [],
         'unmatched_pred_rooms': [],
         'unmatched_gt_rooms': [],
         'matched_room_pairs': [],
@@ -1103,11 +1157,15 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
     return results
 
 def print_and_save_data_statistics(results, num_variations):
-    """
-    Compute and print statistics for the dataset.
-    """
+    """Compute metric dicts from collected result arrays.
 
-    # Get results
+    All console/file reporting is handled by
+    :func:`score_benchmark_result` -- this function only builds the
+    summary dicts.
+
+    Returns:
+        ``(room_count_dict, similarity_dict, area_difference_dict)``
+    """
     room_count_accuracies = results['room_count_accuracies']
     room_count_errors = results['room_count_errors']
     room_type_errors = results['room_type_errors']
@@ -1117,16 +1175,11 @@ def print_and_save_data_statistics(results, num_variations):
     matched_room_pairs = results['matched_room_pairs']
     hidden_room_count = results['hidden_room_count']
 
-    # Print room count accuracy statistics
-    print(f"\n{'='*60}")
-    print("ROOM COUNT AND TYPE ACCURACY STATISTICS")
-    print(f"{'='*60}")
-    
+    # Room count accuracy
     room_count_accuracies_array = np.array(room_count_accuracies)
     room_count_errors_array = np.array(room_count_errors)
     room_type_errors_array = np.array(room_type_errors)
-    
-    # Overall statistics (across all samples and variations)
+
     exact_match_rate = np.mean(room_count_accuracies_array) * 100
     mean_count_error = np.mean(room_count_errors_array)
     median_count_error = np.median(room_count_errors_array)
@@ -1135,81 +1188,26 @@ def print_and_save_data_statistics(results, num_variations):
     median_type_error = np.median(room_type_errors_array)
     max_type_error = np.max(room_type_errors_array)
     hidden_rate = (hidden_room_count / len(room_count_accuracies)) * 100
-    
-    # Compute STD of variation means (same method as GED statistics)
-    # This measures if different generation runs produce systematically different results
+
     std_of_variation_means = 0.0
     count_error_std_of_variation_means = 0.0
     type_error_std_of_variation_means = 0.0
-    
+
     if num_variations > 1:
         num_samples_processed = len(room_count_accuracies) // num_variations
         if len(room_count_accuracies) % num_variations == 0:
             accuracies_reshaped = room_count_accuracies_array.reshape(num_samples_processed, num_variations)
             count_errors_reshaped = room_count_errors_array.reshape(num_samples_processed, num_variations)
             type_errors_reshaped = room_type_errors_array.reshape(num_samples_processed, num_variations)
-            
-            # Mean per variation (averaged across all samples) - same as GED calculation
-            means_per_variation = np.mean(accuracies_reshaped, axis=0)
-            count_error_means_per_variation = np.mean(count_errors_reshaped, axis=0)
-            type_error_means_per_variation = np.mean(type_errors_reshaped, axis=0)
-            
-            # STD of variation means with ddof=1 (sample std) - same as GED calculation
-            std_of_variation_means = np.std(means_per_variation, ddof=1)
-            count_error_std_of_variation_means = np.std(count_error_means_per_variation, ddof=1)
-            type_error_std_of_variation_means = np.std(type_error_means_per_variation, ddof=1)
-            
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Accuracy STD of variation means: {std_of_variation_means:.3f} ({std_of_variation_means*100:.1f}%)")
-            print(f"   • Mean per variation: {means_per_variation}")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Count error STD of variation means: {count_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Type error STD of variation means: {type_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-        else:
-            # Fallback if num_variations doesn't divide evenly
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-    else:
-        # Single variation case
-        print(f"\n📊 Room Count and Type Accuracy:")
-        print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-        print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-        print(f"   • Median count error: {median_count_error:.1f} rooms")
-        print(f"   • Max count error: {max_count_error:.0f} rooms")
-        print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-        print(f"   • Median type error: {median_type_error:.1f} rooms")
-        print(f"   • Max type error: {max_type_error:.0f} rooms")
-        print(f"   • Samples with hidden rooms: {hidden_room_count}/{len(room_count_accuracies)} ({hidden_rate:.1f}%)")
-    
-    print(f"\n💭 Interpretation:")
-    print(f"   This measures how accurately the model predicts both the number and types of rooms.")
-    print(f"   Accuracy = 1.0 only if both count and type distribution match perfectly.")
-    print(f"   {exact_match_rate:.1f}% of predictions have exactly the right room count and types.")
-    print(f"   Note: Hidden rooms (completely overlapped by other polygons) are excluded from count.")
-    
-    # Print room similarity score statistics
-    print(f"\n{'='*60}")
-    print("ROOM SIMILARITY SCORE STATISTICS")
-    print(f"{'='*60}")
-    
+
+            std_of_variation_means = np.std(np.mean(accuracies_reshaped, axis=0), ddof=1)
+            count_error_std_of_variation_means = np.std(np.mean(count_errors_reshaped, axis=0), ddof=1)
+            type_error_std_of_variation_means = np.std(np.mean(type_errors_reshaped, axis=0), ddof=1)
+
+    # Room similarity
     similarity_scores_array = np.array(similarity_scores)
-    # Filter out NaN values (no rooms to compare)
     valid_similarity_scores = similarity_scores_array[~np.isnan(similarity_scores_array)]
-    
+
     if len(valid_similarity_scores) > 0:
         mean_similarity = np.mean(valid_similarity_scores)
         median_similarity = np.median(valid_similarity_scores)
@@ -1217,56 +1215,54 @@ def print_and_save_data_statistics(results, num_variations):
         max_similarity = np.max(valid_similarity_scores)
         std_similarity = np.std(valid_similarity_scores)
         valid_rate = (len(valid_similarity_scores) / len(similarity_scores_array)) * 100
-        
-        print(f"\n📊 Room Similarity Score (δ = abs(1 - (L_SA * L_B)/(L_A * L_SB))):")
-        print(f"   • Mean: {mean_similarity:.4f} (lower is better, 0 = perfect match)")
-        print(f"   • Median: {median_similarity:.4f}")
-        print(f"   • STD: {std_similarity:.4f}")
-        print(f"   • Range: [{min_similarity:.4f}, {max_similarity:.4f}]")
-        print(f"   • Valid samples: {len(valid_similarity_scores)}/{len(similarity_scores_array)} ({valid_rate:.1f}%)")
-        
-        # Report unmatched room statistics
-        total_unmatched_pred = sum(unmatched_pred_rooms)
-        total_unmatched_gt = sum(unmatched_gt_rooms)
-        total_matched_pairs = sum(matched_room_pairs)
-        avg_unmatched_pred = np.mean(unmatched_pred_rooms)
-        avg_unmatched_gt = np.mean(unmatched_gt_rooms)
-        
-        print(f"\n📊 Room Matching Statistics:")
-        print(f"   • Total matched room pairs: {total_matched_pairs}")
-        print(f"   • Total unmatched pred rooms: {total_unmatched_pred} (avg: {avg_unmatched_pred:.2f} per sample)")
-        print(f"   • Total unmatched GT rooms: {total_unmatched_gt} (avg: {avg_unmatched_gt:.2f} per sample)")
-        
-        print(f"\n💭 Interpretation:")
-        print(f"   This measures geometric similarity between predicted and GT rooms.")
-        print(f"   Lower scores indicate better shape matching (0 = identical shapes).")
-        print(f"   Compares common rooms when counts differ (extras are ignored).")
-        
-        # Compute STD of variation means if applicable
+
         similarity_std_of_variation_means = 0.0
         if num_variations > 1:
-            num_samples_processed = len(valid_similarity_scores) // num_variations
-            if num_samples_processed > 0 and len(valid_similarity_scores) % num_variations == 0:
-                sim_reshaped = valid_similarity_scores.reshape(num_samples_processed, num_variations)
-                sim_means_per_variation = np.mean(sim_reshaped, axis=0)
-                similarity_std_of_variation_means = np.std(sim_means_per_variation, ddof=1)
-                print(f"\n   • STD of variation means: {similarity_std_of_variation_means:.4f}")
-                print(f"   • Mean per variation: {sim_means_per_variation}")
+            n = len(valid_similarity_scores) // num_variations
+            if n > 0 and len(valid_similarity_scores) % num_variations == 0:
+                similarity_std_of_variation_means = float(np.std(
+                    np.mean(valid_similarity_scores.reshape(n, num_variations), axis=0), ddof=1))
     else:
         mean_similarity = np.nan
         median_similarity = np.nan
-        std_similarity = np.nan
         min_similarity = np.nan
         max_similarity = np.nan
+        std_similarity = np.nan
         similarity_std_of_variation_means = np.nan
         valid_rate = 0.0
-        
-        print(f"\n⚠️  No valid similarity scores (no rooms to compare)")
-    
-    # Compute and save statistics using shared function
+
+    # Area difference
+    area_difference_scores = results['area_difference_scores']
+    area_difference_scores_array = np.array(area_difference_scores)
+    valid_area_diff_scores = area_difference_scores_array[~np.isnan(area_difference_scores_array)]
+
+    if len(valid_area_diff_scores) > 0:
+        mean_area_diff = np.mean(valid_area_diff_scores)
+        median_area_diff = np.median(valid_area_diff_scores)
+        min_area_diff = np.min(valid_area_diff_scores)
+        max_area_diff = np.max(valid_area_diff_scores)
+        std_area_diff = np.std(valid_area_diff_scores)
+        valid_area_rate = (len(valid_area_diff_scores) / len(area_difference_scores_array)) * 100
+
+        area_diff_std_of_variation_means = 0.0
+        if num_variations > 1:
+            n = len(valid_area_diff_scores) // num_variations
+            if n > 0 and len(valid_area_diff_scores) % num_variations == 0:
+                area_diff_std_of_variation_means = float(np.std(
+                    np.mean(valid_area_diff_scores.reshape(n, num_variations), axis=0), ddof=1))
+    else:
+        mean_area_diff = np.nan
+        median_area_diff = np.nan
+        min_area_diff = np.nan
+        max_area_diff = np.nan
+        std_area_diff = np.nan
+        area_diff_std_of_variation_means = np.nan
+        valid_area_rate = 0.0
+
+    # Build dicts
     room_count_dict = {
         'exact_match_rate': float(exact_match_rate),
-        'accuracy_std': float(std_of_variation_means),  # std of variation means (consistency metric)
+        'accuracy_std': float(std_of_variation_means),
         'mean_count_error': float(mean_count_error),
         'count_error_std': float(count_error_std_of_variation_means),
         'median_count_error': float(median_count_error),
@@ -1281,7 +1277,7 @@ def print_and_save_data_statistics(results, num_variations):
         'all_count_errors': room_count_errors_array.tolist(),
         'all_type_errors': room_type_errors_array.tolist()
     }
-    
+
     similarity_dict = {
         'mean': float(mean_similarity) if not np.isnan(mean_similarity) else None,
         'median': float(median_similarity) if not np.isnan(median_similarity) else None,
@@ -1298,7 +1294,20 @@ def print_and_save_data_statistics(results, num_variations):
         'avg_unmatched_gt': float(np.mean(unmatched_gt_rooms)),
         'all_scores': similarity_scores_array.tolist()
     }
-    return room_count_dict, similarity_dict
+
+    area_difference_dict = {
+        'mean': float(mean_area_diff) if not np.isnan(mean_area_diff) else None,
+        'median': float(median_area_diff) if not np.isnan(median_area_diff) else None,
+        'std': float(std_area_diff) if not np.isnan(std_area_diff) else None,
+        'std_of_variation_means': float(area_diff_std_of_variation_means) if not np.isnan(area_diff_std_of_variation_means) else None,
+        'min': float(min_area_diff) if not np.isnan(min_area_diff) else None,
+        'max': float(max_area_diff) if not np.isnan(max_area_diff) else None,
+        'valid_count': int(len(valid_area_diff_scores)),
+        'valid_rate': float(valid_area_rate),
+        'all_scores': area_difference_scores_array.tolist()
+    }
+
+    return room_count_dict, similarity_dict, area_difference_dict
     
 
 def main():
@@ -1497,6 +1506,7 @@ def main():
             'room_count_errors': [],
             'room_type_errors': [],
             'similarity_scores': [],
+            'area_difference_scores': [],
             'unmatched_pred_rooms': [],
             'unmatched_gt_rooms': [],
             'matched_room_pairs': [],
@@ -1612,7 +1622,7 @@ def main():
             save_generations_housediffusion(args.save_generations, metadata, cache_samples)
     
     # Print and save data statistics
-    room_count_dict, similarity_dict = print_and_save_data_statistics(results, args.num_variations)
+    room_count_dict, similarity_dict, area_difference_dict = print_and_save_data_statistics(results, args.num_variations)
 
     # Save GED statistics
     score_benchmark_result(
@@ -1623,7 +1633,8 @@ def main():
         data_path=args.data_path,
         additional_info={
             'room_count_accuracy': room_count_dict,
-            'room_similarity': similarity_dict
+            'room_similarity': similarity_dict,
+            'area_difference': area_difference_dict,
         }
     )
     
