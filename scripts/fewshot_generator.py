@@ -76,20 +76,6 @@ class FewShotGenerator(ABC):
                  timeout: int | None = None) -> GenerationResult:
         """Non-streaming generation (used by evaluators)."""
 
-    def generate_batch(self, prompts: list[str], *, max_tokens: int | None = None,
-                       temperature: float | None = None,
-                       timeout: int | None = None) -> list[GenerationResult]:
-        """Fallback batch generation by looping one prompt at a time."""
-        return [
-            self.generate(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout=timeout,
-            )
-            for prompt in prompts
-        ]
-
     @abstractmethod
     def generate_streaming(self, prompt: str, *, max_tokens: int | None = None,
                            temperature: float | None = None) -> GenerationResult:
@@ -378,9 +364,6 @@ class QwenGenerator(FewShotGenerator):
     @property
     def tokenizer(self):
         self._ensure_loaded()
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
-        self._tokenizer.padding_side = "left"
         return self._tokenizer
 
     def generate(self, prompt: str, *, max_tokens: int | None = None,
@@ -425,96 +408,6 @@ class QwenGenerator(FewShotGenerator):
             return GenerationResult(
                 input_tokens=num_input, generation_time=elapsed, timed_out=True,
             )
-
-    def generate_batch(self, prompts: list[str], *, max_tokens: int | None = None,
-                       temperature: float | None = None,
-                       timeout: int | None = None) -> list[GenerationResult]:
-        from transformers import StoppingCriteria, StoppingCriteriaList
-
-        mt = max_tokens or self.max_tokens
-        temp = temperature or self.temperature
-        batch_size = len(prompts)
-
-        texts = []
-        for prompt in prompts:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-            texts.append(self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            ))
-
-        inputs = self.tokenizer(texts, return_tensors="pt", padding=True).to(self.model.device)
-        # Real (non-padding) prompt token counts per sequence, for reporting.
-        input_lens = inputs.attention_mask.sum(dim=1).tolist()
-        # Padded input length: same for every sequence in the batch.
-        # outputs[i] = [padded_input_tokens | generated_tokens], so we must
-        # slice from here (not from the non-padded length) to isolate new tokens.
-        # Using non-padded length would include left-padding eos/pad tokens in
-        # the scan, causing every sequence to look "finished".
-        padded_input_len = inputs.input_ids.shape[1]
-
-        gen_kwargs = dict(
-            **inputs, max_new_tokens=mt, temperature=temp,
-            do_sample=True, top_p=0.95, top_k=50,
-        )
-
-        # Per-sequence timeout: checked after every generated token.
-        # Returns a BoolTensor of shape (batch_size,) so HuggingFace can stop
-        # individual sequences independently.  Sequences that already produced
-        # an EOS before the deadline are counted as successful in post-processing.
-        criteria_obj: "_PerSampleTimeout | None" = None
-        if timeout is not None:
-            batch_start = time.time()
-
-            class _PerSampleTimeout(StoppingCriteria):
-                def __init__(self_):
-                    self_.timed_out: bool = False
-
-                def __call__(self_, input_ids, scores, **kwargs) -> bool:
-                    if time.time() - batch_start >= timeout:
-                        self_.timed_out = True
-                    return self_.timed_out
-
-            criteria_obj = _PerSampleTimeout()
-            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([criteria_obj])
-
-        start = time.time()
-        outputs = self.model.generate(**gen_kwargs)
-        elapsed = time.time() - start
-
-        decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
-        eos_id = self.tokenizer.eos_token_id
-
-        results = []
-        for i, (text, num_input) in enumerate(zip(decoded, input_lens)):
-            # Slice only the newly generated tokens (after the padded input).
-            generated_ids = outputs[i, padded_input_len:]
-            finished = bool((generated_ids == eos_id).any().item())
-
-            seq_timed_out = (
-                criteria_obj is not None
-                and criteria_obj.timed_out
-                and not finished
-            )
-            if seq_timed_out:
-                logger.warning(
-                    f"Batch sample {i} timed out after {elapsed:.1f}s "
-                    f"(no EOS in generated tokens)"
-                )
-                results.append(GenerationResult(
-                    input_tokens=int(num_input),
-                    generation_time=elapsed,
-                    timed_out=True,
-                ))
-            else:
-                results.append(GenerationResult(
-                    text=text,
-                    input_tokens=int(num_input),
-                    generation_time=elapsed,
-                ))
-        return results
 
     def generate_streaming(self, prompt: str, *, max_tokens: int | None = None,
                            temperature: float | None = None) -> GenerationResult:
