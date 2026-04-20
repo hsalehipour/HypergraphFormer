@@ -47,7 +47,7 @@ DEBUG_DIR = _PROJECT_ROOT / "checkpoints/grpo_graph_check_ged_2/debug_rewards"
 
 
 # ===========================================================================
-# Boundary-mesh helper  (was geometry_validation_utils.sample_to_boundary_mesh)
+# Boundary-mesh helper
 # ===========================================================================
 
 def sample_to_boundary_mesh(sample):
@@ -76,7 +76,7 @@ def sample_to_boundary_mesh(sample):
 
 
 # ===========================================================================
-# Reward module  (was rl_reward.py)
+# Reward module
 # ===========================================================================
 
 GROUND_TRUTH_TRAIN = None
@@ -484,7 +484,7 @@ def create_accuracy_reward(mode="room_reward_delta_soft"):
 
 
 # ===========================================================================
-# Data helpers  (was in fine_tune_rl_qwen.py)
+# Data helpers
 # ===========================================================================
 
 def load_ground_truth_data():

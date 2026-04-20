@@ -52,8 +52,6 @@ events.out.tfevents*
 
 # directories
 checkpoints/
-.zero_shot_edit_outputs/
-api_key
 
 dataset/hypergraph/*
 !dataset/hypergraph/train.json

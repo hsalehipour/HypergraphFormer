@@ -77,7 +77,6 @@ from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_difference")
 
 
@@ -209,7 +208,6 @@ def _run_ged_subprocess(
             cmd,
             capture_output=True,
             text=True,
-            cwd=REPO_ROOT,
             timeout=wall_timeout,
         )
     except subprocess.TimeoutExpired:

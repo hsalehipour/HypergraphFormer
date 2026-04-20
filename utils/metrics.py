@@ -10,6 +10,7 @@ Provides canonical metrics:
 """
 
 import math
+import warnings
 
 from .hypergraph import Hypergraph
 
@@ -254,7 +255,7 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
 
     Returns:
         float: Mean sigma across all paired rooms. In strict mode returns 0.25
-        on mismatch; in soft mode returns 0.6 when no pairs can be formed.
+        on mismatch; in soft mode returns NaN when no pairs can be formed.
     """
     if strict:
         rooms_A = [t[0] for t in room_list_A]
@@ -307,42 +308,22 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
             list_of_sigmas.append(sigma)
 
     if len(list_of_sigmas) == 0:
-        return 0.6
+        return float('nan')
     return sum(list_of_sigmas) / len(list_of_sigmas)
 
 
-def compute_room_area_difference_score(room_list_A, room_list_B, strict=False, duplicate_mismatched=False, area_sorting=True):
+def compute_room_area_difference_score(room_list_A, room_list_B):
     """Compute mean relative area error between two apartment meshes.
 
     Each room list is a list of ``(merge_id, area)`` tuples from
     :func:`produce_room_area_list`.
 
-    **Strict mode** (``strict=True``): requires identical merge-id order; per-room
-    relative error ``abs(A - B) / B``.
-
-    **Default (non-strict)**: for each canonical room type (kitchen, bathroom, …),
-    **sum** all room face areas of that type in each apartment, then take
+    For each canonical room type (kitchen, bathroom, …), **sum** all room face
+    areas of that type in each apartment, then take
     ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
     apartments. Types present in only one apartment are **skipped**. The score is
     the mean of those relative errors over matching types.
-
-    ``duplicate_mismatched`` and ``area_sorting`` are **ignored** in non-strict mode
-    (kept for API compatibility).
     """
-    if strict:
-        rooms_A = [t[0] for t in room_list_A]
-        rooms_B = [t[0] for t in room_list_B]
-        if rooms_A != rooms_B:
-            return 0.25
-        sigmas = []
-        for i in range(len(room_list_A)):
-            area_A = room_list_A[i][1]
-            area_B = room_list_B[i][1]
-            if area_B == 0:
-                continue
-            sigmas.append(abs(area_A - area_B) / area_B)
-        return sum(sigmas) / len(sigmas) if sigmas else 0.6
-
     sums_A = _aggregate_area_by_room_type(room_list_A)
     sums_B = _aggregate_area_by_room_type(room_list_B)
     common_types = set(sums_A.keys()) & set(sums_B.keys())
@@ -355,7 +336,12 @@ def compute_room_area_difference_score(room_list_A, room_list_B, strict=False, d
         sigmas.append(abs(area_A - area_B) / area_B)
 
     if len(sigmas) == 0:
-        return 0.6
+        warnings.warn(
+            "compute_room_area_difference_score: no comparable room types with "
+            "nonzero GT area (empty sigmas); returning nan",
+            stacklevel=2,
+        )
+        return float('nan')
     return sum(sigmas) / len(sigmas)
 
 
