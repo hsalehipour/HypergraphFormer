@@ -5,13 +5,18 @@ Unified evaluator for hypergraph generation models.
 Modes:
     trained      -- Fine-tuned Qwen, zero-shot, GED + validation (distributed)
     rooms-only   -- Fine-tuned Qwen, rooms-only prompt, room matching (distributed)
+    trained-vllm -- Fine-tuned Qwen via vLLM, single process + tensor parallelism
     fewshot-qwen -- Base Qwen, few-shot prompting, GED (single GPU)
     fewshot-gpt  -- GPT via OpenAI API, few-shot prompting, GED (single process)
 
 Usage:
-    # Fine-tuned model (distributed)
+    # Fine-tuned model (distributed, HuggingFace)
     accelerate launch --num_processes=8 scripts/evaluator.py --mode trained \\
         --model checkpoints/lora_r64_alpha128
+
+    # Fine-tuned model (single process, vLLM — much faster)
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/evaluator.py \\
+        --mode trained-vllm --model checkpoints/lora_r64_alpha128
 
     # Rooms-only (distributed)
     accelerate launch --num_processes=8 scripts/evaluator.py --mode rooms-only \\
@@ -31,6 +36,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,6 +52,25 @@ from utils.hypergraph import Hypergraph
 from scripts.fewshot_generator import QwenGenerator, GPTGenerator
 
 logger = logging.getLogger(__name__)
+
+
+def _gpu_count_via_nvidia_smi() -> int:
+    """GPU count without importing CUDA in the current process (for vLLM parent)."""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index",
+                "--format=csv,noheader",
+            ],
+            text=True,
+            timeout=30,
+            stderr=subprocess.DEVNULL,
+        )
+        n = len([ln for ln in out.strip().splitlines() if ln.strip()])
+        return n if n > 0 else 1
+    except Exception:
+        return 1
 
 
 # ===================================================================
@@ -161,8 +186,14 @@ class Evaluator(ABC):
 
         random.seed(args.seed)
         torch.manual_seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
+        # Do not touch CUDA in the parent before vLLM spawns worker processes: PyTorch
+        # raises "Cannot re-initialize CUDA in forked subprocess" if the parent has
+        # already initialized the driver and workers are forked.  Note:
+        # ``torch.cuda.is_available()`` itself can initialize CUDA, so check the flag
+        # *before* calling any torch.cuda API.
+        if not getattr(self, "defer_cuda_seed_until_model_loaded", False):
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.seed)
 
         # Dataset files
         dataset_dir = Path(args.dataset_dir)
@@ -234,6 +265,8 @@ class Evaluator(ABC):
     # -- distributed loop (Accelerate) -------------------------------------
 
     def _run_distributed(self, args, files_to_process, existing_results, all_files):
+        import concurrent.futures
+        import threading
         from accelerate import Accelerator, InitProcessGroupKwargs
         from torch.utils.data import DataLoader
         from utils.data_loading import HypergraphDataset, collate_fn
@@ -259,15 +292,210 @@ class Evaluator(ABC):
         self._update_generator_model(model)
         dataloader = accelerator.prepare(dataloader)
 
-        start = time.time()
-        local_results = []
+        # How many hypergraphs to keep in-flight on this GPU simultaneously.
+        n_parallel = getattr(args, "batch_size_per_gpu", 1)
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating",
-                                               disable=not accelerator.is_main_process)):
-            sample = self._batch_to_sample(batch, include_gt, include_bounds)
-            result = self.evaluate_sample(sample)
-            local_results.append(result)
-            self._save_partial(args, local_results, accelerator.process_index)
+        # Hard per-sample deadline: same as the soft generation timeout.
+        # A future that exceeds this is abandoned (marked timed-out) so the slot
+        # can be refilled immediately, regardless of whether the CUDA kernel finishes.
+        soft_timeout = getattr(args, "timeout", None)
+        hard_timeout: float | None = float(soft_timeout) if soft_timeout else None
+
+        # Serialize GPU kernel calls so concurrent threads don't race on the same
+        # device.  Non-GPU work (prompt creation, JSON parsing, GED) still overlaps.
+        #
+        # We use lock.acquire(timeout=hard_timeout) rather than a plain `with lock:`
+        # so that if one thread is stuck inside a deadlocked CUDA kernel and holds
+        # the lock indefinitely, other threads waiting to run inference give up after
+        # hard_timeout seconds and return a synthetic timed-out result — keeping them
+        # fully unblocked from the stuck thread.
+        if n_parallel > 1:
+            import types as _types
+            _gen_lock = threading.Lock()
+            _orig_generate = self.generator.generate
+
+            def _locked_generate(*a, **kw):
+                acquired = _gen_lock.acquire(timeout=hard_timeout if hard_timeout else -1)
+                if not acquired:
+                    return _types.SimpleNamespace(
+                        timed_out=True,
+                        text="",
+                        input_tokens=0,
+                        generation_time=hard_timeout or 0.0,
+                    )
+                try:
+                    return _orig_generate(*a, **kw)
+                finally:
+                    _gen_lock.release()
+
+            self.generator.generate = _locked_generate  # type: ignore[method-assign]
+            logger.info(
+                f"[rank {accelerator.process_index}] "
+                f"Running {n_parallel} hypergraphs per GPU in parallel "
+                f"(hard_timeout={hard_timeout}s)"
+            )
+
+        start = time.time()
+        local_results: list[dict] = []
+        rank = accelerator.process_index
+        dataloader_iter = iter(tqdm(dataloader, desc="Evaluating",
+                                    disable=not accelerator.is_main_process))
+
+        def _safe_evaluate(sample: dict) -> dict:
+            try:
+                result = self.evaluate_sample(sample)
+                # evaluate_sample swallows all exceptions into result["error"], so
+                # detect CUDA OOM by inspecting the error string.
+                if result.get("error") and "out of memory" in str(result["error"]).lower():
+                    result["oom"] = True
+                return result
+            except Exception as exc:
+                r = self.build_result_template(sample)
+                r["error"] = f"Unexpected thread error: {exc}"
+                if "out of memory" in str(exc).lower():
+                    r["oom"] = True
+                return r
+
+        def _make_sample(batch: dict) -> dict:
+            return self._batch_to_sample(batch, include_gt, include_bounds)
+
+        # Sliding-window executor: always keep up to n_parallel futures in flight.
+        # pending maps future -> (sample_dict, monotonic_submit_time)
+        pending: dict[concurrent.futures.Future, tuple[dict, float]] = {}
+        # Samples that OOM'd or timed out and are waiting for a serial retry after
+        # the current in-flight batch drains.  Timed-out samples are worth retrying
+        # because with n_parallel>1 each thread waits up to (n-1)×timeout for the
+        # inference lock, so a sample that appears to time out at batch=4 may succeed
+        # fine when run alone.
+        retry_queue: list[dict] = []
+        draining_for_retry = False  # when True, no new submissions until pending is empty
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as executor:
+
+            def _try_submit() -> bool:
+                """Pull the next batch from the dataloader and submit it. Return False when exhausted."""
+                if draining_for_retry:
+                    return False
+                try:
+                    batch = next(dataloader_iter)
+                except StopIteration:
+                    return False
+                sample = _make_sample(batch)
+                future = executor.submit(_safe_evaluate, sample)
+                pending[future] = (sample, time.monotonic())
+                return True
+
+            # Fill the initial window.
+            for _ in range(n_parallel):
+                if not _try_submit():
+                    break
+
+            while pending or retry_queue:
+
+                # --- Serial retry phase ---
+                # Entered once all in-flight samples have drained.  Both OOM and
+                # timed-out samples land here.  Timed-out samples are worth retrying
+                # because with n_parallel>1 each thread waits up to (n-1)×timeout for
+                # the inference lock, so a sample that appears to time out at batch=4
+                # may succeed fine when run alone.
+                if not pending and retry_queue:
+                    n_oom = sum(1 for s in retry_queue if s.get("_retry_reason") == "oom")
+                    n_to  = sum(1 for s in retry_queue if s.get("_retry_reason") == "timeout")
+                    logger.warning(
+                        f"[rank {rank}] Serial retry: {len(retry_queue)} sample(s) "
+                        f"({n_oom} OOM, {n_to} timeout) — clearing GPU cache first"
+                    )
+                    torch.cuda.empty_cache()
+                    for retry_sample in retry_queue:
+                        reason = retry_sample.pop("_retry_reason", "unknown")
+                        logger.info(
+                            f"[rank {rank}] Serial retry ({reason}): {retry_sample['filename']}"
+                        )
+                        retry_result = _safe_evaluate(retry_sample)
+                        retry_result["serial_retried"] = True
+                        retry_result["serial_retry_reason"] = reason
+                        if retry_result.get("oom"):
+                            retry_result["error"] = (
+                                f"OOM persists on serial retry: {retry_result.get('error', '')}"
+                            )
+                        if retry_result.get("timed_out"):
+                            retry_result["error"] = (
+                                f"Timeout persists on serial retry: {retry_result.get('error', '')}"
+                            )
+                        local_results.append(retry_result)
+                        self._save_partial(args, local_results, rank)
+                    retry_queue.clear()
+                    draining_for_retry = False
+                    # Refill the window back to full batch size.
+                    for _ in range(n_parallel):
+                        if not _try_submit():
+                            break
+                    continue
+
+                # --- Normal collection phase ---
+                poll = min(5.0, hard_timeout / 4) if hard_timeout else 5.0
+
+                done, _ = concurrent.futures.wait(
+                    list(pending.keys()),
+                    timeout=poll,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                now = time.monotonic()
+
+                def _queue_for_retry(sample: dict, reason: str):
+                    """Route a sample to the serial retry queue and start draining."""
+                    nonlocal draining_for_retry
+                    sample["_retry_reason"] = reason
+                    retry_queue.append(sample)
+                    draining_for_retry = True
+
+                # Abandon futures that exceeded the hard deadline — queue for retry
+                # instead of discarding, so they get a fair chance alone.
+                if hard_timeout:
+                    for fut, (sample, submit_t) in list(pending.items()):
+                        if fut not in done and now - submit_t > hard_timeout:
+                            logger.warning(
+                                f"[rank {rank}] Hard timeout for {sample['filename']} "
+                                f"after {now - submit_t:.0f}s — queuing for serial retry"
+                            )
+                            del pending[fut]
+                            _queue_for_retry(sample, "timeout")
+                            # Do not call _try_submit(): let pending drain.
+
+                # Collect completed futures.
+                for fut in done:
+                    if fut not in pending:
+                        continue  # already handled as hard-timeout above
+                    sample, _ = pending.pop(fut)
+                    try:
+                        result = fut.result(timeout=0)
+                    except concurrent.futures.TimeoutError:
+                        result = self.build_result_template(sample)
+                        result["error"] = "Future result unavailable after completion"
+                        result["timed_out"] = True
+                    except Exception as exc:
+                        result = self.build_result_template(sample)
+                        result["error"] = f"Thread raised: {exc}"
+
+                    if result.get("oom"):
+                        logger.warning(
+                            f"[rank {rank}] OOM on {sample['filename']} — "
+                            f"queuing for serial retry after {len(pending)} in-flight drain"
+                        )
+                        _queue_for_retry(sample, "oom")
+                        # Do not call _try_submit(): let pending drain naturally.
+                    elif result.get("timed_out") and n_parallel > 1:
+                        logger.warning(
+                            f"[rank {rank}] Timeout on {sample['filename']} — "
+                            f"queuing for serial retry after {len(pending)} in-flight drain"
+                        )
+                        _queue_for_retry(sample, "timeout")
+                        # Do not call _try_submit(): let pending drain naturally.
+                    else:
+                        local_results.append(result)
+                        self._save_partial(args, local_results, rank)
+                        _try_submit()
 
         # Save per-rank results to temp files
         tmp = Path(tempfile.gettempdir())
@@ -278,8 +506,8 @@ class Evaluator(ABC):
 
         if accelerator.is_main_process:
             gathered = []
-            for rank in range(accelerator.num_processes):
-                rf = tmp / f"eval_results_rank_{rank}.json"
+            for r in range(accelerator.num_processes):
+                rf = tmp / f"eval_results_rank_{r}.json"
                 if rf.exists():
                     with open(rf) as f:
                         gathered.extend(json.load(f))
@@ -542,6 +770,261 @@ class TrainedModelEvaluator(Evaluator):
 
 
 # ===================================================================
+# VLLMTrainedEvaluator  (--mode trained-vllm)
+# ===================================================================
+
+class VLLMTrainedEvaluator(TrainedModelEvaluator):
+    """
+    vLLM-based evaluator: single Python process, vLLM handles all GPU
+    parallelism internally via tensor_parallel_size.
+
+    Unlike TrainedModelEvaluator (which uses ``accelerate launch``), this
+    runs as a plain ``python`` invocation:
+
+        CUDA_VISIBLE_DEVICES=0,1,2,...  python scripts/evaluator.py \\
+            --mode trained-vllm [--batch-size-per-gpu 4] ...
+
+    vLLM's continuous batching + PagedAttention gives ~10-20x throughput
+    versus the HuggingFace single-sample path.
+    """
+
+    # Single-process: vLLM owns all GPUs via tensor_parallel_size.
+    distributed = False
+    # See Evaluator.run(): skip torch.cuda.manual_seed_all before load_model so the
+    # parent never initializes CUDA ahead of vLLM's worker processes (fork + CUDA
+    # triggers "Cannot re-initialize CUDA in forked subprocess").
+    defer_cuda_seed_until_model_loaded = True
+
+    def load_model(self):
+        """Parse adapter config and initialise the vLLM engine."""
+        model_path = Path(self.args.model)
+        is_lora = (model_path / "adapter_config.json").exists()
+
+        if is_lora:
+            with open(model_path / "adapter_config.json") as f:
+                cfg = json.load(f)
+            base_name = cfg.get("base_model_name_or_path")
+            if not base_name:
+                raise ValueError("Missing base_model_name_or_path in adapter_config.json")
+            lora_rank = cfg.get("r", 64)
+            lora_path = str(model_path)
+            logger.info(f"LoRA adapter detected — base: {base_name}  rank: {lora_rank}")
+        else:
+            base_name = str(model_path)
+            lora_rank = 64
+            lora_path = None
+
+        # Auto-detect GPU count from CUDA_VISIBLE_DEVICES or nvidia-smi — never
+        # ``torch.cuda.device_count()`` here (initializes CUDA in the parent before vLLM workers).
+        cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cuda_devices:
+            tensor_parallel_size = len([d for d in cuda_devices.split(",") if d.strip()])
+        else:
+            tensor_parallel_size = _gpu_count_via_nvidia_smi()
+
+        batch_size = self.args.batch_size_per_gpu
+        logger.info(
+            f"vLLM single-process evaluation — {tensor_parallel_size} GPU(s)  "
+            f"batch_size={batch_size}"
+        )
+
+        from scripts.fewshot_generator import VLLMQwenGenerator
+        self.generator = VLLMQwenGenerator(
+            base_model=base_name,
+            lora_path=lora_path,
+            lora_rank=lora_rank,
+            gpu_memory_utilization=getattr(self.args, "gpu_memory_utilization", 0.90),
+            max_model_len=self.args.max_model_len,
+            tensor_parallel_size=tensor_parallel_size,
+            enforce_eager=getattr(self.args, "enforce_eager", False),
+        )
+        self.generator.load()
+
+    def _update_generator_model(self, _):
+        pass  # not applicable for vLLM
+
+    def extract_hypergraph(self, response: str):
+        """
+        vLLM returns only the completion string, not the full HF decode that still
+        contains ``<|im_start|>assistant``.  Reconcile with ``from_qwen_response``.
+        """
+        if not response:
+            return None
+        if "<|im_start|>assistant" not in response:
+            response = f"<|im_start|>assistant\n{response}"
+        return Hypergraph.from_qwen_response(
+            response,
+            allow_raw_json_fallback=True,
+        )
+
+    # -- override single-process loop to use batched inference ---------------
+
+    def _run_single(self, args, files_to_process, existing_results, all_files):
+        from torch.utils.data import DataLoader
+        from utils.data_loading import HypergraphDataset, collate_fn
+
+        include_gt = not isinstance(self, RoomsOnlyEvaluator)
+        include_bounds = getattr(args, "footprint", False)
+        dataset = HypergraphDataset(
+            files_to_process,
+            include_ground_truth=include_gt,
+            include_bounds=include_bounds,
+        )
+        dataloader = DataLoader(
+            dataset, batch_size=1, shuffle=getattr(args, "shuffle", False),
+            num_workers=0, collate_fn=collate_fn,
+        )
+
+        batch_size = args.batch_size_per_gpu
+        timeout = getattr(args, "timeout", None)
+        batch_timeout = (timeout * batch_size + 60) if timeout else None
+
+        results = list(existing_results)
+        batch_buffer: list[dict] = []
+        start = time.time()
+
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            sample = self._batch_to_sample(batch, include_gt, include_bounds)
+            batch_buffer.append(sample)
+
+            if len(batch_buffer) >= batch_size:
+                self._flush_batch(args, batch_buffer, results, None,
+                                  timeout, batch_timeout)
+                self._save_checkpoint(args, results, all_files)
+                batch_buffer = []
+
+        if batch_buffer:
+            self._flush_batch(args, batch_buffer, results, None,
+                              timeout, batch_timeout)
+
+        elapsed = time.time() - start
+        logger.info(f"Total time: {elapsed / 60:.1f} min")
+        self._save_final(args, results)
+        return 0
+
+    # -- batch helpers ----------------------------------------------------
+
+    def _flush_batch(self, args, samples, local_results, rank, timeout, batch_timeout):
+        """Run one batched vLLM call and process each result."""
+        prompts = [self.create_prompt(s) for s in samples]
+
+        try:
+            gen_results = self.generator.generate_batch(
+                prompts,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                timeout=batch_timeout,
+            )
+        except Exception as exc:
+            err = str(exc)
+            is_oom = "out of memory" in err.lower()
+            logger.warning(
+                f"[rank {rank}] Batch generation failed ({err[:120]}) — "
+                f"retrying {len(samples)} sample(s) individually"
+            )
+            if is_oom:
+                torch.cuda.empty_cache()
+            for s in samples:
+                result = self._generate_and_process_single(args, s, timeout)
+                result["batch_retry"] = True
+                result["batch_retry_reason"] = "oom" if is_oom else "error"
+                local_results.append(result)
+                self._save_partial(args, local_results, rank)
+            return
+
+        # If the whole batch timed out, retry each sample alone.
+        if all(r.timed_out for r in gen_results):
+            logger.warning(
+                f"[rank {rank}] Entire batch timed out — "
+                f"retrying {len(samples)} sample(s) individually"
+            )
+            for s in samples:
+                result = self._generate_and_process_single(args, s, timeout)
+                result["batch_retry"] = True
+                result["batch_retry_reason"] = "timeout"
+                local_results.append(result)
+                self._save_partial(args, local_results, rank)
+            return
+
+        for sample, gen_res in zip(samples, gen_results):
+            if gen_res.timed_out:
+                result = self._generate_and_process_single(args, sample, timeout)
+                result["batch_retry"] = True
+                result["batch_retry_reason"] = "timeout"
+            else:
+                result = self._process_gen_result(args, sample, gen_res, timeout)
+            local_results.append(result)
+            self._save_partial(args, local_results, rank)
+
+    def _generate_and_process_single(self, args, sample, timeout):
+        """Generate and process one sample (used when a batch-level retry is needed)."""
+        prompt = self.create_prompt(sample)
+        gen_res = self.generator.generate(
+            prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            timeout=timeout,
+        )
+        return self._process_gen_result(args, sample, gen_res, timeout)
+
+    def _process_gen_result(self, args, sample, gen_res, timeout):
+        """
+        Turn a GenerationResult into a scored result dict.
+
+        Mirrors evaluate_sample() from the base class but works on an already-
+        generated GenerationResult rather than calling generate() itself.
+        """
+        result = self.build_result_template(sample)
+        result["num_input_tokens"] = gen_res.input_tokens
+        result["generation_time"] = gen_res.generation_time
+
+        if gen_res.timed_out:
+            result["error"] = f"Generation timed out"
+            result["timed_out"] = True
+            return result
+
+        if not gen_res.text:
+            result["error"] = "Empty generation output"
+            return result
+
+        hg = self.extract_hypergraph(gen_res.text)
+
+        if hg is None:
+            logger.warning(f"JSON extraction failed for {sample['filename']}, retrying...")
+            retry_res = self.generator.generate(
+                self.create_prompt(sample),
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                timeout=timeout,
+            )
+            result["generation_time"] += retry_res.generation_time
+            if retry_res.timed_out:
+                result["error"] = "Timed out on retry"
+                result["timed_out"] = True
+                return result
+            hg = self.extract_hypergraph(retry_res.text or "")
+            if hg is None:
+                result["error"] = "Failed to extract JSON from response (after retry)"
+                return result
+            result["retried"] = True
+
+        is_valid, passed, failed, ged_info = hg.validate(accessgraph=None, debug=True)
+        result["validation"] = {
+            "is_valid": is_valid,
+            "passed_checks": passed,
+            "failed_checks": failed,
+        }
+        result["_ged_info"] = ged_info
+
+        try:
+            self.score_result(result, hg, sample)
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        return result
+
+
+# ===================================================================
 # RoomsOnlyEvaluator  (--mode rooms-only)
 # ===================================================================
 
@@ -774,6 +1257,7 @@ class FewShotGPTEvaluator(Evaluator):
 
 MODE_MAP = {
     "trained": TrainedModelEvaluator,
+    "trained-vllm": VLLMTrainedEvaluator,
     "rooms-only": RoomsOnlyEvaluator,
     "fewshot-qwen": FewShotQwenEvaluator,
     "fewshot-gpt": FewShotGPTEvaluator,
@@ -808,6 +1292,28 @@ def cli():
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--nccl-timeout", type=int, default=7200)
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.90,
+        help="vLLM only: fraction of GPU VRAM to use for model + KV cache (default 0.90).",
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, default=8192,
+        help="vLLM only: maximum total sequence length (prompt + output tokens, default 8192).",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help=(
+            "vLLM only: disable CUDA graph capture (lower peak VRAM during startup; slower decoding)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size-per-gpu", type=int, default=None,
+        help=(
+            "Hypergraphs per vLLM batch (trained-vllm) or concurrent slots per GPU (trained). "
+            "Default: 4 for trained-vllm, 1 for other modes. Raise if you have VRAM headroom."
+        ),
+    )
 
     # Few-shot
     parser.add_argument("--num-examples", type=int, default=3)
@@ -821,7 +1327,7 @@ def cli():
             args.model = "Qwen/Qwen3-4B-Instruct-2507"
         elif args.mode == "fewshot-gpt":
             args.model = "gpt-4"
-        elif args.mode in ("trained", "rooms-only"):
+        elif args.mode in ("trained", "trained-vllm", "rooms-only"):
             parser.error(f"--model is required for --mode {args.mode}")
 
     if args.output is None:
@@ -830,6 +1336,9 @@ def cli():
 
     if args.mode.startswith("fewshot"):
         args.max_tokens = args.max_tokens or 5120
+
+    if args.batch_size_per_gpu is None:
+        args.batch_size_per_gpu = 4 if args.mode == "trained-vllm" else 1
 
     cls = MODE_MAP[args.mode]
     evaluator = cls(args)

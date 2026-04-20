@@ -22,8 +22,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import subprocess
 import sys
+import sysconfig
 import time
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,7 +373,7 @@ class QwenGenerator(FewShotGenerator):
     def generate(self, prompt: str, *, max_tokens: int | None = None,
                  temperature: float | None = None,
                  timeout: int | None = None) -> GenerationResult:
-        from utils import TimeoutException, time_limit
+        import threading
 
         mt = max_tokens or self.max_tokens
         temp = temperature or self.temperature
@@ -389,25 +393,38 @@ class QwenGenerator(FewShotGenerator):
             do_sample=True, top_p=0.95, top_k=50,
         )
 
+        # Use a daemon thread so the timeout works from any thread (including
+        # ThreadPoolExecutor workers).  signal.alarm() only works in the main
+        # thread, so we can't use time_limit() here.
+        _outputs: list = []
+        _exc: list = []
+
+        def _run():
+            try:
+                _outputs.append(self.model.generate(**gen_kwargs))
+            except Exception as e:
+                _exc.append(e)
+
+        t = threading.Thread(target=_run, daemon=True)
         start = time.time()
-        try:
-            if timeout is not None:
-                with time_limit(timeout):
-                    outputs = self.model.generate(**gen_kwargs)
-            else:
-                outputs = self.model.generate(**gen_kwargs)
-            elapsed = time.time() - start
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-            return GenerationResult(
-                text=decoded, input_tokens=num_input,
-                generation_time=elapsed,
-            )
-        except TimeoutException:
-            elapsed = time.time() - start
+        t.start()
+        t.join(timeout=timeout)
+        elapsed = time.time() - start
+
+        if t.is_alive():
             logger.error(f"TIMEOUT: Generation exceeded {timeout}s limit")
             return GenerationResult(
                 input_tokens=num_input, generation_time=elapsed, timed_out=True,
             )
+
+        if _exc:
+            raise _exc[0]
+
+        decoded = self.tokenizer.decode(_outputs[0][0], skip_special_tokens=False)
+        return GenerationResult(
+            text=decoded, input_tokens=num_input,
+            generation_time=elapsed,
+        )
 
     def generate_streaming(self, prompt: str, *, max_tokens: int | None = None,
                            temperature: float | None = None) -> GenerationResult:
@@ -458,6 +475,321 @@ class QwenGenerator(FewShotGenerator):
 
     def extract_hypergraph(self, response: str) -> Hypergraph | None:
         return Hypergraph.from_qwen_response(response)
+
+
+# ---------------------------------------------------------------------------
+# vLLM backend (high-throughput batched inference)
+# ---------------------------------------------------------------------------
+
+def _deb_arch() -> str:
+    m = platform.machine().lower()
+    return {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m)
+
+
+def _ensure_python_include_for_vllm_triton() -> Path:
+    """
+    vLLM / Triton JIT-compile a small CUDA helper; gcc needs Python.h.
+
+    On minimal or broken images ``python3.10-dev`` is marked installed but
+    ``/usr/include/python3.X`` is empty.      We recover by extracting headers from Ubuntu's ``libpython3.10-dev`` .deb
+    into ``.cache/`` (no root, no apt).  The ``python3.10-dev`` metapackage
+    does not ship ``Python.h``.
+    """
+    inc_sys = Path(sysconfig.get_path("include"))
+    if (inc_sys / "Python.h").is_file():
+        return inc_sys
+
+    py_mm = f"{sys.version_info.major}.{sys.version_info.minor}"
+    proj_root = Path(__file__).resolve().parent.parent
+    extract_root = proj_root / ".cache" / "python3-dev-extract"
+    inc_extracted = extract_root / "usr" / "include" / f"python{py_mm}"
+    if (inc_extracted / "Python.h").is_file():
+        return inc_extracted
+
+    arch = _deb_arch()
+    # Headers live in libpythonX.Y-dev, not the pythonX.Y-dev metapackage (docs only).
+    deb_pkg = f"libpython{py_mm}-dev"
+    # Ubuntu rotates minor revisions; older .deb URLs 404.  Keep newest first.
+    deb_versions = [
+        "3.10.12-1~22.04.17",
+        "3.10.12-1~22.04.16",
+        "3.10.12-1~22.04.15",
+        "3.10.12-1~22.04.14",
+        "3.10.12-1~22.04.13",
+        "3.10.12-1~22.04.11",
+        "3.10.12-1~22.04.10",
+        "3.10.12-1~22.04.9",
+        "3.10.12-1~22.04.8",
+        "3.10.12-1~22.04.7",
+        "3.10.12-1~22.04.6",
+        "3.10.12-1~22.04.5",
+        "3.10.12-1~22.04.4",
+        "3.10.12-1~22.04.3",
+        "3.10.12-1~22.04.2",
+        "3.10.12-1~22.04.1",
+    ]
+    deb_path = proj_root / ".cache" / f"{deb_pkg}_{arch}.deb"
+    deb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    last_err: Exception | None = None
+    for ver in deb_versions:
+        fname = f"{deb_pkg}_{ver}_{arch}.deb"
+        for base in (
+            f"http://archive.ubuntu.com/ubuntu/pool/main/p/python{py_mm}/",
+            f"http://security.ubuntu.com/ubuntu/pool/main/p/python{py_mm}/",
+        ):
+            url = base + fname
+            try:
+                logger.info("Fetching missing Python headers from %s", url)
+                urllib.request.urlretrieve(url, deb_path)
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                continue
+        if last_err is None:
+            break
+    if last_err is not None:
+        raise RuntimeError(
+            "Python development headers (Python.h) are missing and could not "
+            "be downloaded automatically. Install on the host/container, e.g.:\n"
+            "  apt-get update && apt-get install -y python3.10-dev\n"
+            f"(sysconfig include path was: {inc_sys})"
+        ) from last_err
+
+    extract_root.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["dpkg-deb", "-x", str(deb_path), str(extract_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Extracting python3-dev .deb requires `dpkg-deb` (install dpkg)."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"dpkg-deb failed: {exc.stderr or exc.stdout or exc}"
+        ) from exc
+
+    if not (inc_extracted / "Python.h").is_file():
+        raise RuntimeError(
+            f"Extracted .deb but Python.h not at {inc_extracted}. "
+            "Try apt-get install python3.10-dev after apt-get update."
+        )
+    logger.info("Using Python headers from extracted .deb at %s", inc_extracted)
+    return inc_extracted
+
+
+def _multiarch_lib_dir() -> str:
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "/usr/lib/x86_64-linux-gnu"
+    if m in ("aarch64", "arm64"):
+        return "/usr/lib/aarch64-linux-gnu"
+    return "/usr/lib/x86_64-linux-gnu"
+
+
+def _prepare_vllm_subprocess_compile_env(include_dir: Path) -> None:
+    """Ensure gcc / Triton child processes can find Python and libcuda."""
+    # include_dir is .../usr/include/python3.10; multiarch pyconfig lives under
+    # .../usr/include/x86_64-linux-gnu/python3.10/ and is pulled in via
+    # #include <x86_64-linux-gnu/python3.10/pyconfig.h> — parent must be on CPATH.
+    usr_include = str(include_dir.parent.resolve())
+    py_inc = str(include_dir.resolve())
+    lib = _multiarch_lib_dir()
+    combined_inc = f"{usr_include}:{py_inc}"
+    for key in ("CPATH", "C_INCLUDE_PATH"):
+        prev = os.environ.get(key, "")
+        os.environ[key] = combined_inc if not prev else f"{combined_inc}:{prev}"
+    prev_l = os.environ.get("LIBRARY_PATH", "")
+    os.environ["LIBRARY_PATH"] = lib if not prev_l else f"{lib}:{prev_l}"
+
+
+class VLLMQwenGenerator:
+    """
+    vLLM-based generator for high-throughput batched inference.
+
+    Unlike QwenGenerator (one sequence at a time), this submits N prompts in a
+    single llm.generate() call.  vLLM runs them in parallel on the GPU using
+    continuous batching and PagedAttention, giving ~5-10× higher GPU utilisation.
+
+    Usage::
+
+        gen = VLLMQwenGenerator(base_model="Qwen/...", lora_path="/path/to/ckpt")
+        gen.load()                          # call once per process, after CUDA_VISIBLE_DEVICES is set
+        results = gen.generate_batch(prompts, max_tokens=3328, temperature=0.7)
+    """
+
+    def __init__(
+        self,
+        base_model: str,
+        *,
+        lora_path: str | None = None,
+        lora_rank: int = 64,
+        gpu_memory_utilization: float = 0.90,
+        max_model_len: int = 8192,
+        tensor_parallel_size: int = 1,
+        enforce_eager: bool = False,
+    ):
+        self.base_model = base_model
+        self.lora_path = lora_path
+        self.lora_rank = lora_rank
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self.tensor_parallel_size = tensor_parallel_size
+        self.enforce_eager = enforce_eager
+        self._llm = None
+        self._tokenizer = None
+        self._lora_request = None
+
+    def load(self):
+        """Initialise the vLLM engine.  Must be called after CUDA_VISIBLE_DEVICES is set."""
+        include_dir = _ensure_python_include_for_vllm_triton()
+        _prepare_vllm_subprocess_compile_env(include_dir)
+
+        from vllm import LLM
+        from transformers import AutoTokenizer
+
+        engine_kwargs: dict = dict(
+            model=self.base_model,
+            dtype="float16",
+            gpu_memory_utilization=self.gpu_memory_utilization,
+            max_model_len=self.max_model_len,
+            trust_remote_code=True,
+            tensor_parallel_size=self.tensor_parallel_size,
+        )
+        if self.enforce_eager:
+            engine_kwargs["enforce_eager"] = True
+        if self.lora_path:
+            engine_kwargs["enable_lora"] = True
+            engine_kwargs["max_lora_rank"] = self.lora_rank
+
+        logger.info(
+            f"Loading vLLM engine: {self.base_model}  "
+            f"LoRA: {self.lora_path}  "
+            f"gpu_mem_util={self.gpu_memory_utilization}"
+        )
+        self._llm = LLM(**engine_kwargs)
+
+        tokenizer_src = self.lora_path or self.base_model
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_src)
+
+        if self.lora_path:
+            from vllm.lora.request import LoRARequest
+            self._lora_request = LoRARequest("adapter", 1, self.lora_path)
+
+        logger.info("vLLM engine ready")
+
+    # -- prompt formatting ---------------------------------------------------
+
+    def _format_prompts(self, prompts: list[str]) -> list[str]:
+        out = []
+        for p in prompts:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": p},
+            ]
+            out.append(
+                self._tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            )
+        return out
+
+    # -- batched generation --------------------------------------------------
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        *,
+        max_tokens: int = 3328,
+        temperature: float = 0.7,
+        timeout: int | None = None,
+    ) -> list[GenerationResult]:
+        """
+        Generate for N prompts in one vLLM call (true GPU batching).
+
+        If *timeout* is set and the call exceeds it, every result in the
+        returned list has ``timed_out=True``.
+        """
+        import threading
+        from vllm import SamplingParams
+
+        formatted = self._format_prompts(prompts)
+        input_lengths = [
+            len(self._tokenizer.encode(fp, add_special_tokens=False))
+            for fp in formatted
+        ]
+
+        sampling_params = SamplingParams(
+            temperature=temperature, top_p=0.95, top_k=50, max_tokens=max_tokens,
+        )
+
+        _outputs: list = []
+        _exc: list = []
+
+        def _run():
+            try:
+                _outputs.extend(
+                    self._llm.generate(
+                        formatted,
+                        sampling_params,
+                        lora_request=self._lora_request,
+                        use_tqdm=False,
+                    )
+                )
+            except Exception as exc:
+                _exc.append(exc)
+
+        start = time.time()
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        total_elapsed = time.time() - start
+
+        if t.is_alive():
+            logger.error(
+                f"vLLM batch of {len(prompts)} timed out after {total_elapsed:.0f}s"
+            )
+            return [
+                GenerationResult(
+                    input_tokens=n, generation_time=total_elapsed, timed_out=True,
+                )
+                for n in input_lengths
+            ]
+
+        if _exc:
+            raise _exc[0]
+
+        results = []
+        for output, n_input in zip(_outputs, input_lengths):
+            text = output.outputs[0].text if output.outputs else None
+            try:
+                gen_time = (
+                    output.metrics.finished_time - output.metrics.first_scheduled_time
+                )
+            except Exception:
+                gen_time = total_elapsed / max(len(prompts), 1)
+            results.append(GenerationResult(
+                text=text, input_tokens=n_input, generation_time=gen_time,
+            ))
+        return results
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 3328,
+        temperature: float = 0.7,
+        timeout: int | None = None,
+    ) -> GenerationResult:
+        """Single-prompt wrapper — API-compatible with QwenGenerator."""
+        return self.generate_batch(
+            [prompt], max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+        )[0]
 
 
 # ---------------------------------------------------------------------------
