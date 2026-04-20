@@ -413,6 +413,25 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     }
 
 
+def _room_multiset_proximity_accuracy(result: dict) -> float:
+    """Continuous closeness in ``[0, 1]``: multiset overlap / max(|GT|, |pred|).
+
+    Overlap is ``sum_t min(gt_t, pred_t)`` (multiset intersection size).
+    If both GT and prediction have zero rooms, returns NaN (treated as an error /
+    undefined case).
+    """
+    n_e = result["expected_rooms"]
+    n_g = result["generated_rooms"]
+    if n_e == 0 and n_g == 0:
+        return float("nan")
+    exp = result["expected_types"]
+    gen = result["generated_types"]
+    keys = set(exp) | set(gen)
+    overlap = sum(min(int(exp.get(k, 0)), int(gen.get(k, 0))) for k in keys)
+    denom = max(n_e, n_g)
+    return overlap / denom if denom else 1.0
+
+
 def compute_room_type_accuracy(accessgraph, hypergraph):
     """Compare room-type multisets between an access-graph dict and a hypergraph dict.
 
@@ -436,6 +455,11 @@ def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
                            skip_ids=None):
     """Compute room-type accuracy grouped into room-count buckets.
 
+    Per-sample score is multiset **edit proximity** in ``[0, 1]``: intersection
+    size of GT vs predicted room-type multisets divided by ``max(n_gt, n_pred)``.
+    Bucket and overall aggregates use the **sum** of these scores in
+    ``matches`` (so ``matches / total`` is the mean proximity in that bucket).
+
     Args:
         accessgraphs: ``{sample_id: accessgraph_dict}``
         hypergraphs:  ``{sample_id: hypergraph_dict}``
@@ -448,10 +472,11 @@ def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
     Returns:
         dict with keys:
 
-        - ``categories``: ``{label: {matches, total}}``
+        - ``categories``: ``{label: {matches, total}}`` — *matches* is the
+          sum of per-sample proximity scores (float-compatible).
         - ``category_order``: list of bucket labels in input order
-        - ``overall_matches``: int
-        - ``overall_total``: int
+        - ``overall_matches``: sum of per-sample proximity scores
+        - ``overall_total``: number of samples counted (same as before)
         - ``skipped``: int
     """
     from tqdm import tqdm
@@ -509,11 +534,11 @@ def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
         if label is None:
             continue
 
+        score = _room_multiset_proximity_accuracy(result)
         categories[label]["total"] += 1
         overall_total += 1
-        if result["room_types_match"]:
-            categories[label]["matches"] += 1
-            overall_matches += 1
+        categories[label]["matches"] += score
+        overall_matches += score
 
     return {
         "categories": categories,
