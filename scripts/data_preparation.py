@@ -3,22 +3,22 @@
 Data preparation for hypergraph model training and evaluation.
 
 Modes:
-    jsonl        -- Convert pre-split hypergraph JSON to instruction JSONL
-    eval-format  -- Export per-sample .txt eval files from a JSON split
+    train        -- Convert pre-split hypergraph JSON to instruction JSONL
+    eval         -- Export per-sample .txt eval files from a JSON split
     room-lists   -- Convert hypergraph JSON splits to pre-computed room-list
                     JSON files (requires RGL)
 
 Usage:
     # Convert to instruction JSONL (SFT)
-    python scripts/data_preparation.py --mode jsonl \\
+    python scripts/data_preparation.py --mode train \\
         --dataset-dir dataset/hypergraph
 
     # Convert to instruction JSONL (RL with footprint)
-    python scripts/data_preparation.py --mode jsonl \\
+    python scripts/data_preparation.py --mode train \\
         --dataset-dir dataset/hypergraph --footprint
 
     # Export eval-format .txt files
-    python scripts/data_preparation.py --mode eval-format \\
+    python scripts/data_preparation.py --mode eval \\
         --input-file dataset/hypergraph/test.json \\
         --output-dir dataset/hypergraph/test
 
@@ -116,7 +116,7 @@ def load_json_split(file_path, *, footprint=False):
 
 
 # ===================================================================
-# convert_to_jsonl  (--mode jsonl)
+# convert_to_jsonl  (--mode train)
 # ===================================================================
 
 def convert_to_jsonl(args) -> int:
@@ -161,7 +161,7 @@ def convert_to_jsonl(args) -> int:
 
 
 # ===================================================================
-# export_eval_format  (--mode eval-format)
+# export_eval_format  (--mode eval)
 # ===================================================================
 
 def export_eval_format(args) -> int:
@@ -306,8 +306,8 @@ def generate_room_lists(args) -> int:
 # ===================================================================
 
 MODE_MAP = {
-    "jsonl": convert_to_jsonl,
-    "eval-format": export_eval_format,
+    "train": convert_to_jsonl,
+    "eval": export_eval_format,
     "room-lists": generate_room_lists,
 }
 
@@ -326,25 +326,25 @@ def cli():
     parser.add_argument("--dataset-dir", type=str, default="dataset/hypergraph")
     parser.add_argument("--seed", type=int, default=42)
 
-    # jsonl mode
+    # train mode
     parser.add_argument(
         "--footprint",
         action="store_true",
         help="Include apartment footprint (bounds) in prompts; output to rl/ subdir",
     )
 
-    # eval-format mode
+    # eval mode
     parser.add_argument(
         "--input-file",
         type=str,
         default="dataset/hypergraph/test.json",
-        help="Path to JSON file to export (eval-format mode)",
+        help="Path to JSON file to export (eval mode)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory (eval-format: .txt files; room-lists: room-list JSONs)",
+        help="Output directory (eval: .txt files; room-lists: room-list JSONs)",
     )
 
     args = parser.parse_args()
