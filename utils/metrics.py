@@ -321,28 +321,57 @@ def compute_room_area_difference_score(room_list_A, room_list_B):
     For each canonical room type (kitchen, bathroom, …), **sum** all room face
     areas of that type in each apartment, then take
     ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
-    apartments. Types present in only one apartment are **skipped**. The score is
-    the mean of those relative errors over matching types.
+    apartments. Types present in only one apartment are tracked as unmatched.
+    The score is the mean of those relative errors over matching types.
+
+    Returns:
+        dict with keys:
+
+        - ``area_difference_score`` (float): mean relative error (NaN if
+          no comparable types).
+        - ``matched_types`` (int): number of room types compared.
+        - ``unmatched_pred`` (int): room types in pred only.
+        - ``unmatched_gt`` (int): room types in GT only.
+        - ``per_type_scores`` (list[float]): per-type relative errors.
+        - ``skipped_types_pred`` (list[str]): type keys present only in pred.
+        - ``skipped_types_gt`` (list[str]): type keys present only in GT.
     """
+    import numpy as np
+
     sums_A = _aggregate_area_by_room_type(room_list_A)
     sums_B = _aggregate_area_by_room_type(room_list_B)
+
     common_types = set(sums_A.keys()) & set(sums_B.keys())
-    sigmas = []
-    for category in common_types:
+    only_in_A = set(sums_A.keys()) - set(sums_B.keys())
+    only_in_B = set(sums_B.keys()) - set(sums_A.keys())
+
+    per_type_scores = []
+    for category in sorted(common_types):
         area_A = sums_A[category]
         area_B = sums_B[category]
         if area_B == 0:
             continue
-        sigmas.append(abs(area_A - area_B) / area_B)
+        per_type_scores.append(abs(area_A - area_B) / area_B)
 
-    if len(sigmas) == 0:
+    if len(per_type_scores) == 0:
         warnings.warn(
             "compute_room_area_difference_score: no comparable room types with "
             "nonzero GT area (empty sigmas); returning nan",
             stacklevel=2,
         )
-        return float('nan')
-    return sum(sigmas) / len(sigmas)
+        avg_error = float('nan')
+    else:
+        avg_error = float(np.mean(per_type_scores))
+
+    return {
+        'area_difference_score': avg_error,
+        'matched_types': len(per_type_scores),
+        'unmatched_pred': len(only_in_A),
+        'unmatched_gt': len(only_in_B),
+        'per_type_scores': per_type_scores,
+        'skipped_types_pred': sorted(only_in_A),
+        'skipped_types_gt': sorted(only_in_B),
+    }
 
 
 def room_type_accuracy(expected_room_types, generated_room_types):
