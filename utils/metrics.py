@@ -4,11 +4,13 @@ Metric functions for evaluating hypergraph generation quality.
 Provides canonical metrics:
 - GED (Graph Edit Distance): structural similarity between access graphs
 - Delta metric: shape regularity deviation between room lists
-- Area difference: relative room-area error between paired room lists
+- Area difference: relative error of **total area per canonical room type** (bathrooms summed, etc.),
+  averaged over room types present in **both** apartments only
 - Room-type accuracy: multiset comparison of room types
 """
 
 import math
+import warnings
 
 from .hypergraph import Hypergraph
 
@@ -60,6 +62,47 @@ def produce_room_area_list(generated_mesh):
             return len(ROOM_ORDER)
 
     return sorted(room_data, key=_sort_key)
+
+
+def _canonical_room_type_key(merge_id) -> str:
+    """Map a mesh ``merge_id`` string to a canonical room-type key for area aggregation.
+
+    Aligns loosely with :func:`produce_room_area_list` ordering (``bath`` → ``bathroom``,
+    longest-prefix match against :data:`ROOM_ORDER`).
+    """
+    s = str(merge_id).lower().strip()
+    if "bath" in s:
+        return "bathroom"
+    if s in ROOM_ORDER:
+        return s
+    best = None
+    best_len = 0
+    for r in ROOM_ORDER:
+        if r == "extra":
+            continue
+        if s.startswith(r) and len(r) >= best_len:
+            best, best_len = r, len(r)
+    if best is not None:
+        return best
+    return s
+
+
+def _aggregate_area_by_room_type(room_area_list):
+    """Sum areas per canonical room type.
+
+    Args:
+        room_area_list: ``[(merge_id, area), ...]`` as from :func:`produce_room_area_list`.
+
+    Returns:
+        ``dict`` mapping canonical room-type string → total area.
+    """
+    from collections import defaultdict
+
+    sums: defaultdict[str, float] = defaultdict(float)
+    for merge_id, area in room_area_list:
+        key = _canonical_room_type_key(merge_id)
+        sums[key] += float(area)
+    return dict(sums)
 
 
 def accessgraph_dict_to_nx(ag):
@@ -212,7 +255,7 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
 
     Returns:
         float: Mean sigma across all paired rooms. In strict mode returns 0.25
-        on mismatch; in soft mode returns 0.6 when no pairs can be formed.
+        on mismatch; in soft mode returns NaN when no pairs can be formed.
     """
     if strict:
         rooms_A = [t[0] for t in room_list_A]
@@ -265,68 +308,40 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
             list_of_sigmas.append(sigma)
 
     if len(list_of_sigmas) == 0:
-        return 0.6
+        return float('nan')
     return sum(list_of_sigmas) / len(list_of_sigmas)
 
 
-def compute_room_area_difference_score(room_list_A, room_list_B, strict=False, duplicate_mismatched=False, area_sorting=True):
-    """Compute mean relative area error between paired rooms.
+def compute_room_area_difference_score(room_list_A, room_list_B):
+    """Compute mean relative area error between two apartment meshes.
 
-    Each room list is a list of ``(room_name, area)`` tuples. Pairing logic
-    mirrors :func:`compute_room_similarity_score`: strict mode requires exact
-    room-name order; soft mode groups by room category and pairs within each
-    group, optionally sorting by area.
+    Each room list is a list of ``(merge_id, area)`` tuples from
+    :func:`produce_room_area_list`.
+
+    For each canonical room type (kitchen, bathroom, …), **sum** all room face
+    areas of that type in each apartment, then take
+    ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
+    apartments. Types present in only one apartment are **skipped**. The score is
+    the mean of those relative errors over matching types.
     """
-    if strict:
-        rooms_A = [t[0] for t in room_list_A]
-        rooms_B = [t[0] for t in room_list_B]
-        if rooms_A != rooms_B:
-            return 0.25
-        sigmas = []
-        for i in range(len(room_list_A)):
-            area_A = room_list_A[i][1]
-            area_B = room_list_B[i][1]
-            if area_B == 0:
-                continue
-            sigmas.append(abs(area_A - area_B) / area_B)
-        return sum(sigmas) / len(sigmas) if sigmas else 0.6
-
-    rooms_by_category_A = {}
-    rooms_by_category_B = {}
-    for room_tuple in room_list_A:
-        rooms_by_category_A.setdefault(room_tuple[0], []).append(room_tuple)
-    for room_tuple in room_list_B:
-        rooms_by_category_B.setdefault(room_tuple[0], []).append(room_tuple)
-
-    all_categories = set(rooms_by_category_A.keys()) | set(rooms_by_category_B.keys())
+    sums_A = _aggregate_area_by_room_type(room_list_A)
+    sums_B = _aggregate_area_by_room_type(room_list_B)
+    common_types = set(sums_A.keys()) & set(sums_B.keys())
     sigmas = []
-    for category in all_categories:
-        sublist_A = rooms_by_category_A.get(category, [])
-        sublist_B = rooms_by_category_B.get(category, [])
-        if area_sorting:
-            sublist_A = sorted(sublist_A, key=lambda x: x[1], reverse=True)
-            sublist_B = sorted(sublist_B, key=lambda x: x[1], reverse=True)
-        count_A = len(sublist_A)
-        count_B = len(sublist_B)
-        if count_A == 0 or count_B == 0:
+    for category in common_types:
+        area_A = sums_A[category]
+        area_B = sums_B[category]
+        if area_B == 0:
             continue
-        if duplicate_mismatched:
-            if count_A > count_B:
-                sublist_B = (sublist_B * ((count_A // count_B) + 1))[:count_A]
-            elif count_B > count_A:
-                sublist_A = (sublist_A * ((count_B // count_A) + 1))[:count_B]
-            n_pairs = max(count_A, count_B)
-        else:
-            n_pairs = min(count_A, count_B)
-        for i in range(n_pairs):
-            area_A = sublist_A[i][1]
-            area_B = sublist_B[i][1]
-            if area_B == 0:
-                continue
-            sigmas.append(abs(area_A - area_B) / area_B)
+        sigmas.append(abs(area_A - area_B) / area_B)
 
     if len(sigmas) == 0:
-        return 0.6
+        warnings.warn(
+            "compute_room_area_difference_score: no comparable room types with "
+            "nonzero GT area (empty sigmas); returning nan",
+            stacklevel=2,
+        )
+        return float('nan')
     return sum(sigmas) / len(sigmas)
 
 

@@ -17,6 +17,25 @@ from typing import Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 
+def _parse_first_json_object(s: str):
+    """Parse the first top-level JSON object from *s*, ignoring trailing text.
+
+    Models often emit valid hypergraph JSON followed by commentary or extra tokens,
+    which makes ``json.loads`` fail with "Extra data: ...".  ``JSONDecoder.raw_decode``
+    stops after the first complete value.
+    """
+    s = s.strip()
+    dec = json.JSONDecoder()
+    i = s.find("{")
+    if i == -1:
+        return None
+    try:
+        obj, _end = dec.raw_decode(s[i:])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 class Hypergraph:
     """A BSP-tree hypergraph representing a spatial floor plan subdivision.
 
@@ -785,30 +804,42 @@ class Hypergraph:
             if end_idx != -1:
                 json_section = json_section[:end_idx]
             json_section = _strip_fences(json_section)
+            obj = None
+            used_first_object_only = False
             try:
                 obj = json.loads(json_section)
-                if isinstance(obj, dict) and "name" in obj and "children" in obj:
-                    if not silent:
-                        logger.info("✅ Successfully extracted JSON from assistant section")
-                    return cls(obj)
-                else:
-                    if not silent:
-                        logger.warning("Parsed JSON but missing required fields ('name' or 'children')")
             except json.JSONDecodeError as e:
-                if not silent:
+                obj = _parse_first_json_object(json_section)
+                if obj is not None:
+                    used_first_object_only = True
+                elif not silent:
                     logger.warning(f"Found assistant section but failed to parse JSON: {e}")
                     logger.debug(f"Attempted to parse: {json_section[:200]}...")
 
+            if obj is not None and isinstance(obj, dict) and "name" in obj and "children" in obj:
+                if not silent:
+                    if used_first_object_only:
+                        logger.info(
+                            "✅ Extracted hypergraph JSON from assistant section "
+                            "(first JSON object only; trailing model text ignored)"
+                        )
+                    else:
+                        logger.info("✅ Successfully extracted JSON from assistant section")
+                return cls(obj)
+            if obj is not None and isinstance(obj, dict) and not silent:
+                logger.warning("Parsed JSON but missing required fields ('name' or 'children')")
+
         if allow_raw_json_fallback:
             json_section = _strip_fences(response)
+            obj = None
             try:
                 obj = json.loads(json_section)
-                if isinstance(obj, dict) and "name" in obj and "children" in obj:
-                    if not silent:
-                        logger.info("✅ Successfully extracted JSON from raw response")
-                    return cls(obj)
             except json.JSONDecodeError:
-                pass
+                obj = _parse_first_json_object(json_section)
+            if isinstance(obj, dict) and "name" in obj and "children" in obj:
+                if not silent:
+                    logger.info("✅ Successfully extracted JSON from raw response")
+                return cls(obj)
 
         if not silent:
             logger.error("❌ Could not find valid JSON in response")

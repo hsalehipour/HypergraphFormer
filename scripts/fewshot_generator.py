@@ -15,6 +15,10 @@ Usage:
     # Batch generation
     python scripts/fewshot_generator.py --backend gpt --batch \
         --test-dir data/test --output results.json --resume
+
+    # Qwen via vLLM (default if installed; use --no-vllm for HuggingFace)
+    python scripts/fewshot_generator.py --backend qwen --batch --test-dir data/test \\
+        --output results.json --vllm-gpu-memory 0.85 --vllm-max-model-len 6900
 """
 
 from __future__ import annotations
@@ -29,11 +33,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+# See scripts/evaluator.py — set before importing vllm below.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 from utils.hypergraph import Hypergraph
 from utils.prompts import create_structured_prompt
 from utils.data_loading import load_example_hypergraphs, load_target_from_dataset
 
 logger = logging.getLogger(__name__)
+
+# vLLM (optional; used for fast local inference — see rlft_pipeline GRPOConfig / evaluate_rl_model.py)
+VLLM_AVAILABLE = False
+try:
+    from vllm import LLM as _VLLM_LLM
+    from vllm import SamplingParams as _VLLM_SamplingParams
+    from vllm.lora.request import LoRARequest as _VLLM_LoRARequest
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    _VLLM_LLM = _VLLM_SamplingParams = _VLLM_LoRARequest = None  # type: ignore[misc, assignment]
 
 SYSTEM_PROMPT = (
     "You are an expert at generating structured hierarchical BSP tree data "
@@ -305,7 +323,6 @@ class FewShotGenerator(ABC):
                     failed_samples.append(filename)
 
                 pbar.update(1)
-                time.sleep(1)
 
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
@@ -460,6 +477,239 @@ class QwenGenerator(FewShotGenerator):
         return Hypergraph.from_qwen_response(response)
 
 
+def _wrap_vllm_completion_for_qwen_parse(generated_text: str) -> str:
+    """vLLM returns only new tokens; ``Hypergraph.from_qwen_response`` looks for the assistant span."""
+    g = (generated_text or "").strip()
+    marker = "<|im_start|>assistant"
+    if marker in g:
+        return g
+    return f"{marker}\n{g}\n<|redacted_im_end|>"
+
+
+class VllmQwenGenerator(FewShotGenerator):
+    """Local Qwen via vLLM (faster batched inference; aligns with rlft_pipeline / evaluate_rl_model)."""
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
+        *,
+        lora_path: str | Path | None = None,
+        max_tokens: int = 5120,
+        temperature: float = 0.7,
+        gpu_memory_utilization: float = 0.85,
+        max_model_len: int = 6900,
+        tensor_parallel_size: int = 1,
+        max_lora_rank: int | None = None,
+        enforce_eager: bool = True,
+    ):
+        if not VLLM_AVAILABLE:
+            raise RuntimeError("vLLM is not installed. Install with: pip install vllm")
+        super().__init__(model_name, max_tokens=max_tokens, temperature=temperature)
+        self._lora_path: Path | None = Path(lora_path).resolve() if lora_path else None
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._max_model_len = max_model_len
+        self._tensor_parallel_size = tensor_parallel_size
+
+        tokenizer_src = str(self._lora_path) if self._lora_path and (self._lora_path / "adapter_config.json").exists() else model_name
+        from transformers import AutoTokenizer
+
+        _local = bool(self._lora_path) or (Path(model_name).exists() and Path(model_name).is_dir())
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, local_files_only=_local)
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+
+        base_model = model_name
+        enable_lora = False
+        if self._lora_path and (self._lora_path / "adapter_config.json").exists():
+            with open(self._lora_path / "adapter_config.json") as f:
+                cfg = json.load(f)
+            base_model = cfg.get("base_model_name_or_path") or base_model
+            enable_lora = True
+            if max_lora_rank is None:
+                max_lora_rank = int(cfg.get("r", 64))
+
+        logger.info(
+            f"Loading vLLM: base={base_model}, lora={self._lora_path}, "
+            f"gpu_mem={gpu_memory_utilization}, max_model_len={max_model_len}, tp={tensor_parallel_size}",
+        )
+        _llm_kw: dict = dict(
+            model=base_model,
+            dtype="bfloat16",
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            tensor_parallel_size=tensor_parallel_size,
+        )
+        if enable_lora:
+            _llm_kw["enable_lora"] = True
+            _llm_kw["max_lora_rank"] = max_lora_rank or 64
+        # Default True: CUDA graph capture/warmup can OOM on 40GB cards with long max_model_len.
+        _llm_kw["enforce_eager"] = enforce_eager
+        self._llm = _VLLM_LLM(**_llm_kw)
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    def _lora_request(self):
+        if self._lora_path is None or not (self._lora_path / "adapter_config.json").exists():
+            return None
+        return _VLLM_LoRARequest(
+            lora_name=self._lora_path.name,
+            lora_int_id=hash(str(self._lora_path)) % (2**31),
+            lora_path=str(self._lora_path),
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: int | None = None,
+    ) -> GenerationResult:
+        from utils import TimeoutException, time_limit
+
+        mt = max_tokens or self.max_tokens
+        temp = temperature or self.temperature
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        text = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        num_input = len(self._tokenizer.encode(text))
+
+        sampling_params = _VLLM_SamplingParams(
+            temperature=temp,
+            top_k=50,
+            top_p=0.95,
+            max_tokens=mt,
+        )
+        lora_req = self._lora_request()
+
+        def _run_generate():
+            if lora_req is not None:
+                return self._llm.generate(
+                    [text], sampling_params, lora_request=lora_req, use_tqdm=False,
+                )
+            return self._llm.generate([text], sampling_params, use_tqdm=False)
+
+        start = time.time()
+        try:
+            if timeout is not None:
+                with time_limit(timeout):
+                    outputs = _run_generate()
+            else:
+                outputs = _run_generate()
+            elapsed = time.time() - start
+            raw = outputs[0].outputs[0].text
+            wrapped = _wrap_vllm_completion_for_qwen_parse(raw)
+            out_tokens = len(self._tokenizer.encode(raw)) if raw else 0
+            return GenerationResult(
+                text=wrapped,
+                input_tokens=num_input,
+                output_tokens=out_tokens,
+                generation_time=elapsed,
+            )
+        except TimeoutException:
+            elapsed = time.time() - start
+            logger.error(f"TIMEOUT: Generation exceeded {timeout}s limit")
+            return GenerationResult(
+                input_tokens=num_input, generation_time=elapsed, timed_out=True,
+            )
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout: int | None = None,
+    ) -> list[GenerationResult]:
+        """Batched vLLM inference (one engine; multiple prompts per ``generate`` call)."""
+        from utils import TimeoutException, time_limit
+
+        if not prompts:
+            return []
+        mt = max_tokens or self.max_tokens
+        temp = temperature or self.temperature
+
+        texts: list[str] = []
+        input_counts: list[int] = []
+        for prompt in prompts:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            text = self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            texts.append(text)
+            input_counts.append(len(self._tokenizer.encode(text)))
+
+        sampling_params = _VLLM_SamplingParams(
+            temperature=temp,
+            top_k=50,
+            top_p=0.95,
+            max_tokens=mt,
+        )
+        lora_req = self._lora_request()
+
+        def _run_batch():
+            if lora_req is not None:
+                return self._llm.generate(
+                    texts, sampling_params, lora_request=lora_req, use_tqdm=False,
+                )
+            return self._llm.generate(texts, sampling_params, use_tqdm=False)
+
+        start = time.time()
+        try:
+            if timeout is not None:
+                with time_limit(timeout):
+                    outputs = _run_batch()
+            else:
+                outputs = _run_batch()
+        except TimeoutException:
+            elapsed = time.time() - start
+            logger.error(f"TIMEOUT: batched generation exceeded {timeout}s limit")
+            return [
+                GenerationResult(
+                    input_tokens=input_counts[i],
+                    generation_time=elapsed / max(len(prompts), 1),
+                    timed_out=True,
+                )
+                for i in range(len(prompts))
+            ]
+
+        elapsed = time.time() - start
+        n = len(prompts)
+        per = elapsed / n if n else 0.0
+        out: list[GenerationResult] = []
+        for i in range(n):
+            raw = outputs[i].outputs[0].text
+            wrapped = _wrap_vllm_completion_for_qwen_parse(raw)
+            out_tokens = len(self._tokenizer.encode(raw)) if raw else 0
+            out.append(
+                GenerationResult(
+                    text=wrapped,
+                    input_tokens=input_counts[i],
+                    output_tokens=out_tokens,
+                    generation_time=per,
+                )
+            )
+        return out
+
+    def generate_streaming(self, prompt: str, *, max_tokens: int | None = None,
+                           temperature: float | None = None) -> GenerationResult:
+        logger.info("vLLM: non-streaming generate (streaming not wired; single-shot decode)")
+        return self.generate(prompt, max_tokens=max_tokens, temperature=temperature, timeout=None)
+
+    def extract_hypergraph(self, response: str) -> Hypergraph | None:
+        return Hypergraph.from_qwen_response(response)
+
+
 # ---------------------------------------------------------------------------
 # GPT backend
 # ---------------------------------------------------------------------------
@@ -598,13 +848,60 @@ def cli():
     batch.add_argument("--test-dir", type=str, default=None)
     batch.add_argument("--resume", action="store_true")
 
+    vllm = parser.add_argument_group("vLLM (Qwen backend)")
+    vllm.add_argument(
+        "--no-vllm",
+        action="store_true",
+        help="Use HuggingFace generate instead of vLLM (slower)",
+    )
+    vllm.add_argument(
+        "--vllm-gpu-memory",
+        type=float,
+        default=0.85,
+        help=(
+            "vLLM gpu_memory_utilization (default: 0.85 for inference). "
+            "Use ~0.25 only when sharing the GPU (e.g. GRPO colocate); too low causes KV cache OOM."
+        ),
+    )
+    vllm.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=6900,
+        help="vLLM max_model_len (default: 6900, matches rlft_pipeline GRPOConfig)",
+    )
+    vllm.add_argument(
+        "--tensor-parallel",
+        type=int,
+        default=1,
+        help="vLLM tensor_parallel_size (default: 1)",
+    )
+    vllm.add_argument(
+        "--vllm-no-enforce-eager",
+        action="store_true",
+        help="Allow vLLM CUDA graphs (default is enforce_eager=True to avoid OOM during capture)",
+    )
+
     args = parser.parse_args()
 
     model_name = args.model
     if args.backend == "qwen":
         model_name = model_name or "Qwen/Qwen3-4B-Instruct-2507"
-        gen = QwenGenerator(model_name, max_tokens=args.max_tokens,
-                            temperature=args.temperature)
+        use_vllm = not args.no_vllm and VLLM_AVAILABLE
+        if not args.no_vllm and not VLLM_AVAILABLE:
+            logger.warning("vLLM not installed; falling back to HuggingFace generate (pip install vllm)")
+        if use_vllm:
+            gen = VllmQwenGenerator(
+                model_name,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                gpu_memory_utilization=args.vllm_gpu_memory,
+                max_model_len=args.vllm_max_model_len,
+                tensor_parallel_size=args.tensor_parallel,
+                enforce_eager=not args.vllm_no_enforce_eager,
+            )
+        else:
+            gen = QwenGenerator(model_name, max_tokens=args.max_tokens,
+                                temperature=args.temperature)
     else:
         model_name = model_name or "gpt-4"
         gen = GPTGenerator(model_name, max_tokens=args.max_tokens,
