@@ -118,7 +118,7 @@ def accessgraph_dict_to_nx(ag):
     return g
 
 
-def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeout_capture_best=False):
+def ged_between_graphs(G_pred, G_true, _id, timeout=20000, upper_bound=40, timeout_capture_best=False):
     """Core GED computation on pre-built NetworkX graphs.
 
     This is the low-level algorithm shared by
@@ -130,7 +130,7 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeo
         G_pred: Predicted NetworkX graph (nodes must have a ``label`` attribute).
         G_true: Ground-truth NetworkX graph (nodes must have a ``label`` attribute).
         _id: Sample identifier for log messages.
-        timeout: Timeout in milliseconds (default: 10 000).
+        timeout: Timeout in milliseconds (default: 20 000).
         upper_bound: Upper bound passed to ``nx.optimize_graph_edit_distance``.
         timeout_capture_best: If *True*, return the best value found
             before timeout instead of ``None``.
@@ -177,7 +177,7 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeo
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=10000,
+def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=20000,
                                 upper_bound=40, timeout_capture_best=False,
                                 correct_accessgraph=False, bounds=None):
     """Compute GED between an access-graph dict and a hypergraph dict.
@@ -195,7 +195,7 @@ def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=10000,
         accessgraph: Access graph dict with ``nodes`` and ``edges``.
         hypergraph: Hypergraph BSP-tree dict.
         _id: Sample identifier for log messages.
-        timeout: Timeout in milliseconds (default: 10 000).
+        timeout: Timeout in milliseconds (default: 20 000).
         upper_bound: Upper bound for GED computation.
         timeout_capture_best: If *True*, return the best partial result
             on timeout.
@@ -321,31 +321,60 @@ def compute_room_area_difference_score(room_list_A, room_list_B):
     For each canonical room type (kitchen, bathroom, …), **sum** all room face
     areas of that type in each apartment, then take
     ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
-    apartments. Types present in only one apartment are **skipped**. The score is
-    the mean of those relative errors over matching types.
+    apartments. Types present in only one apartment are tracked as unmatched.
+    The score is the mean of those relative errors over matching types.
+
+    Returns:
+        dict with keys:
+
+        - ``area_difference_score`` (float): mean relative error (NaN if
+          no comparable types).
+        - ``matched_types`` (int): number of room types compared.
+        - ``unmatched_pred`` (int): room types in pred only.
+        - ``unmatched_gt`` (int): room types in GT only.
+        - ``per_type_scores`` (list[float]): per-type relative errors.
+        - ``skipped_types_pred`` (list[str]): type keys present only in pred.
+        - ``skipped_types_gt`` (list[str]): type keys present only in GT.
     """
+    import numpy as np
+
     sums_A = _aggregate_area_by_room_type(room_list_A)
     sums_B = _aggregate_area_by_room_type(room_list_B)
+
     common_types = set(sums_A.keys()) & set(sums_B.keys())
-    sigmas = []
-    for category in common_types:
+    only_in_A = set(sums_A.keys()) - set(sums_B.keys())
+    only_in_B = set(sums_B.keys()) - set(sums_A.keys())
+
+    per_type_scores = []
+    for category in sorted(common_types):
         area_A = sums_A[category]
         area_B = sums_B[category]
         if area_B == 0:
             continue
-        sigmas.append(abs(area_A - area_B) / area_B)
+        per_type_scores.append(abs(area_A - area_B) / area_B)
 
-    if len(sigmas) == 0:
+    if len(per_type_scores) == 0:
         warnings.warn(
             "compute_room_area_difference_score: no comparable room types with "
             "nonzero GT area (empty sigmas); returning nan",
             stacklevel=2,
         )
-        return float('nan')
-    return sum(sigmas) / len(sigmas)
+        avg_error = float('nan')
+    else:
+        avg_error = float(np.mean(per_type_scores))
+
+    return {
+        'area_difference_score': avg_error,
+        'matched_types': len(per_type_scores),
+        'unmatched_pred': len(only_in_A),
+        'unmatched_gt': len(only_in_B),
+        'per_type_scores': per_type_scores,
+        'skipped_types_pred': sorted(only_in_A),
+        'skipped_types_gt': sorted(only_in_B),
+    }
 
 
-def room_type_accuracy(expected_room_types, generated_room_types):
+def room_type_accuracy(expected_room_types, generated_room_types, strict=False):
     """Core room-type multiset comparison on two flat lists.
 
     This is the low-level function shared by
@@ -356,13 +385,19 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
+        strict: When ``True`` (default), ``accuracy`` is binary —
+            1.0 only if both count and types match exactly, else 0.0.
+            When ``False``, ``accuracy`` is a continuous score in
+            ``[0, 1]``: multiset intersection size divided by
+            ``max(|expected|, |generated|)``, giving partial credit
+            for partially correct room-type sets.
 
     Returns:
         dict with keys:
 
         - ``room_count_match`` (bool)
         - ``room_types_match`` (bool)
-        - ``accuracy`` (float): 1.0 if both match, else 0.0
+        - ``accuracy`` (float): see *strict* parameter
         - ``expected_rooms`` / ``generated_rooms`` (int)
         - ``expected_types`` / ``generated_types`` (dict)
         - ``missing_types`` / ``extra_types`` (list)
@@ -396,10 +431,22 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     count_error = abs(n_generated - n_expected)
     type_error = (len(missing_types) + len(extra_types)) // 2
 
+    if strict:
+        accuracy = 1.0 if (room_count_match and room_types_match) else 0.0
+    else:
+        denom = max(n_expected, n_generated)
+        if denom == 0:
+            accuracy = float('nan')
+        else:
+            all_keys = set(expected_counter) | set(generated_counter)
+            overlap = sum(min(expected_counter[k], generated_counter[k])
+                          for k in all_keys)
+            accuracy = overlap / denom
+
     return {
         'room_count_match': room_count_match,
         'room_types_match': room_types_match,
-        'accuracy': 1.0 if (room_count_match and room_types_match) else 0.0,
+        'accuracy': accuracy,
         'expected_rooms': n_expected,
         'generated_rooms': n_generated,
         'expected_types': dict(expected_counter),
@@ -413,26 +460,7 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     }
 
 
-def _room_multiset_proximity_accuracy(result: dict) -> float:
-    """Continuous closeness in ``[0, 1]``: multiset overlap / max(|GT|, |pred|).
-
-    Overlap is ``sum_t min(gt_t, pred_t)`` (multiset intersection size).
-    If both GT and prediction have zero rooms, returns NaN (treated as an error /
-    undefined case).
-    """
-    n_e = result["expected_rooms"]
-    n_g = result["generated_rooms"]
-    if n_e == 0 and n_g == 0:
-        return float("nan")
-    exp = result["expected_types"]
-    gen = result["generated_types"]
-    keys = set(exp) | set(gen)
-    overlap = sum(min(int(exp.get(k, 0)), int(gen.get(k, 0))) for k in keys)
-    denom = max(n_e, n_g)
-    return overlap / denom if denom else 1.0
-
-
-def compute_room_type_accuracy(accessgraph, hypergraph):
+def compute_room_type_accuracy(accessgraph, hypergraph, strict=False):
     """Compare room-type multisets between an access-graph dict and a hypergraph dict.
 
     Extracts room-type lists from the raw dictionaries and delegates to
@@ -441,6 +469,7 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     Args:
         accessgraph: Access graph dict with ``nodes`` mapping id -> room_type.
         hypergraph: Hypergraph BSP-tree dict.
+        strict: Passed through to :func:`room_type_accuracy`.
 
     Returns:
         dict -- see :func:`room_type_accuracy`.
@@ -448,7 +477,7 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     expected_room_types = list(accessgraph.get('nodes', {}).values())
     leaves = Hypergraph(hypergraph).leaves
     generated_room_types = [leaf['mergeid'] for leaf in leaves]
-    return room_type_accuracy(expected_room_types, generated_room_types)
+    return room_type_accuracy(expected_room_types, generated_room_types, strict=strict)
 
 
 def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
@@ -534,7 +563,7 @@ def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
         if label is None:
             continue
 
-        score = _room_multiset_proximity_accuracy(result)
+        score = result["accuracy"]
         categories[label]["total"] += 1
         overall_total += 1
         categories[label]["matches"] += score

@@ -379,11 +379,15 @@ def score_area_difference(results, ground_truth, skip_ids):
             bounds = gt["bounds"]
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
             gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
-            area_difference = compute_room_area_difference_score(
+            result = compute_room_area_difference_score(
                 produce_room_area_list(gen_mesh),
                 produce_room_area_list(gt_mesh),
             )
-            per_sample.append({"sample_id": sample_id, "area_difference": area_difference})
+            per_sample.append({
+                "sample_id": sample_id,
+                "area_difference": result['area_difference_score'],
+                "area_difference_detail": result,
+            })
         except Exception as e:
             logger.warning(f"Area difference failed for {sample_id}: {e}")
             per_sample.append({"sample_id": sample_id, "area_difference": None, "error": str(e)})

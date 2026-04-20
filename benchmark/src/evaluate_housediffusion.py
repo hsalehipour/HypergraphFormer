@@ -32,6 +32,7 @@ import pickle
 
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
+from utils.metrics import compute_room_area_difference_score as compute_area_diff_metric
 from benchmark.src.evaluate_houseganpp import draw_masks
 from benchmark.utils.score_benchmark_result import score_benchmark_result
 from house_diffusion.script_util import (
@@ -51,6 +52,12 @@ ROOM_CLASS = {
     "storage": 10, "front door": 15, "unknown": 16, "interior_door": 17
 }
 CLASS_ROOM = {v: k for k, v in ROOM_CLASS.items()}
+
+
+def _room_geometries_to_area_tuples(room_geometries):
+    """Convert room geometry dicts to ``(merge_id, area)`` tuples for metrics.py."""
+    return [(CLASS_ROOM.get(r['room_type'], str(r['room_type'])), r['area'])
+            for r in room_geometries]
 
 
 # Color scheme for room types matching visualize_hypergraph.ipynb
@@ -427,52 +434,6 @@ def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
         'unmatched_pred': unmatched_pred_count,
         'unmatched_gt': unmatched_gt_count,
         'per_room_scores': similarity_scores
-    }
-
-
-def compute_room_area_difference_score_polygons(pred_polygons, gt_polygons):
-    """Compute mean relative room-area error using polygon-based representation.
-
-    Pairing logic mirrors :func:`compute_room_similarity_score_polygons`:
-    rooms grouped by type, sorted by area descending, paired largest-first.
-    Per-pair error is ``abs(area_pred - area_gt) / area_gt``.
-    """
-    pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
-    gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
-
-    pred_by_type = {}
-    gt_by_type = {}
-    for room in pred_rooms:
-        pred_by_type.setdefault(room['room_type'], []).append(room)
-    for room in gt_rooms:
-        gt_by_type.setdefault(room['room_type'], []).append(room)
-
-    area_errors = []
-    matched_pairs = 0
-    unmatched_pred_count = 0
-    unmatched_gt_count = 0
-
-    for room_type in set(pred_by_type.keys()) | set(gt_by_type.keys()):
-        pred_of_type = sorted(pred_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
-        gt_of_type = sorted(gt_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
-        num_to_match = min(len(pred_of_type), len(gt_of_type))
-        unmatched_pred_count += len(pred_of_type) - num_to_match
-        unmatched_gt_count += len(gt_of_type) - num_to_match
-
-        for pred_room, gt_room in zip(pred_of_type[:num_to_match], gt_of_type[:num_to_match]):
-            area_gt = gt_room['area']
-            if area_gt > 0:
-                area_errors.append(abs(pred_room['area'] - area_gt) / area_gt)
-                matched_pairs += 1
-
-    avg_error = np.mean(area_errors) if area_errors else np.nan
-
-    return {
-        'area_difference_score': avg_error,
-        'matched_pairs': matched_pairs,
-        'unmatched_pred': unmatched_pred_count,
-        'unmatched_gt': unmatched_gt_count,
-        'per_room_scores': area_errors,
     }
 
 
@@ -995,7 +956,7 @@ def _ged_worker(pair):
     G_pred, G_true, sample_idx, upper_bound = pair
     ged, _ = ged_between_graphs(
         G_pred, G_true, sample_idx,
-        timeout=10000, upper_bound=upper_bound
+        upper_bound=upper_bound
     )
     return ged if ged is not None else np.nan
 
@@ -1096,8 +1057,11 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
         results['unmatched_gt_rooms'].append(similarity_result['unmatched_gt'])
         results['matched_room_pairs'].append(similarity_result['matched_pairs'])
 
-        area_diff_result = compute_room_area_difference_score_polygons(
-            pred_polygons, gt_polygons
+        pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
+        gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
+        area_diff_result = compute_area_diff_metric(
+            _room_geometries_to_area_tuples(pred_rooms),
+            _room_geometries_to_area_tuples(gt_rooms),
         )
         results['area_difference_scores'].append(area_diff_result['area_difference_score'])
 
