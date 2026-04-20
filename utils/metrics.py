@@ -374,7 +374,7 @@ def compute_room_area_difference_score(room_list_A, room_list_B):
     }
 
 
-def room_type_accuracy(expected_room_types, generated_room_types):
+def room_type_accuracy(expected_room_types, generated_room_types, strict=False):
     """Core room-type multiset comparison on two flat lists.
 
     This is the low-level function shared by
@@ -385,13 +385,19 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
+        strict: When ``True`` (default), ``accuracy`` is binary —
+            1.0 only if both count and types match exactly, else 0.0.
+            When ``False``, ``accuracy`` is a continuous score in
+            ``[0, 1]``: multiset intersection size divided by
+            ``max(|expected|, |generated|)``, giving partial credit
+            for partially correct room-type sets.
 
     Returns:
         dict with keys:
 
         - ``room_count_match`` (bool)
         - ``room_types_match`` (bool)
-        - ``accuracy`` (float): 1.0 if both match, else 0.0
+        - ``accuracy`` (float): see *strict* parameter
         - ``expected_rooms`` / ``generated_rooms`` (int)
         - ``expected_types`` / ``generated_types`` (dict)
         - ``missing_types`` / ``extra_types`` (list)
@@ -425,10 +431,22 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     count_error = abs(n_generated - n_expected)
     type_error = (len(missing_types) + len(extra_types)) // 2
 
+    if strict:
+        accuracy = 1.0 if (room_count_match and room_types_match) else 0.0
+    else:
+        denom = max(n_expected, n_generated)
+        if denom == 0:
+            accuracy = float('nan')
+        else:
+            all_keys = set(expected_counter) | set(generated_counter)
+            overlap = sum(min(expected_counter[k], generated_counter[k])
+                          for k in all_keys)
+            accuracy = overlap / denom
+
     return {
         'room_count_match': room_count_match,
         'room_types_match': room_types_match,
-        'accuracy': 1.0 if (room_count_match and room_types_match) else 0.0,
+        'accuracy': accuracy,
         'expected_rooms': n_expected,
         'generated_rooms': n_generated,
         'expected_types': dict(expected_counter),
@@ -442,26 +460,7 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     }
 
 
-def _room_multiset_proximity_accuracy(result: dict) -> float:
-    """Continuous closeness in ``[0, 1]``: multiset overlap / max(|GT|, |pred|).
-
-    Overlap is ``sum_t min(gt_t, pred_t)`` (multiset intersection size).
-    If both GT and prediction have zero rooms, returns NaN (treated as an error /
-    undefined case).
-    """
-    n_e = result["expected_rooms"]
-    n_g = result["generated_rooms"]
-    if n_e == 0 and n_g == 0:
-        return float("nan")
-    exp = result["expected_types"]
-    gen = result["generated_types"]
-    keys = set(exp) | set(gen)
-    overlap = sum(min(int(exp.get(k, 0)), int(gen.get(k, 0))) for k in keys)
-    denom = max(n_e, n_g)
-    return overlap / denom if denom else 1.0
-
-
-def compute_room_type_accuracy(accessgraph, hypergraph):
+def compute_room_type_accuracy(accessgraph, hypergraph, strict=False):
     """Compare room-type multisets between an access-graph dict and a hypergraph dict.
 
     Extracts room-type lists from the raw dictionaries and delegates to
@@ -470,6 +469,7 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     Args:
         accessgraph: Access graph dict with ``nodes`` mapping id -> room_type.
         hypergraph: Hypergraph BSP-tree dict.
+        strict: Passed through to :func:`room_type_accuracy`.
 
     Returns:
         dict -- see :func:`room_type_accuracy`.
@@ -477,7 +477,7 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     expected_room_types = list(accessgraph.get('nodes', {}).values())
     leaves = Hypergraph(hypergraph).leaves
     generated_room_types = [leaf['mergeid'] for leaf in leaves]
-    return room_type_accuracy(expected_room_types, generated_room_types)
+    return room_type_accuracy(expected_room_types, generated_room_types, strict=strict)
 
 
 def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
@@ -563,7 +563,7 @@ def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
         if label is None:
             continue
 
-        score = _room_multiset_proximity_accuracy(result)
+        score = result["accuracy"]
         categories[label]["total"] += 1
         overall_total += 1
         categories[label]["matches"] += score
