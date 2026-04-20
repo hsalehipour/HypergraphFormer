@@ -241,10 +241,11 @@ def score_delta(results, ground_truth, skip_ids):
 # ===================================================================
 
 def score_area_difference(results, ground_truth, skip_ids):
-    """Compute relative room-area error for every sample.
+    """Compute relative area error for every sample (aggregated per room type).
 
-    Pairing logic follows the same room-list grouping behavior as delta, but
-    scores per-room area error: ``abs(Area_pred - Area_gt) / Area_gt``.
+    Uses :func:`utils.metrics.compute_room_area_difference_score`: areas are summed
+    per canonical room type in pred vs GT mesh; only types present in both are
+    compared; mean relative error ``abs(A - B) / B`` over those types.
     """
     per_sample = []
     skipped = 0
