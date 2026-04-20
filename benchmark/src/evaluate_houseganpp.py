@@ -33,6 +33,7 @@ import cv2
 from PIL import Image, ImageDraw
 
 from utils.metrics import ged_between_graphs, room_type_accuracy
+from utils.metrics import compute_room_area_difference_score as compute_area_diff_metric
 from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
 from benchmark.utils.score_benchmark_result import score_benchmark_result
 from houseganpp.misc.utils import _init_input
@@ -45,6 +46,13 @@ ROOM_CLASS = {
     "storage": 10, "front door": 15, "unknown": 16, "interior_door": 17
 }
 CLASS_ROOM = {v: k for k, v in ROOM_CLASS.items()}
+
+
+def _room_geometries_to_area_tuples(room_geometries):
+    """Convert room geometry dicts to ``(merge_id, area)`` tuples for metrics.py."""
+    return [(CLASS_ROOM.get(r['room_type'], str(r['room_type'])), r['area'])
+            for r in room_geometries]
+
 
 # Color scheme for room types matching visualize_hypergraph.ipynb
 ID_COLOR = {
@@ -391,55 +399,6 @@ def compute_room_similarity_score(pred_nodes, pred_masks, gt_nodes, gt_masks):
         'unmatched_pred': unmatched_pred_count,
         'unmatched_gt': unmatched_gt_count,
         'per_room_scores': similarity_scores
-    }
-
-
-def compute_room_area_difference_score(pred_nodes, pred_masks, gt_nodes, gt_masks):
-    """Compute mean relative room-area error between predicted and GT masks.
-
-    Rooms are grouped by type and paired largest-first (same pairing logic
-    as :func:`compute_room_similarity_score`).  Per-pair error is
-    ``abs(area_pred - area_gt) / area_gt``.
-
-    Returns a dict with the same shape as ``compute_room_similarity_score``
-    so it can be collected identically.
-    """
-    pred_rooms = extract_room_geometries_from_masks(pred_nodes, pred_masks)
-    gt_rooms = extract_room_geometries_from_masks(gt_nodes, gt_masks)
-
-    pred_by_type = {}
-    gt_by_type = {}
-    for room in pred_rooms:
-        pred_by_type.setdefault(room['room_type'], []).append(room)
-    for room in gt_rooms:
-        gt_by_type.setdefault(room['room_type'], []).append(room)
-
-    area_errors = []
-    matched_pairs = 0
-    unmatched_pred_count = 0
-    unmatched_gt_count = 0
-
-    for room_type in set(pred_by_type.keys()) | set(gt_by_type.keys()):
-        pred_of_type = sorted(pred_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
-        gt_of_type = sorted(gt_by_type.get(room_type, []), key=lambda r: r['area'], reverse=True)
-        num_to_match = min(len(pred_of_type), len(gt_of_type))
-        unmatched_pred_count += len(pred_of_type) - num_to_match
-        unmatched_gt_count += len(gt_of_type) - num_to_match
-
-        for pred_room, gt_room in zip(pred_of_type[:num_to_match], gt_of_type[:num_to_match]):
-            area_gt = gt_room['area']
-            if area_gt > 0:
-                area_errors.append(abs(pred_room['area'] - area_gt) / area_gt)
-                matched_pairs += 1
-
-    avg_error = np.mean(area_errors) if area_errors else np.nan
-
-    return {
-        'area_difference_score': avg_error,
-        'matched_pairs': matched_pairs,
-        'unmatched_pred': unmatched_pred_count,
-        'unmatched_gt': unmatched_gt_count,
-        'per_room_scores': area_errors,
     }
 
 
@@ -953,9 +912,11 @@ def main():
                             real_nodes, gen_masks,
                             real_nodes, gt_masks
                         )
-                        area_diff_result = compute_room_area_difference_score(
-                            real_nodes, gen_masks,
-                            real_nodes, gt_masks
+                        pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
+                        gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
+                        area_diff_result = compute_area_diff_metric(
+                            _room_geometries_to_area_tuples(pred_rooms),
+                            _room_geometries_to_area_tuples(gt_rooms),
                         )
                     except Exception as e:
                         print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
@@ -1059,9 +1020,11 @@ def main():
                                 real_nodes, gen_masks,
                                 real_nodes, gt_masks
                             )
-                            area_diff_result = compute_room_area_difference_score(
-                                real_nodes, gen_masks,
-                                real_nodes, gt_masks
+                            pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
+                            gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
+                            area_diff_result = compute_area_diff_metric(
+                                _room_geometries_to_area_tuples(pred_rooms),
+                                _room_geometries_to_area_tuples(gt_rooms),
                             )
                         except Exception as e:
                             print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
