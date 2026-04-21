@@ -1041,6 +1041,11 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
 
     G_true = build_access_graph_from_polygons(gt_polygons)
 
+    gt_room_type_list = [
+        int(p['room_type']) for p in gt_polygons
+        if p['room_type'] not in [15, 17]
+    ]
+
     syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
     syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
     syn_padding_mask = sample_data.get('syn_padding_mask', sample_data['gt_padding_mask'])
@@ -1072,7 +1077,7 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
             results['hidden_room_count'] += 1
 
         room_count_metric = room_type_accuracy(
-            room_count_info['expected_room_types'],
+            gt_room_type_list,
             room_count_info['actual_room_types']
         )
         results['room_count_accuracies'].append(room_count_metric['accuracy'])
@@ -1153,12 +1158,15 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
 def _build_report_kwargs(results):
     """Package raw per-sample arrays as keyword args for ``report_results``."""
     return {
-        'accuracies': np.array(results['room_count_accuracies']),
-        'room_count_accuracies': np.array(results['room_count_accuracy_scores']),
-        'room_type_accuracies': np.array(results['room_type_accuracy_scores']),
-        'similarity_scores': np.array(results['similarity_scores']),
-        'area_proportion_errors': np.array(results['area_proportion_errors']),
-        'spatial_overlap_ratios': np.array(results['spatial_overlap_ratios']),
+        'metrics': {
+            'geds': ('GED', np.array(results['all_geds'])),
+            'accuracies': ('Room Accuracy', np.array(results['room_count_accuracies'])),
+            'room_count_accuracies': ('Room Count Accuracy', np.array(results['room_count_accuracy_scores'])),
+            'room_type_accuracies': ('Room Type Accuracy', np.array(results['room_type_accuracy_scores'])),
+            'similarity_scores': ('Room Similarity (delta)', np.array(results['similarity_scores'])),
+            'area_proportion_errors': ('Area Proportion Error', np.array(results['area_proportion_errors'])),
+            'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(results['spatial_overlap_ratios'])),
+        },
         'extra': {
             'hidden_count': results['hidden_room_count'],
             'total_samples': len(results['room_count_accuracies']),
@@ -1470,7 +1478,6 @@ def main():
     
     report_results(
         args.out,
-        geds=np.array(results['all_geds']),
         num_variations=args.num_variations,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,

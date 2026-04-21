@@ -3,8 +3,17 @@
 Unified reporting: compute summary statistics, print to console, and persist
 results as NPZ + TXT.
 
-All metric arrays are accepted as optional flat 1-D NumPy arrays (may contain
-NaN).  NaN values are excluded consistently from every summary statistic.
+All metrics are passed via a single ``metrics`` dict mapping NPZ keys to
+``(display_title, 1-D array)`` tuples.  Adding a new metric requires **no
+changes** to this module -- just add an entry to the dict at the call site.
+
+Special formatting is applied automatically for well-known keys:
+
+- ``"geds"`` -- custom GED block with failure rate, plus a derived
+  ``ged_accuracies`` (GED == 0) array.
+- ``"accuracies"`` + ``"room_count_accuracies"`` + ``"room_type_accuracies"``
+  -- grouped room-accuracy summary with disconnected/hidden counts.
+- ``"similarity_scores"`` -- extra lines for matched/unmatched room pairs.
 
 Outputs
 -------
@@ -44,17 +53,20 @@ def _stats(arr: np.ndarray) -> dict:
 def _variation_std(arr: np.ndarray, num_variations: int) -> float | None:
     """Std of per-variation column means (cross-variation consistency).
 
-    Returns *None* when ``num_variations <= 1`` or the array length is not
-    evenly divisible by *num_variations*.
+    Returns *None* when ``num_variations < 2`` or the total array length
+    is not evenly divisible by *num_variations*.  NaN values are handled
+    via ``nanmean`` so that a few failed samples don't break the reshape.
     """
-    if num_variations <= 1:
+    if num_variations < 2:
         return None
-    valid = arr[~np.isnan(arr)]
-    n = len(valid)
+    n = len(arr)
     if n == 0 or n % num_variations != 0:
         return None
-    reshaped = valid.reshape(n // num_variations, num_variations)
-    return float(np.std(np.mean(reshaped, axis=0), ddof=1))
+    reshaped = arr.reshape(n // num_variations, num_variations)
+    col_means = np.nanmean(reshaped, axis=0)
+    if np.any(np.isnan(col_means)):
+        return None
+    return float(np.std(col_means, ddof=1))
 
 
 # ── Formatting helpers ────────────────────────────────────────────────
@@ -66,29 +78,27 @@ def _safe(val, fmt=".4f"):
     return f"{val:{fmt}}"
 
 
-# ── Room-count accuracy helpers ───────────────────────────────────────
+# ── Room-accuracy helpers ────────────────────────────────────────────
+
+_ROOM_ACC_KEYS = ("accuracies", "room_count_accuracies", "room_type_accuracies")
 
 
-def _room_accuracy_summary(accuracies, room_count_accuracies,
-                           room_type_accuracies, num_variations, extra):
-    """Build a rich summary dict for the three room accuracy metrics."""
-    acc = np.asarray(accuracies, dtype=float)
-    rca = np.asarray(room_count_accuracies, dtype=float)
-    rta = np.asarray(room_type_accuracies, dtype=float)
-    total = extra.get("total_samples", len(acc)) if extra else len(acc)
+def _room_accuracy_summary(stats_by_key, num_variations, extra):
+    """Build a rich summary dict for the three room accuracy metrics.
+
+    ``stats_by_key`` maps NPZ key -> pre-computed ``_stats()`` dict (with
+    an optional ``std_of_variation_means`` entry already attached).
+    """
+    total = extra.get("total_samples") if extra else None
+    if total is None:
+        st = stats_by_key.get("accuracies")
+        total = (st["n_valid"] + st["n_nan"]) if st else 0
 
     d = {
-        "accuracy": _stats(acc),
-        "room_count_accuracy": _stats(rca),
-        "room_type_accuracy": _stats(rta),
+        "accuracy": stats_by_key["accuracies"],
+        "room_count_accuracy": stats_by_key["room_count_accuracies"],
+        "room_type_accuracy": stats_by_key["room_type_accuracies"],
     }
-
-    if num_variations > 1:
-        for key, arr in [("accuracy", acc), ("room_count_accuracy", rca),
-                         ("room_type_accuracy", rta)]:
-            vs = _variation_std(arr, num_variations)
-            if vs is not None:
-                d[key]["std_of_variation_means"] = vs
 
     if extra:
         dc = extra.get("disconnected_count")
@@ -147,12 +157,13 @@ def _similarity_extras(extra):
     lines = []
     mp = extra.get("matched_room_pairs")
     if mp is not None:
-        lines.append(f"Matched pairs:  {int(sum(mp)):,}")
+        total = int(np.nansum(np.asarray(mp, dtype=float)))
+        lines.append(f"Matched pairs:  {total:,}")
     up = extra.get("unmatched_pred_rooms")
     ug = extra.get("unmatched_gt_rooms")
     if up is not None and ug is not None:
-        lines.append(f"Avg unmatched:  pred={float(np.mean(up)):.2f}"
-                     f"  gt={float(np.mean(ug)):.2f}")
+        lines.append(f"Avg unmatched:  pred={float(np.nanmean(up)):.2f}"
+                     f"  gt={float(np.nanmean(ug)):.2f}")
     return lines or None
 
 
@@ -162,13 +173,7 @@ def _similarity_extras(extra):
 def report_results(
     output_dir: str,
     *,
-    geds: np.ndarray | None = None,
-    accuracies: np.ndarray | None = None,
-    room_count_accuracies: np.ndarray | None = None,
-    room_type_accuracies: np.ndarray | None = None,
-    similarity_scores: np.ndarray | None = None,
-    area_proportion_errors: np.ndarray | None = None,
-    spatial_overlap_ratios: np.ndarray | None = None,
+    metrics: dict[str, tuple[str, np.ndarray]] | None = None,
     num_variations: int = 1,
     checkpoint_path: str | None = None,
     data_path: str | None = None,
@@ -176,19 +181,21 @@ def report_results(
 ) -> dict:
     """Compute statistics, print report, and write NPZ + TXT.
 
-    Every metric parameter is an optional flat 1-D array that may contain
-    NaN.  NaN values are excluded from all summary statistics.
-
     Args:
         output_dir: Directory for ``results.npz`` and ``results.txt``.
-        geds: Per-sample GED values.
-        accuracies: Per-sample combined room accuracy (count and types).
-        room_count_accuracies: Per-sample room-count accuracy.
-        room_type_accuracies: Per-sample room-type-set accuracy.
-        similarity_scores: Per-sample delta / room-similarity scores.
-        area_proportion_errors: Per-sample area-proportion error.
-        spatial_overlap_ratios: Per-sample spatial overlap ratio (pred only).
+        metrics: All metrics.  Each entry maps an NPZ key to a
+            ``(display_title, array)`` tuple.  Well-known keys trigger
+            special formatting (see module docstring).  Example::
+
+                metrics={
+                    "geds": ("GED", ged_array),
+                    "accuracies": ("Room Accuracy", acc_array),
+                    "room_count_accuracies": ("Room Count Accuracy", rca_array),
+                    "room_type_accuracies": ("Room Type Accuracy", rta_array),
+                    "similarity_scores": ("Room Similarity (delta)", sim_array),
+                }
         num_variations: Generation variations per sample (default 1).
+            Must be >= 1.
         checkpoint_path: Included in TXT header when provided.
         data_path: Included in TXT header when provided.
         extra: Passthrough dict saved into the NPZ.  Also used for
@@ -198,57 +205,49 @@ def report_results(
 
     Returns:
         The dict that was saved to the NPZ file.
+
+    Raises:
+        ValueError: If *num_variations* < 1 or if an *extra* key
+            collides with a metric key or reserved key.
     """
+    if num_variations < 1:
+        raise ValueError(f"num_variations must be >= 1, got {num_variations}")
+
     extra = extra or {}
+    metrics = metrics or {}
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── Compute per-metric stats ──────────────────────────────────────
+    # ── Resolve all arrays ────────────────────────────────────────────
+    resolved: dict[str, np.ndarray] = {}
+    titles: dict[str, str] = {}
+    for npz_key, (title, arr) in metrics.items():
+        resolved[npz_key] = np.asarray(arr, dtype=float)
+        titles[npz_key] = title
+
+    # ── Derived metric: ged_accuracies ────────────────────────────────
+    if "geds" in resolved:
+        geds = resolved["geds"]
+        ged_acc = np.where(np.isnan(geds), np.nan, (geds == 0).astype(float))
+        resolved["ged_accuracies"] = ged_acc
+        titles["ged_accuracies"] = "GED Accuracy"
+
+    # ── Compute per-metric stats (single pass) ────────────────────────
     summary: dict = {}
-    metric_entries: list[tuple[str, str, np.ndarray]] = []
-
-    ged_accuracies = None
-    if geds is not None:
-        geds = np.asarray(geds, dtype=float)
-        metric_entries.append(("geds", "GED", geds))
-        ged_accuracies = np.where(np.isnan(geds), np.nan,
-                                  (geds == 0).astype(float))
-    if accuracies is not None:
-        accuracies = np.asarray(accuracies, dtype=float)
-    if room_count_accuracies is not None:
-        room_count_accuracies = np.asarray(room_count_accuracies, dtype=float)
-    if room_type_accuracies is not None:
-        room_type_accuracies = np.asarray(room_type_accuracies, dtype=float)
-    if similarity_scores is not None:
-        similarity_scores = np.asarray(similarity_scores, dtype=float)
-        metric_entries.append(
-            ("similarity_scores", "Room Similarity (delta)", similarity_scores))
-    if area_proportion_errors is not None:
-        area_proportion_errors = np.asarray(area_proportion_errors, dtype=float)
-        metric_entries.append(
-            ("area_proportion_errors", "Area Proportion Error",
-             area_proportion_errors))
-    if spatial_overlap_ratios is not None:
-        spatial_overlap_ratios = np.asarray(spatial_overlap_ratios, dtype=float)
-        metric_entries.append(
-            ("spatial_overlap_ratios", "Spatial Overlap Ratio",
-             spatial_overlap_ratios))
-
-    for npz_key, _, arr in metric_entries:
+    for npz_key, arr in resolved.items():
         summary[npz_key] = _stats(arr)
         vs = _variation_std(arr, num_variations)
         if vs is not None:
             summary[npz_key]["std_of_variation_means"] = vs
 
-    if ged_accuracies is not None:
-        summary["ged_accuracies"] = _stats(ged_accuracies)
-
+    # ── Room accuracy grouped summary (reuses pre-computed stats) ─────
     rc_summary = None
-    if (accuracies is not None and room_count_accuracies is not None
-            and room_type_accuracies is not None):
-        rc_summary = _room_accuracy_summary(
-            accuracies, room_count_accuracies, room_type_accuracies,
-            num_variations, extra)
+    if all(k in resolved for k in _ROOM_ACC_KEYS):
+        rc_summary = _room_accuracy_summary(summary, num_variations, extra)
         summary["room_accuracies"] = rc_summary
+
+    # ── Ordered list for generic display (excludes special-cased keys) ─
+    _SPECIAL_KEYS = {"geds", "ged_accuracies", *_ROOM_ACC_KEYS}
+    generic_keys = [k for k in resolved if k not in _SPECIAL_KEYS]
 
     # ── Build output lines (shared by console + TXT) ──────────────────
     lines: list[str] = []
@@ -265,12 +264,13 @@ def report_results(
     def _line(text):
         lines.append(text)
 
-    # GED gets a custom block because of its special formatting
-    if geds is not None:
+    # GED gets a custom block
+    if "geds" in resolved:
+        geds = resolved["geds"]
         st = summary["geds"]
         n_total = len(geds)
-        n_samples = n_total // num_variations if num_variations else n_total
-        _line(f"\n--- GED ---")
+        n_samples = n_total // num_variations
+        _line(f"\n--- {titles['geds']} ---")
         _line(f"  Samples:  {n_samples:,}")
         if num_variations > 1:
             _line(f"  Total:    {n_total:,} ({n_samples} x {num_variations})")
@@ -284,28 +284,28 @@ def report_results(
         if st["min"] is not None and st["max"] is not None:
             _line(f"  Range:    [{_safe(st['min'], '.0f')}, "
                   f"{_safe(st['max'], '.0f')}]")
-        vs = summary["geds"].get("std_of_variation_means")
+        vs = st.get("std_of_variation_means")
         if vs is not None:
-            cv = (vs / st["mean"] * 100) if st["mean"] else 0
-            _line(f"  Std (variation means): {_safe(vs)}  (CV: {cv:.2f}%)")
+            mean = st["mean"]
+            cv = (vs / mean * 100) if mean is not None and mean != 0 else None
+            cv_str = f"  (CV: {cv:.2f}%)" if cv is not None else ""
+            _line(f"  Std (variation means): {_safe(vs)}{cv_str}")
         ga_st = summary.get("ged_accuracies")
         if ga_st and ga_st.get("mean") is not None:
             _line(f"  GED Accuracy (GED=0 rate): {ga_st['mean'] * 100:.1f}%"
                   f"  ({ga_st['n_valid']} valid samples)")
 
-    # Room accuracies
+    # Room accuracies (grouped)
     if rc_summary:
         _emit_room_accuracies(_line, rc_summary)
 
-    # Generic metrics (similarity, area proportion error)
-    for npz_key, title, _arr in metric_entries:
-        if npz_key == "geds":
-            continue
+    # All other metrics (generic)
+    for npz_key in generic_keys:
         st = summary[npz_key]
         extra_lines = None
         if npz_key == "similarity_scores":
             extra_lines = _similarity_extras(extra)
-        _emit_metric(_line, title, st,
+        _emit_metric(_line, titles[npz_key], st,
                      var_std=st.get("std_of_variation_means"),
                      extra_lines=extra_lines)
 
@@ -314,26 +314,17 @@ def report_results(
         print(line)
 
     # ── Save NPZ ──────────────────────────────────────────────────────
+    reserved_keys = {"num_variations", "summary"}
     save_dict: dict = {"num_variations": num_variations, "summary": summary}
-    if geds is not None:
-        save_dict["geds"] = geds
-    if ged_accuracies is not None:
-        save_dict["ged_accuracies"] = ged_accuracies
-    if accuracies is not None:
-        save_dict["accuracies"] = accuracies
-    if room_count_accuracies is not None:
-        save_dict["room_count_accuracies"] = room_count_accuracies
-    if room_type_accuracies is not None:
-        save_dict["room_type_accuracies"] = room_type_accuracies
-    if similarity_scores is not None:
-        save_dict["similarity_scores"] = similarity_scores
-    if area_proportion_errors is not None:
-        save_dict["area_proportion_errors"] = area_proportion_errors
-    if spatial_overlap_ratios is not None:
-        save_dict["spatial_overlap_ratios"] = spatial_overlap_ratios
+    for npz_key, arr in resolved.items():
+        save_dict[npz_key] = arr
+
+    collisions = set(extra) & (set(save_dict) | reserved_keys)
+    if collisions:
+        raise ValueError(
+            f"extra keys collide with metric/reserved keys: {collisions}")
     for k, v in extra.items():
-        if k not in save_dict:
-            save_dict[k] = v
+        save_dict[k] = v
 
     npz_path = os.path.join(output_dir, "results.npz")
     np.savez(npz_path, **save_dict)

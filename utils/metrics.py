@@ -420,18 +420,21 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     hypergraph dicts) and the benchmark evaluation scripts (which
     extract lists from pixel masks or polygon outputs).
 
+    The continuous definitions are always used internally:
+
+    - ``accuracy`` = ``overlap / max(|E|, |G|)``
+    - ``room_count_accuracy`` = ``min(|E|, |G|) / max(|E|, |G|)``
+    - ``room_type_accuracy`` = ``overlap / min(|E|, |G|)``
+
+    where ``overlap`` is the multiset intersection size.
+
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
-        strict: When ``True`` (default), all three accuracy values are
-            binary (1.0 for exact match, 0.0 otherwise).  When
-            ``False``, they are continuous in ``[0, 1]``:
-
-            - ``accuracy`` = ``overlap / max(|E|, |G|)``
-            - ``room_count_accuracy`` = ``min(|E|, |G|) / max(|E|, |G|)``
-            - ``room_type_accuracy`` = ``overlap / min(|E|, |G|)``
-
-            where ``overlap`` is the multiset intersection size.
+        strict: When ``True`` (default), the continuous values are
+            thresholded to binary: 1.0 if the continuous value equals
+            1.0, else 0.0.  When ``False``, the raw continuous values
+            in ``[0, 1]`` are returned.
 
     Returns:
         dict with keys:
@@ -449,28 +452,29 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     n_expected = len(expected_room_types)
     n_generated = len(generated_room_types)
 
-    room_count_match = n_expected == n_generated
-    room_types_match = expected_counter == generated_counter
-
     all_keys = set(expected_counter) | set(generated_counter)
 
+    denom = max(n_expected, n_generated)
+    if denom == 0:
+        return {
+            'accuracy': float('nan'),
+            'room_count_accuracy': float('nan'),
+            'room_type_accuracy': float('nan'),
+        }
+
+    overlap = sum(min(expected_counter[k], generated_counter[k])
+                  for k in all_keys)
+    accuracy = overlap / denom
+    rc_accuracy = min(n_expected, n_generated) / denom
+    min_count = min(n_expected, n_generated)
+    rt_accuracy = (overlap / min_count) if min_count > 0 else float('nan')
+
     if strict:
-        accuracy = 1.0 if (room_count_match and room_types_match) else 0.0
-        rc_accuracy = 1.0 if room_count_match else 0.0
-        rt_accuracy = 1.0 if room_types_match else 0.0
-    else:
-        denom = max(n_expected, n_generated)
-        if denom == 0:
-            accuracy = float('nan')
-            rc_accuracy = float('nan')
-            rt_accuracy = float('nan')
-        else:
-            overlap = sum(min(expected_counter[k], generated_counter[k])
-                          for k in all_keys)
-            accuracy = overlap / denom
-            rc_accuracy = min(n_expected, n_generated) / denom
-            min_count = min(n_expected, n_generated)
-            rt_accuracy = (overlap / min_count) if min_count > 0 else float('nan')
+        import math
+        accuracy = 1.0 if accuracy == 1.0 else 0.0
+        rc_accuracy = 1.0 if rc_accuracy == 1.0 else 0.0
+        if not math.isnan(rt_accuracy):
+            rt_accuracy = 1.0 if rt_accuracy == 1.0 else 0.0
 
     return {
         'accuracy': accuracy,

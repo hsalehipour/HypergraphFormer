@@ -72,24 +72,30 @@ def _stats(values: np.ndarray) -> dict:
 
 # ── Extract per-sample score arrays from the NPZ ────────────────────
 
-_NPZ_KEY_TO_METRIC = {
-    "geds": "ged",
-    "ged_accuracies": "ged_accuracy",
-    "accuracies": "accuracy",
-    "room_count_accuracies": "room_count_accuracy",
-    "room_type_accuracies": "room_type_accuracy",
-    "similarity_scores": "similarity",
-    "area_proportion_errors": "area_prop_err",
-    "spatial_overlap_ratios": "spatial_overlap",
+_SKIP_NPZ_KEYS = {
+    "num_variations", "summary",
+    "matched_room_pairs", "unmatched_pred_rooms", "unmatched_gt_rooms",
+    "total_samples", "hidden_count", "disconnected_count", "target_set",
 }
 
 
 def _extract_metric_arrays(npz) -> Dict[str, np.ndarray]:
-    """Return ``{metric_name: 1-D array}`` for every binnable metric."""
+    """Return ``{npz_key: 1-D array}`` for every binnable metric in the NPZ.
+
+    Any top-level key whose value is a 1-D numeric array is treated as a
+    metric.  Non-metric keys (``num_variations``, ``summary``, and
+    anything stored via *extra*) are skipped automatically.
+    """
     arrays: Dict[str, np.ndarray] = {}
-    for npz_key, metric_name in _NPZ_KEY_TO_METRIC.items():
-        if npz_key in npz:
-            arrays[metric_name] = np.array(npz[npz_key], dtype=float)
+    for key in npz.files:
+        if key in _SKIP_NPZ_KEYS:
+            continue
+        try:
+            arr = np.array(npz[key], dtype=float)
+        except (ValueError, TypeError):
+            continue
+        if arr.ndim == 1 and arr.size > 0:
+            arrays[key] = arr
     return arrays
 
 

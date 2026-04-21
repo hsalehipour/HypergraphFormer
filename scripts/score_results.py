@@ -511,40 +511,54 @@ def cli():
                 results, ground_truth, skip_ids)
 
     # ── Collect per-sample values into flat arrays for the reporter ──
-    report_kwargs: dict = {}
+    all_metrics: dict[str, tuple[str, np.ndarray]] = {}
 
     ged_result = metric_results.get("ged")
     if ged_result and ged_result["per_sample"]:
-        report_kwargs["geds"] = np.array([
-            r["ged"] if r["ged"] is not None else np.nan
-            for r in ged_result["per_sample"]
-        ])
+        all_metrics["geds"] = (
+            "GED",
+            np.array([
+                r["ged"] if r["ged"] is not None else np.nan
+                for r in ged_result["per_sample"]
+            ]),
+        )
 
     acc_result = metric_results.get("accuracy")
     if acc_result and acc_result["per_sample"]:
-        for key, kwarg in [("accuracy", "accuracies"),
-                           ("room_count_accuracy", "room_count_accuracies"),
-                           ("room_type_accuracy", "room_type_accuracies")]:
-            report_kwargs[kwarg] = np.array([
-                r[key] if r[key] is not None else np.nan
-                for r in acc_result["per_sample"]
-            ])
+        for key, npz_key, title in [
+            ("accuracy", "accuracies", "Room Accuracy"),
+            ("room_count_accuracy", "room_count_accuracies", "Room Count Accuracy"),
+            ("room_type_accuracy", "room_type_accuracies", "Room Type Accuracy"),
+        ]:
+            all_metrics[npz_key] = (
+                title,
+                np.array([
+                    r[key] if r[key] is not None else np.nan
+                    for r in acc_result["per_sample"]
+                ]),
+            )
 
     delta_result = metric_results.get("delta")
     if delta_result and delta_result["per_sample"]:
-        report_kwargs["similarity_scores"] = np.array([
-            r["delta"] if r["delta"] is not None else np.nan
-            for r in delta_result["per_sample"]
-        ])
+        all_metrics["similarity_scores"] = (
+            "Room Similarity (delta)",
+            np.array([
+                r["delta"] if r["delta"] is not None else np.nan
+                for r in delta_result["per_sample"]
+            ]),
+        )
 
     ape_result = metric_results.get("area_proportion_error")
     if ape_result and ape_result["per_sample"]:
-        report_kwargs["area_proportion_errors"] = np.array([
-            r["area_proportion_error"] if r["area_proportion_error"] is not None else np.nan
-            for r in ape_result["per_sample"]
-        ])
+        all_metrics["area_proportion_errors"] = (
+            "Area Proportion Error",
+            np.array([
+                r["area_proportion_error"] if r["area_proportion_error"] is not None else np.nan
+                for r in ape_result["per_sample"]
+            ]),
+        )
 
-    report_results(args.output_dir, **report_kwargs)
+    report_results(args.output_dir, metrics=all_metrics)
 
     return 0
 

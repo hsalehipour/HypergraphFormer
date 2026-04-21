@@ -918,6 +918,10 @@ def main():
             else:
                 G_true = nx.Graph()
             
+            gt_room_type_list = [
+                int(rt) for rt in (real_nodes + 1) if rt not in [15, 17]
+            ]
+
             # Process each variation
             for var_data in sample_data['variations']:
                 gen_masks = var_data['gen_masks']
@@ -950,7 +954,7 @@ def main():
                     except Exception as e:
                         print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                 
-                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result, overlap_ratio))
+                graphs.append((G_pred, G_true, sample_idx, var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                 
                 # Optionally save visualizations
                 if args.save_graphs and var == 0:
@@ -1015,6 +1019,10 @@ def main():
                 eds.detach().cpu().numpy(),
                 masks=None  # Use structure only for ground truth
             )
+
+            gt_room_type_list = [
+                int(rt) for rt in (real_nodes + 1) if rt not in [15, 17]
+            ]
             
             # Get unique room types for incremental generation
             _types = sorted(list(set(real_nodes)))
@@ -1060,7 +1068,7 @@ def main():
                         except Exception as e:
                             print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                     
-                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result, overlap_ratio))
+                    graphs.append((G_pred, G_true, sample_idx, var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                     
                     # Store for caching if enabled
                     if save_mode:
@@ -1127,7 +1135,7 @@ def main():
     
     results = Parallel(n_jobs=num_cores)(
         delayed(ged_between_graphs)(G_pred, G_true, _id, upper_bound=args.upper_bound)
-        for G_pred, G_true, _id, _var, _room_info, _sim_result, _area_result, _overlap in tqdm(graphs, desc="Computing GED")
+        for G_pred, G_true, _id, _var, _gt_types, _room_info, _sim_result, _area_result, _overlap in tqdm(graphs, desc="Computing GED")
     )
     
     # Collect all GED results (with NaN for failed computations to preserve structure)
@@ -1143,16 +1151,16 @@ def main():
     matched_room_pairs = []
     disconnected_count = 0
     
-    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result, area_prop_result, overlap_ratio) in zip(results, graphs):
+    for (min_dist, graph_len), (G_pred, G_true, _id, _var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio) in zip(results, graphs):
         if min_dist is not None:
             all_dists.append(min_dist)
         else:
             # Add NaN to preserve num_variations structure
             all_dists.append(np.nan)
         
-        # Compute room count and type accuracy
+        # Compute room count and type accuracy (GT vs predicted visible rooms)
         room_count_metric = room_type_accuracy(
-            room_count_info['expected_room_types'],
+            gt_room_type_list,
             room_count_info['actual_room_types']
         )
         room_count_accuracies.append(room_count_metric['accuracy'])
@@ -1175,13 +1183,15 @@ def main():
     
     report_results(
         args.out,
-        geds=np.array(all_dists),
-        accuracies=np.array(room_count_accuracies),
-        room_count_accuracies=np.array(room_count_accuracy_scores),
-        room_type_accuracies=np.array(room_type_accuracy_scores),
-        similarity_scores=np.array(similarity_scores),
-        area_proportion_errors=np.array(area_proportion_errors),
-        spatial_overlap_ratios=np.array(spatial_overlap_ratios),
+        metrics={
+            'geds': ('GED', np.array(all_dists)),
+            'accuracies': ('Room Accuracy', np.array(room_count_accuracies)),
+            'room_count_accuracies': ('Room Count Accuracy', np.array(room_count_accuracy_scores)),
+            'room_type_accuracies': ('Room Type Accuracy', np.array(room_type_accuracy_scores)),
+            'similarity_scores': ('Room Similarity (delta)', np.array(similarity_scores)),
+            'area_proportion_errors': ('Area Proportion Error', np.array(area_proportion_errors)),
+            'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(spatial_overlap_ratios)),
+        },
         num_variations=args.num_variations,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
