@@ -82,8 +82,6 @@ HypergraphFormer/
 │   │
 │   │  # Data preparation (--mode train | eval | room-lists)
 │   ├── data_preparation.py          JSON → JSONL, eval .txt, or room-list JSONs
-│   ├── data_preparation_access.py   Prepare access-graph .txt files from RPLAN
-│   │                                      dataset_access for evaluator.py
 │   │
 │   │  # Training
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
@@ -338,6 +336,15 @@ Prepare the eval-format directory (one `{id}.txt` per sample):
 python scripts/data_preparation.py --mode eval \
     --input-file dataset/hypergraph/test.json \
     --output-dir dataset/hypergraph/test
+```
+
+Optionally pass `--aggregate` to merge same-type, spatially adjacent,
+access-connected rooms into single nodes in the output access graphs:
+
+```bash
+python scripts/data_preparation.py --mode eval --aggregate \
+    --input-file dataset/hypergraph/test.json \
+    --output-dir dataset/hypergraph/test_aggregated
 ```
 
 Run evaluation (generates hypergraphs + inline scoring):
