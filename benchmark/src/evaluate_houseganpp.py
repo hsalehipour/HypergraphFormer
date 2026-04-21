@@ -6,7 +6,7 @@ Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
-  4. Area Difference -- Relative room-area error between paired rooms
+  4. Area Proportion Error -- Mean absolute area-proportion difference between paired rooms
 
 Expects an RPLAN pickle file via --data_path.  To convert from
 RPLAN JSON files, use benchmark/utils/convert_json_to_pickle.py first
@@ -33,7 +33,7 @@ import cv2
 from PIL import Image, ImageDraw
 
 from utils.metrics import ged_between_graphs, room_type_accuracy
-from utils.metrics import compute_room_area_difference_score as compute_area_diff_metric
+from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
 from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
 from benchmark.utils.score_benchmark_result import score_benchmark_result
 from houseganpp.misc.utils import _init_input
@@ -902,9 +902,9 @@ def main():
                 # Count actual rooms and get room types
                 room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                                 
-                # Compute room similarity score and area difference
+                # Compute room similarity score and area proportion error
                 similarity_result = {'similarity_score': np.nan}
-                area_diff_result = {'area_difference_score': np.nan}
+                area_prop_result = {'area_proportion_error': np.nan}
                 if raw_sample is not None:
                     try:
                         gt_masks = polygon_sample_to_masks(raw_sample, image_size=gen_masks.shape[1])
@@ -914,14 +914,14 @@ def main():
                         )
                         pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
                         gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
-                        area_diff_result = compute_area_diff_metric(
+                        area_prop_result = compute_area_prop_metric(
                             _room_geometries_to_area_tuples(pred_rooms),
                             _room_geometries_to_area_tuples(gt_rooms),
                         )
                     except Exception as e:
                         print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                 
-                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_diff_result))
+                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result))
                 
                 # Optionally save visualizations
                 if args.save_graphs and var == 0:
@@ -1010,9 +1010,9 @@ def main():
                     # Count actual rooms in generated masks (accounting for disconnected regions)
                     room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                     
-                    # Compute room similarity score and area difference
+                    # Compute room similarity score and area proportion error
                     similarity_result = {'similarity_score': np.nan}
-                    area_diff_result = {'area_difference_score': np.nan}
+                    area_prop_result = {'area_proportion_error': np.nan}
                     if raw_sample is not None:
                         try:
                             gt_masks = polygon_sample_to_masks(raw_sample, image_size=gen_masks.shape[1])
@@ -1022,14 +1022,14 @@ def main():
                             )
                             pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
                             gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
-                            area_diff_result = compute_area_diff_metric(
+                            area_prop_result = compute_area_prop_metric(
                                 _room_geometries_to_area_tuples(pred_rooms),
                                 _room_geometries_to_area_tuples(gt_rooms),
                             )
                         except Exception as e:
                             print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                     
-                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_diff_result))
+                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result))
                     
                     # Store for caching if enabled
                     if save_mode:
@@ -1105,13 +1105,13 @@ def main():
     room_count_errors = []
     room_type_errors = []
     similarity_scores = []
-    area_difference_scores = []
+    area_proportion_errors = []
     unmatched_pred_rooms = []
     unmatched_gt_rooms = []
     matched_room_pairs = []
     disconnected_count = 0
     
-    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result, area_diff_result) in zip(results, graphs):
+    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result, area_prop_result) in zip(results, graphs):
         if min_dist is not None:
             all_dists.append(min_dist)
         else:
@@ -1133,8 +1133,8 @@ def main():
         unmatched_gt_rooms.append(similarity_result['unmatched_gt'])
         matched_room_pairs.append(similarity_result['matched_pairs'])
         
-        # Collect area difference scores
-        area_difference_scores.append(area_diff_result['area_difference_score'])
+        # Collect area proportion errors
+        area_proportion_errors.append(area_prop_result['area_proportion_error'])
         
         # Track disconnected masks
         if len(room_count_info['disconnected_masks']) > 0:
@@ -1161,8 +1161,8 @@ def main():
                 'unmatched_pred_rooms': unmatched_pred_rooms,
                 'unmatched_gt_rooms': unmatched_gt_rooms,
             },
-            'area_difference': {
-                'scores': area_difference_scores,
+            'area_proportion_error': {
+                'scores': area_proportion_errors,
             },
         }
     )

@@ -3,7 +3,7 @@
 This benchmark evaluates **HouseGAN++** and **House-Diffusion** on the WMR24
 dataset.  It includes automated setup scripts, data conversion utilities, and
 evaluation pipelines with four metrics: GED, room accuracy, delta (geometric
-similarity), and area difference.
+similarity), and area proportion error.
 
 ## Table of Contents
 
@@ -94,7 +94,7 @@ computation, printing, and file output to `utils/score_benchmark_result.py`:
 | **GED** | Graph Edit Distance between predicted and ground-truth door-based access graphs. Computed with a 10 s timeout per pair; timed-out cases are recorded as NaN. |
 | **Room Count Accuracy** | Exact match rate, mean count error, and mean type error between predicted and expected room sets. |
 | **Delta (Room Similarity)** | Geometric shape similarity between matched predicted and ground-truth room pairs, based on area and perimeter ratios. |
-| **Area Difference** | Mean relative room-area error between paired predicted and ground-truth rooms of the same type. |
+| **Area Proportion Error** | Mean absolute difference between room-area proportions of paired predicted and ground-truth rooms of the same type. |
 
 All metrics are saved to `benchmark_results.npz` and optionally to a
 human-readable `benchmark_results.txt` summary.
@@ -220,7 +220,7 @@ here; no statistics are computed in the evaluation scripts themselves.
 Post-evaluation analysis that bins all available metrics by room count.
 Automatically discovers every per-sample score array in the
 `benchmark_results.npz` (GED, accuracy, count error, type error, similarity,
-area difference) and groups samples into bins (\(\leq 4\), 5, 6, 7, 8,
+area proportion error) and groups samples into bins (\(\leq 4\), 5, 6, 7, 8,
 \(> 8\) rooms).  `num_variations` is auto-detected from the NPZ when
 omitted.
 

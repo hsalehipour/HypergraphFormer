@@ -4,8 +4,8 @@ Metric functions for evaluating hypergraph generation quality.
 Provides canonical metrics:
 - GED (Graph Edit Distance): structural similarity between access graphs
 - Delta metric: shape regularity deviation between room lists
-- Area difference: relative error of **total area per canonical room type** (bathrooms summed, etc.),
-  averaged over room types present in **both** apartments only
+- Area proportion error: mean absolute difference between room-area proportions
+  (each room's area / total apartment area), paired 1-to-1 within each type
 - Room-type accuracy: multiset comparison of room types
 """
 
@@ -312,65 +312,103 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
     return sum(list_of_sigmas) / len(list_of_sigmas)
 
 
-def compute_room_area_difference_score(room_list_A, room_list_B):
-    """Compute mean relative area error between two apartment meshes.
+def compute_room_area_proportion_error(room_list_A, room_list_B, aggregate=False):
+    """Compute mean area-proportion error between two apartment meshes.
 
     Each room list is a list of ``(merge_id, area)`` tuples from
     :func:`produce_room_area_list`.
 
-    For each canonical room type (kitchen, bathroom, …), **sum** all room face
-    areas of that type in each apartment, then take
-    ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
-    apartments. Types present in only one apartment are tracked as unmatched.
-    The score is the mean of those relative errors over matching types.
+    Proportions are computed as ``area_i / total_area`` for each room (or
+    room-type sum when *aggregate* is True).  The error is the mean of
+    ``|prop_pred_i - prop_gt_i|`` and is bounded in ``[0, 1]``.
+
+    Args:
+        room_list_A: Predicted rooms -- ``[(merge_id, area), ...]``.
+        room_list_B: Ground-truth rooms -- ``[(merge_id, area), ...]``.
+        aggregate: If ``True``, sum all room areas per canonical type before
+            computing proportions (one term per type).  If ``False``
+            (default), keep individual rooms: within each canonical type,
+            rooms are sorted by area and paired 1-to-1; unmatched rooms
+            on either side contribute their full proportion as error.
 
     Returns:
         dict with keys:
 
-        - ``area_difference_score`` (float): mean relative error (NaN if
-          no comparable types).
-        - ``matched_types`` (int): number of room types compared.
-        - ``unmatched_pred`` (int): room types in pred only.
-        - ``unmatched_gt`` (int): room types in GT only.
-        - ``per_type_scores`` (list[float]): per-type relative errors.
-        - ``skipped_types_pred`` (list[str]): type keys present only in pred.
-        - ``skipped_types_gt`` (list[str]): type keys present only in GT.
+        - ``area_proportion_error`` (float): mean absolute proportion
+          error (NaN if both apartments have zero total area).
+        - ``num_terms`` (int): number of proportion-error terms averaged.
+        - ``per_term_errors`` (list[float]): individual absolute
+          proportion errors.
+        - ``types_only_in_pred`` (list[str]): canonical type keys present
+          only in pred.
+        - ``types_only_in_gt`` (list[str]): canonical type keys present
+          only in GT.
     """
     import numpy as np
+    from collections import defaultdict
 
-    sums_A = _aggregate_area_by_room_type(room_list_A)
-    sums_B = _aggregate_area_by_room_type(room_list_B)
+    total_A = sum(area for _, area in room_list_A)
+    total_B = sum(area for _, area in room_list_B)
 
-    common_types = set(sums_A.keys()) & set(sums_B.keys())
-    only_in_A = set(sums_A.keys()) - set(sums_B.keys())
-    only_in_B = set(sums_B.keys()) - set(sums_A.keys())
-
-    per_type_scores = []
-    for category in sorted(common_types):
-        area_A = sums_A[category]
-        area_B = sums_B[category]
-        if area_B == 0:
-            continue
-        per_type_scores.append(abs(area_A - area_B) / area_B)
-
-    if len(per_type_scores) == 0:
+    if total_A == 0 and total_B == 0:
         warnings.warn(
-            "compute_room_area_difference_score: no comparable room types with "
-            "nonzero GT area (empty sigmas); returning nan",
+            "compute_room_area_proportion_error: both apartments have zero "
+            "total area; returning nan",
             stacklevel=2,
         )
-        avg_error = float('nan')
+        return {
+            'area_proportion_error': float('nan'),
+            'num_terms': 0,
+            'per_term_errors': [],
+            'types_only_in_pred': [],
+            'types_only_in_gt': [],
+        }
+
+    if aggregate:
+        sums_A = _aggregate_area_by_room_type(room_list_A)
+        sums_B = _aggregate_area_by_room_type(room_list_B)
+
+        all_types = sorted(set(sums_A.keys()) | set(sums_B.keys()))
+        only_in_A = sorted(set(sums_A.keys()) - set(sums_B.keys()))
+        only_in_B = sorted(set(sums_B.keys()) - set(sums_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            prop_A = sums_A.get(category, 0.0) / total_A if total_A > 0 else 0.0
+            prop_B = sums_B.get(category, 0.0) / total_B if total_B > 0 else 0.0
+            per_term_errors.append(abs(prop_A - prop_B))
     else:
-        avg_error = float(np.mean(per_type_scores))
+        rooms_A: defaultdict[str, list[float]] = defaultdict(list)
+        rooms_B: defaultdict[str, list[float]] = defaultdict(list)
+        for merge_id, area in room_list_A:
+            rooms_A[_canonical_room_type_key(merge_id)].append(float(area))
+        for merge_id, area in room_list_B:
+            rooms_B[_canonical_room_type_key(merge_id)].append(float(area))
+
+        all_types = sorted(set(rooms_A.keys()) | set(rooms_B.keys()))
+        only_in_A = sorted(set(rooms_A.keys()) - set(rooms_B.keys()))
+        only_in_B = sorted(set(rooms_B.keys()) - set(rooms_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            areas_a = sorted(rooms_A.get(category, []), reverse=True)
+            areas_b = sorted(rooms_B.get(category, []), reverse=True)
+            n = max(len(areas_a), len(areas_b))
+            for i in range(n):
+                a = areas_a[i] if i < len(areas_a) else 0.0
+                b = areas_b[i] if i < len(areas_b) else 0.0
+                prop_a = a / total_A if total_A > 0 else 0.0
+                prop_b = b / total_B if total_B > 0 else 0.0
+                per_term_errors.append(abs(prop_a - prop_b))
+
+    avg_error = float(np.mean(per_term_errors)) if per_term_errors else float('nan')
 
     return {
-        'area_difference_score': avg_error,
-        'matched_types': len(per_type_scores),
-        'unmatched_pred': len(only_in_A),
-        'unmatched_gt': len(only_in_B),
-        'per_type_scores': per_type_scores,
-        'skipped_types_pred': sorted(only_in_A),
-        'skipped_types_gt': sorted(only_in_B),
+        'area_proportion_error': avg_error,
+        'num_terms': len(per_term_errors),
+        'per_term_errors': per_term_errors,
+        'types_only_in_pred': only_in_A,
+        'types_only_in_gt': only_in_B,
     }
 
 

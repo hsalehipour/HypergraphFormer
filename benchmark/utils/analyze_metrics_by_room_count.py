@@ -5,7 +5,7 @@ Analyze benchmark metrics binned by room count.
 Reads a cached-generations pickle (for ground-truth room types) and the
 ``benchmark_results.npz`` produced by ``score_benchmark_result.py``.
 Every per-sample array found in the NPZ (GED, accuracy, similarity,
-area difference, …) is grouped into room-count bins and reported.
+area proportion error, …) is grouped into room-count bins and reported.
 
 Room-count bins: <=4, 5, 6, 7, 8, >8
 
@@ -93,9 +93,9 @@ def _extract_metric_arrays(npz) -> Dict[str, np.ndarray]:
     if rs and isinstance(rs, dict) and "all_scores" in rs:
         arrays["similarity"] = np.array(rs["all_scores"], dtype=float)
 
-    ad = npz["area_difference"].item() if "area_difference" in npz else None
+    ad = npz["area_proportion_error"].item() if "area_proportion_error" in npz else None
     if ad and isinstance(ad, dict) and "all_scores" in ad:
-        arrays["area_diff"] = np.array(ad["all_scores"], dtype=float)
+        arrays["area_prop_err"] = np.array(ad["all_scores"], dtype=float)
 
     return arrays
 

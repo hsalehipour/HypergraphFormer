@@ -6,7 +6,7 @@ Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
-  4. Area Difference -- Relative room-area error between paired rooms
+  4. Area Proportion Error -- Mean absolute area-proportion difference between paired rooms
 
 Expects a pre-processed NPZ file via --data_path.  To convert from
 RPLAN JSON files, use benchmark/utils/convert_json_to_npz.py first
@@ -32,7 +32,7 @@ import pickle
 
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
-from utils.metrics import compute_room_area_difference_score as compute_area_diff_metric
+from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
 from benchmark.src.evaluate_houseganpp import draw_masks
 from benchmark.utils.score_benchmark_result import score_benchmark_result
 from house_diffusion.script_util import (
@@ -943,7 +943,7 @@ def _make_results_dict():
         'room_count_errors': [],
         'room_type_errors': [],
         'similarity_scores': [],
-        'area_difference_scores': [],
+        'area_proportion_errors': [],
         'unmatched_pred_rooms': [],
         'unmatched_gt_rooms': [],
         'matched_room_pairs': [],
@@ -1059,11 +1059,11 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
 
         pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
         gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
-        area_diff_result = compute_area_diff_metric(
+        area_prop_result = compute_area_prop_metric(
             _room_geometries_to_area_tuples(pred_rooms),
             _room_geometries_to_area_tuples(gt_rooms),
         )
-        results['area_difference_scores'].append(area_diff_result['area_difference_score'])
+        results['area_proportion_errors'].append(area_prop_result['area_proportion_error'])
 
         results['ged_pairs'].append(
             (G_pred, G_true, sample_idx, ged_upper_bound)
@@ -1133,8 +1133,8 @@ def _build_additional_info(results):
             'unmatched_pred_rooms': results['unmatched_pred_rooms'],
             'unmatched_gt_rooms': results['unmatched_gt_rooms'],
         },
-        'area_difference': {
-            'scores': results['area_difference_scores'],
+        'area_proportion_error': {
+            'scores': results['area_proportion_errors'],
         },
     }
     

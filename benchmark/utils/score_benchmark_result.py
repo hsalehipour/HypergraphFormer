@@ -13,7 +13,7 @@ Metrics handled:
   type-error arrays plus a disconnected/hidden count.
 - **Room Similarity (delta)** -- per-sample scores with optional
   room-matching metadata (unmatched counts, matched pairs).
-- **Area Difference** -- per-sample relative room-area error scores.
+- **Area Proportion Error** -- per-sample area-proportion error scores.
 """
 
 import os
@@ -264,7 +264,7 @@ def score_benchmark_result(all_geds, num_variations, output_dir,
                 ``unmatched_gt_rooms``.
                 **Or** a pre-computed summary dict.
 
-            ``area_difference``
+            ``area_proportion_error``
                 Dict with list ``scores``.
                 **Or** a pre-computed summary dict.
 
@@ -337,7 +337,7 @@ def score_benchmark_result(all_geds, num_variations, output_dir,
     else:
         rs = raw_rs
 
-    raw_ad = additional_info.get("area_difference")
+    raw_ad = additional_info.get("area_proportion_error")
     if raw_ad and "scores" in raw_ad:
         ad = _summarise_scores(raw_ad["scores"], num_variations)
     else:
@@ -347,7 +347,7 @@ def score_benchmark_result(all_geds, num_variations, output_dir,
     _print_room_count(rc)
     _print_metric("Room Similarity (delta)", rs,
                   extra_lines=_similarity_extras(rs) if rs else None)
-    _print_metric("Area Difference (relative room-area error)", ad)
+    _print_metric("Area Proportion Error", ad)
 
     # ── Save NPZ ─────────────────────────────────────────────────────
     results_file = os.path.join(output_dir, "benchmark_results.npz")
@@ -365,9 +365,9 @@ def score_benchmark_result(all_geds, num_variations, output_dir,
     if rs is not None:
         save_dict["room_similarity"] = rs
     if ad is not None:
-        save_dict["area_difference"] = ad
+        save_dict["area_proportion_error"] = ad
     for k, v in additional_info.items():
-        if k not in ("room_count_accuracy", "room_similarity", "area_difference"):
+        if k not in ("room_count_accuracy", "room_similarity", "area_proportion_error"):
             save_dict[k] = v
 
     np.savez(results_file, **save_dict)
@@ -400,7 +400,7 @@ def score_benchmark_result(all_geds, num_variations, output_dir,
 
             _write_room_count(f, rc)
             _write_metric(f, "Room Similarity (delta)", rs)
-            _write_metric(f, "Area Difference", ad)
+            _write_metric(f, "Area Proportion Error", ad)
 
         print(f"  Summary saved to: {text_file}")
 

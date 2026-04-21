@@ -7,7 +7,7 @@ Available metrics:
     ged       -- Graph Edit Distance between access graphs
     accuracy  -- Room-type multiset matching (bucketed by room count)
     delta     -- Shape regularity deviation via RGL mesh comparison
-    area_difference -- Relative area error aggregated per room type (see metrics)
+    area_proportion_error -- Area proportion error per room type (see metrics)
 
 Usage:
     # All metrics
@@ -68,7 +68,7 @@ from tqdm import tqdm
 
 from utils import (
     bucketed_room_accuracy,
-    compute_room_area_difference_score,
+    compute_room_area_proportion_error,
     compute_room_similarity_score,
     produce_room_area_list,
     produce_room_list,
@@ -77,7 +77,7 @@ from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_difference")
+AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_proportion_error")
 
 
 # ===================================================================
@@ -353,21 +353,22 @@ def score_delta(results, ground_truth, skip_ids):
 
 
 # ===================================================================
-# Metric: Area difference
+# Metric: Area proportion error
 # ===================================================================
 
-def score_area_difference(results, ground_truth, skip_ids):
-    """Compute relative area error for every sample (aggregated per room type).
+def score_area_proportion_error(results, ground_truth, skip_ids):
+    """Compute area-proportion error for every sample.
 
-    Uses :func:`utils.metrics.compute_room_area_difference_score`: areas are summed
-    per canonical room type in pred vs GT mesh; only types present in both are
-    compared; mean relative error ``abs(A - B) / B`` over those types.
+    Uses :func:`utils.metrics.compute_room_area_proportion_error`: each room's
+    area is converted to a proportion of total apartment area, rooms are paired
+    1-to-1 within each type, and the mean absolute proportion difference is
+    returned.
     """
     per_sample = []
     skipped = 0
     errors = 0
 
-    for sample_id in tqdm(results, desc="Computing area_difference", unit="sample"):
+    for sample_id in tqdm(results, desc="Computing area_proportion_error", unit="sample"):
         if sample_id in skip_ids:
             skipped += 1
             continue
@@ -379,21 +380,21 @@ def score_area_difference(results, ground_truth, skip_ids):
             bounds = gt["bounds"]
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
             gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
-            result = compute_room_area_difference_score(
+            result = compute_room_area_proportion_error(
                 produce_room_area_list(gen_mesh),
                 produce_room_area_list(gt_mesh),
             )
             per_sample.append({
                 "sample_id": sample_id,
-                "area_difference": result['area_difference_score'],
-                "area_difference_detail": result,
+                "area_proportion_error": result['area_proportion_error'],
+                "area_proportion_error_detail": result,
             })
         except Exception as e:
-            logger.warning(f"Area difference failed for {sample_id}: {e}")
-            per_sample.append({"sample_id": sample_id, "area_difference": None, "error": str(e)})
+            logger.warning(f"Area proportion error failed for {sample_id}: {e}")
+            per_sample.append({"sample_id": sample_id, "area_proportion_error": None, "error": str(e)})
             errors += 1
 
-    values = [r["area_difference"] for r in per_sample if r["area_difference"] is not None]
+    values = [r["area_proportion_error"] for r in per_sample if r["area_proportion_error"] is not None]
     summary = {
         "mean": sum(values) / len(values) if values else float("nan"),
         "successful": len(values),
@@ -458,10 +459,10 @@ def _print_delta_report(result, summary_only):
         print(f"  Errors:     {s['errors']}")
 
 
-def _print_area_difference_report(result, summary_only):
+def _print_area_proportion_error_report(result, summary_only):
     s = result["summary"]
     print(f"\n{'=' * 70}")
-    print("AREA DIFFERENCE (Relative Room-Area Error)")
+    print("AREA PROPORTION ERROR")
     print(f"{'=' * 70}")
     print(f"  Mean:       {s['mean']:.4f}")
     print(f"  Successful: {s['successful']}/{s['total']}")
@@ -474,7 +475,7 @@ _REPORT_PRINTERS = {
     "ged": _print_ged_report,
     "accuracy": _print_accuracy_report,
     "delta": _print_delta_report,
-    "area_difference": _print_area_difference_report,
+    "area_proportion_error": _print_area_proportion_error_report,
 }
 
 
@@ -488,7 +489,7 @@ def write_csv(path, metric_results, results_keys):
     Columns: ``sample_id`` + one column per metric that has per-sample data.
     """
     col_map = {}
-    for name in ("ged", "delta", "area_difference"):
+    for name in ("ged", "delta", "area_proportion_error"):
         if name in metric_results and metric_results[name]["per_sample"]:
             col_map[name] = {
                 r["sample_id"]: r.get(name)
@@ -542,7 +543,7 @@ def cli():
     parser.add_argument(
         "--metrics", nargs="+", required=True,
         choices=AVAILABLE_METRICS,
-        help="Metrics to compute (ged, accuracy, delta, area_difference)",
+        help="Metrics to compute (ged, accuracy, delta, area_proportion_error)",
     )
     parser.add_argument(
         "--correct-accessgraph",
@@ -617,8 +618,8 @@ def cli():
             )
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
-        elif metric == "area_difference":
-            metric_results["area_difference"] = score_area_difference(results, ground_truth, skip_ids)
+        elif metric == "area_proportion_error":
+            metric_results["area_proportion_error"] = score_area_proportion_error(results, ground_truth, skip_ids)
 
     for metric in args.metrics:
         print_report(metric, metric_results[metric], args.summary_only)
