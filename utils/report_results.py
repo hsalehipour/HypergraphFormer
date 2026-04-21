@@ -204,9 +204,12 @@ def report_results(
     summary: dict = {}
     metric_entries: list[tuple[str, str, np.ndarray]] = []
 
+    ged_accuracies = None
     if geds is not None:
         geds = np.asarray(geds, dtype=float)
         metric_entries.append(("geds", "GED", geds))
+        ged_accuracies = np.where(np.isnan(geds), np.nan,
+                                  (geds == 0).astype(float))
     if accuracies is not None:
         accuracies = np.asarray(accuracies, dtype=float)
     if room_count_accuracies is not None:
@@ -228,6 +231,9 @@ def report_results(
         vs = _variation_std(arr, num_variations)
         if vs is not None:
             summary[npz_key]["std_of_variation_means"] = vs
+
+    if ged_accuracies is not None:
+        summary["ged_accuracies"] = _stats(ged_accuracies)
 
     rc_summary = None
     if (accuracies is not None and room_count_accuracies is not None
@@ -275,6 +281,10 @@ def report_results(
         if vs is not None:
             cv = (vs / st["mean"] * 100) if st["mean"] else 0
             _line(f"  Std (variation means): {_safe(vs)}  (CV: {cv:.2f}%)")
+        ga_st = summary.get("ged_accuracies")
+        if ga_st and ga_st.get("mean") is not None:
+            _line(f"  GED Accuracy (GED=0 rate): {ga_st['mean'] * 100:.1f}%"
+                  f"  ({ga_st['n_valid']} valid samples)")
 
     # Room accuracies
     if rc_summary:
@@ -300,6 +310,8 @@ def report_results(
     save_dict: dict = {"num_variations": num_variations, "summary": summary}
     if geds is not None:
         save_dict["geds"] = geds
+    if ged_accuracies is not None:
+        save_dict["ged_accuracies"] = ged_accuracies
     if accuracies is not None:
         save_dict["accuracies"] = accuracies
     if room_count_accuracies is not None:
