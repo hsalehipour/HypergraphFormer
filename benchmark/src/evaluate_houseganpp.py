@@ -291,6 +291,33 @@ def extract_room_geometries_from_masks(nodes, masks):
     return room_geometries
 
 
+def compute_spatial_overlap_ratio_from_masks(nodes, masks):
+    """Fraction of total room area that overlaps with other rooms (mask-based).
+
+    Args:
+        nodes: Array of room types (0-indexed from one-hot).
+        masks: Generated masks ``[num_masks, H, W]``.
+
+    Returns:
+        float in ``[0, 1]``, or ``nan`` if no room pixels exist.
+    """
+    room_types = nodes + 1
+    binary_masks = []
+    for k, room_type in enumerate(room_types):
+        if room_type not in [15, 17]:
+            binary_masks.append(masks[k] > 0)
+    if not binary_masks:
+        return float('nan')
+    sum_of_areas = sum(int(np.count_nonzero(m)) for m in binary_masks)
+    if sum_of_areas == 0:
+        return float('nan')
+    union_mask = np.zeros_like(binary_masks[0], dtype=bool)
+    for m in binary_masks:
+        union_mask |= m
+    union_area = int(np.count_nonzero(union_mask))
+    return 1.0 - (union_area / sum_of_areas)
+
+
 def compute_room_similarity_score(pred_nodes, pred_masks, gt_nodes, gt_masks):
     """
     Compute room similarity score based on geometric properties.
@@ -902,6 +929,8 @@ def main():
                 # Count actual rooms and get room types
                 room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                                 
+                overlap_ratio = compute_spatial_overlap_ratio_from_masks(real_nodes, gen_masks)
+
                 # Compute room similarity score and area proportion error
                 similarity_result = {'similarity_score': np.nan}
                 area_prop_result = {'area_proportion_error': np.nan}
@@ -921,7 +950,7 @@ def main():
                     except Exception as e:
                         print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                 
-                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result))
+                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                 
                 # Optionally save visualizations
                 if args.save_graphs and var == 0:
@@ -1010,6 +1039,8 @@ def main():
                     # Count actual rooms in generated masks (accounting for disconnected regions)
                     room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                     
+                    overlap_ratio = compute_spatial_overlap_ratio_from_masks(real_nodes, gen_masks)
+
                     # Compute room similarity score and area proportion error
                     similarity_result = {'similarity_score': np.nan}
                     area_prop_result = {'area_proportion_error': np.nan}
@@ -1029,7 +1060,7 @@ def main():
                         except Exception as e:
                             print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                     
-                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result))
+                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                     
                     # Store for caching if enabled
                     if save_mode:
@@ -1096,7 +1127,7 @@ def main():
     
     results = Parallel(n_jobs=num_cores)(
         delayed(ged_between_graphs)(G_pred, G_true, _id, upper_bound=args.upper_bound)
-        for G_pred, G_true, _id, _var, _room_info, _sim_result, _area_result in tqdm(graphs, desc="Computing GED")
+        for G_pred, G_true, _id, _var, _room_info, _sim_result, _area_result, _overlap in tqdm(graphs, desc="Computing GED")
     )
     
     # Collect all GED results (with NaN for failed computations to preserve structure)
@@ -1106,12 +1137,13 @@ def main():
     room_type_accuracy_scores = []
     similarity_scores = []
     area_proportion_errors = []
+    spatial_overlap_ratios = []
     unmatched_pred_rooms = []
     unmatched_gt_rooms = []
     matched_room_pairs = []
     disconnected_count = 0
     
-    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result, area_prop_result) in zip(results, graphs):
+    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result, area_prop_result, overlap_ratio) in zip(results, graphs):
         if min_dist is not None:
             all_dists.append(min_dist)
         else:
@@ -1133,8 +1165,9 @@ def main():
         unmatched_gt_rooms.append(similarity_result['unmatched_gt'])
         matched_room_pairs.append(similarity_result['matched_pairs'])
         
-        # Collect area proportion errors
+        # Collect area proportion errors and spatial overlap
         area_proportion_errors.append(area_prop_result['area_proportion_error'])
+        spatial_overlap_ratios.append(overlap_ratio)
         
         # Track disconnected masks
         if len(room_count_info['disconnected_masks']) > 0:
@@ -1148,6 +1181,7 @@ def main():
         room_type_accuracies=np.array(room_type_accuracy_scores),
         similarity_scores=np.array(similarity_scores),
         area_proportion_errors=np.array(area_proportion_errors),
+        spatial_overlap_ratios=np.array(spatial_overlap_ratios),
         num_variations=args.num_variations,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,

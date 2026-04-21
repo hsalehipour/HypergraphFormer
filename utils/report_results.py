@@ -168,6 +168,7 @@ def report_results(
     room_type_accuracies: np.ndarray | None = None,
     similarity_scores: np.ndarray | None = None,
     area_proportion_errors: np.ndarray | None = None,
+    spatial_overlap_ratios: np.ndarray | None = None,
     num_variations: int = 1,
     checkpoint_path: str | None = None,
     data_path: str | None = None,
@@ -186,6 +187,7 @@ def report_results(
         room_type_accuracies: Per-sample room-type-set accuracy.
         similarity_scores: Per-sample delta / room-similarity scores.
         area_proportion_errors: Per-sample area-proportion error.
+        spatial_overlap_ratios: Per-sample spatial overlap ratio (pred only).
         num_variations: Generation variations per sample (default 1).
         checkpoint_path: Included in TXT header when provided.
         data_path: Included in TXT header when provided.
@@ -225,6 +227,11 @@ def report_results(
         metric_entries.append(
             ("area_proportion_errors", "Area Proportion Error",
              area_proportion_errors))
+    if spatial_overlap_ratios is not None:
+        spatial_overlap_ratios = np.asarray(spatial_overlap_ratios, dtype=float)
+        metric_entries.append(
+            ("spatial_overlap_ratios", "Spatial Overlap Ratio",
+             spatial_overlap_ratios))
 
     for npz_key, _, arr in metric_entries:
         summary[npz_key] = _stats(arr)
@@ -322,6 +329,8 @@ def report_results(
         save_dict["similarity_scores"] = similarity_scores
     if area_proportion_errors is not None:
         save_dict["area_proportion_errors"] = area_proportion_errors
+    if spatial_overlap_ratios is not None:
+        save_dict["spatial_overlap_ratios"] = spatial_overlap_ratios
     for k, v in extra.items():
         if k not in save_dict:
             save_dict[k] = v

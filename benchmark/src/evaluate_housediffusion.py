@@ -341,6 +341,35 @@ def extract_room_geometries_from_polygons(polygons):
     return room_geometries
 
 
+def compute_spatial_overlap_ratio_from_polygons(polygons):
+    """Spatial overlap ratio for predicted polygons (Shapely-based).
+
+    Returns ``1 - (union_area / sum_of_areas)`` over all room polygons
+    (skipping doors), or ``nan`` if no valid room area exists.
+    """
+    from shapely.ops import unary_union
+
+    shapely_polys = []
+    for poly_data in polygons:
+        if poly_data['room_type'] in [15, 17]:
+            continue
+        try:
+            sp = ShapelyPolygon(poly_data['coords'])
+            if not sp.is_valid:
+                sp = make_valid(sp)
+            if sp.area > 0:
+                shapely_polys.append(sp)
+        except Exception:
+            continue
+    if not shapely_polys:
+        return float('nan')
+    sum_of_areas = sum(p.area for p in shapely_polys)
+    if sum_of_areas == 0:
+        return float('nan')
+    union = unary_union(shapely_polys)
+    return 1.0 - (union.area / sum_of_areas)
+
+
 def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
     """
     Compute room similarity score using polygon-based representation.
@@ -944,6 +973,7 @@ def _make_results_dict():
         'room_type_accuracy_scores': [],
         'similarity_scores': [],
         'area_proportion_errors': [],
+        'spatial_overlap_ratios': [],
         'unmatched_pred_rooms': [],
         'unmatched_gt_rooms': [],
         'matched_room_pairs': [],
@@ -1065,6 +1095,9 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
         )
         results['area_proportion_errors'].append(area_prop_result['area_proportion_error'])
 
+        results['spatial_overlap_ratios'].append(
+            compute_spatial_overlap_ratio_from_polygons(pred_polygons))
+
         results['ged_pairs'].append(
             (G_pred, G_true, sample_idx, ged_upper_bound)
         )
@@ -1125,6 +1158,7 @@ def _build_report_kwargs(results):
         'room_type_accuracies': np.array(results['room_type_accuracy_scores']),
         'similarity_scores': np.array(results['similarity_scores']),
         'area_proportion_errors': np.array(results['area_proportion_errors']),
+        'spatial_overlap_ratios': np.array(results['spatial_overlap_ratios']),
         'extra': {
             'hidden_count': results['hidden_room_count'],
             'total_samples': len(results['room_count_accuracies']),

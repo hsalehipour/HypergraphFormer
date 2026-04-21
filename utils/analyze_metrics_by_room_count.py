@@ -80,6 +80,7 @@ _NPZ_KEY_TO_METRIC = {
     "room_type_accuracies": "room_type_accuracy",
     "similarity_scores": "similarity",
     "area_proportion_errors": "area_prop_err",
+    "spatial_overlap_ratios": "spatial_overlap",
 }
 
 
