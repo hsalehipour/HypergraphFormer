@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw
 from utils.metrics import ged_between_graphs, room_type_accuracy
 from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
 from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
-from benchmark.utils.score_benchmark_result import score_benchmark_result
+from utils.report_results import report_results
 from houseganpp.misc.utils import _init_input
 from houseganpp.models.models import Generator
 
@@ -1140,31 +1140,25 @@ def main():
         if len(room_count_info['disconnected_masks']) > 0:
             disconnected_count += 1
     
-    score_benchmark_result(
-        all_geds=np.array(all_dists),
+    report_results(
+        args.out,
+        geds=np.array(all_dists),
+        accuracies=np.array(room_count_accuracies),
+        count_errors=np.array(room_count_errors),
+        type_errors=np.array(room_type_errors),
+        similarity_scores=np.array(similarity_scores),
+        area_proportion_errors=np.array(area_proportion_errors),
         num_variations=args.num_variations,
-        output_dir=args.out,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
-        additional_info={
+        extra={
             'target_set': args.target_set,
-            'room_count_accuracy': {
-                'accuracies': room_count_accuracies,
-                'count_errors': room_count_errors,
-                'type_errors': room_type_errors,
-                'disconnected_count': disconnected_count,
-                'total_samples': len(graphs),
-            },
-            'room_similarity': {
-                'scores': similarity_scores,
-                'matched_room_pairs': matched_room_pairs,
-                'unmatched_pred_rooms': unmatched_pred_rooms,
-                'unmatched_gt_rooms': unmatched_gt_rooms,
-            },
-            'area_proportion_error': {
-                'scores': area_proportion_errors,
-            },
-        }
+            'disconnected_count': disconnected_count,
+            'total_samples': len(graphs),
+            'matched_room_pairs': matched_room_pairs,
+            'unmatched_pred_rooms': unmatched_pred_rooms,
+            'unmatched_gt_rooms': unmatched_gt_rooms,
+        },
     )
 
 

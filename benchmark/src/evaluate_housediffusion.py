@@ -34,7 +34,7 @@ from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
 from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
 from benchmark.src.evaluate_houseganpp import draw_masks
-from benchmark.utils.score_benchmark_result import score_benchmark_result
+from utils.report_results import report_results
 from house_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -1117,24 +1117,20 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
     results['all_geds'] = _parallel_ged(results['ged_pairs'])
     return results
 
-def _build_additional_info(results):
-    """Package raw per-sample arrays for ``score_benchmark_result``."""
+def _build_report_kwargs(results):
+    """Package raw per-sample arrays as keyword args for ``report_results``."""
     return {
-        'room_count_accuracy': {
-            'accuracies': results['room_count_accuracies'],
-            'count_errors': results['room_count_errors'],
-            'type_errors': results['room_type_errors'],
+        'accuracies': np.array(results['room_count_accuracies']),
+        'count_errors': np.array(results['room_count_errors']),
+        'type_errors': np.array(results['room_type_errors']),
+        'similarity_scores': np.array(results['similarity_scores']),
+        'area_proportion_errors': np.array(results['area_proportion_errors']),
+        'extra': {
             'hidden_count': results['hidden_room_count'],
             'total_samples': len(results['room_count_accuracies']),
-        },
-        'room_similarity': {
-            'scores': results['similarity_scores'],
             'matched_room_pairs': results['matched_room_pairs'],
             'unmatched_pred_rooms': results['unmatched_pred_rooms'],
             'unmatched_gt_rooms': results['unmatched_gt_rooms'],
-        },
-        'area_proportion_error': {
-            'scores': results['area_proportion_errors'],
         },
     }
     
@@ -1438,13 +1434,13 @@ def main():
 
         results['all_geds'] = _parallel_ged(results['ged_pairs'])
     
-    score_benchmark_result(
-        all_geds=np.array(results['all_geds']),
+    report_results(
+        args.out,
+        geds=np.array(results['all_geds']),
         num_variations=args.num_variations,
-        output_dir=args.out,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
-        additional_info=_build_additional_info(results),
+        **_build_report_kwargs(results),
     )
     
     return 0

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Score saved inference results against ground truth using metrics from
-``utils/metrics.py``.
+``utils/metrics.py``, then write unified NPZ + TXT reports via
+``utils.report_results``.
 
 Available metrics:
     ged       -- Graph Edit Distance between access graphs
@@ -14,18 +15,21 @@ Usage:
     python scripts/score_results.py \\
         --results-file checkpoints/model/test_hypergraphs.json \\
         --test-dir dataset/hypergraph/test \\
-        --metrics ged accuracy delta
+        --output-dir checkpoints/model/eval \\
+        --metrics ged accuracy delta area_proportion_error
 
     # Just GED
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
+        --output-dir eval_output \\
         --metrics ged
 
     # GED with corrected accessgraph (mesh-adjacency corrected)
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
+        --output-dir eval_output \\
         --metrics ged \\
         --correct-accessgraph
 
@@ -33,28 +37,14 @@ Usage:
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
+        --output-dir eval_output \\
         --metrics accuracy \\
         --buckets '<=4' 5 6 7 8 '>=9'
-
-    # Delta with CSV output
-    python scripts/score_results.py \\
-        --results-file results.json \\
-        --test-dir dataset/hypergraph/test \\
-        --metrics delta \\
-        --output-csv delta_scores.csv
-
-    # Summary-only (machine-readable, for scripting)
-    python scripts/score_results.py \\
-        --results-file results.json \\
-        --test-dir dataset/hypergraph/test \\
-        --metrics ged accuracy \\
-        --summary-only
 """
 
 from __future__ import annotations
 
 import copy
-import csv
 import json
 import logging
 import re
@@ -64,6 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 from utils import (
@@ -74,6 +65,7 @@ from utils import (
     produce_room_list,
 )
 from utils.hypergraph import Hypergraph
+from utils.report_results import report_results
 
 logger = logging.getLogger(__name__)
 
@@ -406,122 +398,12 @@ def score_area_proportion_error(results, ground_truth, skip_ids):
 
 
 # ===================================================================
-# Reporting
-# ===================================================================
-
-def _print_ged_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("GED (Graph Edit Distance)")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.2f}")
-    print(f"  Min:        {s['min']:.2f}")
-    print(f"  Max:        {s['max']:.2f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-
-
-def _print_accuracy_report(result, summary_only):
-    stats = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("ACCURACY BY NUMBER OF ROOMS")
-    print(f"{'=' * 70}\n")
-    print(f"{'Category':<12} {'Matches':<10} {'Total':<10} {'Accuracy'}")
-    print(f"{'-' * 70}")
-
-    for label in stats["category_order"]:
-        cat = stats["categories"][label]
-        if cat["total"] > 0:
-            acc = cat["matches"] / cat["total"] * 100
-            print(f"{label:<12} {cat['matches']:<10} {cat['total']:<10} {acc:>6.1f}%")
-        else:
-            print(f"{label:<12} {cat['matches']:<10} {cat['total']:<10} {'N/A':>6}")
-
-    print(f"{'-' * 70}")
-    if stats["overall_total"] > 0:
-        overall = stats["overall_matches"] / stats["overall_total"] * 100
-        print(
-            f"{'Overall':<12} {stats['overall_matches']:<10} "
-            f"{stats['overall_total']:<10} {overall:>6.1f}%"
-        )
-    print(f"  Excluded:   {stats['skipped']}")
-
-
-def _print_delta_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("DELTA (Shape Regularity)")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.4f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-    if s["errors"]:
-        print(f"  Errors:     {s['errors']}")
-
-
-def _print_area_proportion_error_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("AREA PROPORTION ERROR")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.4f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-    if s["errors"]:
-        print(f"  Errors:     {s['errors']}")
-
-
-_REPORT_PRINTERS = {
-    "ged": _print_ged_report,
-    "accuracy": _print_accuracy_report,
-    "delta": _print_delta_report,
-    "area_proportion_error": _print_area_proportion_error_report,
-}
-
-
-def print_report(metric_name, result, summary_only=False):
-    _REPORT_PRINTERS[metric_name](result, summary_only)
-
-
-def write_csv(path, metric_results, results_keys):
-    """Write a combined CSV with one row per sample.
-
-    Columns: ``sample_id`` + one column per metric that has per-sample data.
-    """
-    col_map = {}
-    for name in ("ged", "delta", "area_proportion_error"):
-        if name in metric_results and metric_results[name]["per_sample"]:
-            col_map[name] = {
-                r["sample_id"]: r.get(name)
-                for r in metric_results[name]["per_sample"]
-            }
-
-    if not col_map:
-        logger.info("No per-sample data to write to CSV.")
-        return
-
-    fieldnames = ["sample_id"] + list(col_map.keys())
-    path = Path(path)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for sid in results_keys:
-            row = {"sample_id": sid}
-            for metric_name, lookup in col_map.items():
-                row[metric_name] = lookup.get(sid)
-            writer.writerow(row)
-
-    logger.info(f"CSV written to {path}")
-
-
-# ===================================================================
 # CLI
 # ===================================================================
 
 def cli():
     import argparse
 
-    # Worker mode: re-invoked as subprocess to compute GED for a single sample.
     if "--_ged-worker" in sys.argv:
         sys.exit(_ged_worker_main())
 
@@ -539,6 +421,10 @@ def cli():
     parser.add_argument(
         "--test-dir", required=True,
         help="Directory with ground-truth .txt files",
+    )
+    parser.add_argument(
+        "--output-dir", required=True,
+        help="Directory for results.npz and results.txt output",
     )
     parser.add_argument(
         "--metrics", nargs="+", required=True,
@@ -561,20 +447,12 @@ def cli():
     parser.add_argument(
         "--skip-ids-file", default=None,
         help="Newline-delimited file of sample IDs to exclude "
-             "(default: utils/skipped_ids)",
+             "(default: no skipping)",
     )
     parser.add_argument(
         "--buckets", nargs="+",
         default=["<=4", "5", "6", "7", "8", ">=9"],
         help="Accuracy bucket boundaries (default: <=4 5 6 7 8 >=9)",
-    )
-    parser.add_argument(
-        "--output-csv", default=None,
-        help="Write per-sample results to this CSV file",
-    )
-    parser.add_argument(
-        "--summary-only", action="store_true",
-        help="Print only aggregate statistics",
     )
     args = parser.parse_args()
 
@@ -583,13 +461,11 @@ def cli():
         logger.error(f"Results file not found: {results_path}")
         return 1
 
-    skip_ids_path = (
-        args.skip_ids_file
-        or str(Path(__file__).parent.parent / "utils" / "skipped_ids")
-    )
-    skip_ids = load_skip_ids(skip_ids_path)
-    if skip_ids:
-        logger.info(f"Loaded {len(skip_ids)} skip IDs from {skip_ids_path}")
+    skip_ids = set()
+    if args.skip_ids_file:
+        skip_ids = load_skip_ids(args.skip_ids_file)
+        if skip_ids:
+            logger.info(f"Loaded {len(skip_ids)} skip IDs from {args.skip_ids_file}")
 
     logger.info(f"Loading results from {results_path} ...")
     with open(results_path) as f:
@@ -619,13 +495,34 @@ def cli():
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
         elif metric == "area_proportion_error":
-            metric_results["area_proportion_error"] = score_area_proportion_error(results, ground_truth, skip_ids)
+            metric_results["area_proportion_error"] = score_area_proportion_error(
+                results, ground_truth, skip_ids)
 
-    for metric in args.metrics:
-        print_report(metric, metric_results[metric], args.summary_only)
+    # ── Collect per-sample values into flat arrays for the reporter ──
+    report_kwargs: dict = {}
 
-    if args.output_csv:
-        write_csv(args.output_csv, metric_results, results.keys())
+    ged_result = metric_results.get("ged")
+    if ged_result and ged_result["per_sample"]:
+        report_kwargs["geds"] = np.array([
+            r["ged"] if r["ged"] is not None else np.nan
+            for r in ged_result["per_sample"]
+        ])
+
+    delta_result = metric_results.get("delta")
+    if delta_result and delta_result["per_sample"]:
+        report_kwargs["similarity_scores"] = np.array([
+            r["delta"] if r["delta"] is not None else np.nan
+            for r in delta_result["per_sample"]
+        ])
+
+    ape_result = metric_results.get("area_proportion_error")
+    if ape_result and ape_result["per_sample"]:
+        report_kwargs["area_proportion_errors"] = np.array([
+            r["area_proportion_error"] if r["area_proportion_error"] is not None else np.nan
+            for r in ape_result["per_sample"]
+        ])
+
+    report_results(args.output_dir, **report_kwargs)
 
     return 0
 

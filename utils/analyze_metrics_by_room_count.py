@@ -3,23 +3,23 @@
 Analyze benchmark metrics binned by room count.
 
 Reads a cached-generations pickle (for ground-truth room types) and the
-``benchmark_results.npz`` produced by ``score_benchmark_result.py``.
+``results.npz`` produced by ``utils.report_results``.
 Every per-sample array found in the NPZ (GED, accuracy, similarity,
 area proportion error, …) is grouped into room-count bins and reported.
 
 Room-count bins: <=4, 5, 6, 7, 8, >8
 
 Usage:
-    python benchmark/utils/analyze_metrics_by_room_count.py \\
+    python utils/analyze_metrics_by_room_count.py \\
         --model houseganpp \\
         --cache_pickle eval_results_houseganpp/generations.pkl \\
-        --results_npz  eval_results_houseganpp/benchmark_results.npz \\
+        --results_npz  eval_results_houseganpp/results.npz \\
         --num_variations 5
 
-    python benchmark/utils/analyze_metrics_by_room_count.py \\
+    python utils/analyze_metrics_by_room_count.py \\
         --model housediffusion \\
         --cache_pickle eval_results_housediffusion/generations.pkl \\
-        --results_npz  eval_results_housediffusion/benchmark_results.npz \\
+        --results_npz  eval_results_housediffusion/results.npz \\
         --num_variations 5
 """
 
@@ -31,7 +31,7 @@ import pickle
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 
@@ -72,31 +72,22 @@ def _stats(values: np.ndarray) -> dict:
 
 # ── Extract per-sample score arrays from the NPZ ────────────────────
 
+_NPZ_KEY_TO_METRIC = {
+    "geds": "ged",
+    "accuracies": "accuracy",
+    "count_errors": "count_error",
+    "type_errors": "type_error",
+    "similarity_scores": "similarity",
+    "area_proportion_errors": "area_prop_err",
+}
+
 
 def _extract_metric_arrays(npz) -> Dict[str, np.ndarray]:
     """Return ``{metric_name: 1-D array}`` for every binnable metric."""
     arrays: Dict[str, np.ndarray] = {}
-
-    if "geds" in npz:
-        arrays["ged"] = np.array(npz["geds"], dtype=float)
-
-    rc = npz["room_count_accuracy"].item() if "room_count_accuracy" in npz else None
-    if rc and isinstance(rc, dict):
-        if "all_accuracies" in rc:
-            arrays["accuracy"] = np.array(rc["all_accuracies"], dtype=float)
-        if "all_count_errors" in rc:
-            arrays["count_error"] = np.array(rc["all_count_errors"], dtype=float)
-        if "all_type_errors" in rc:
-            arrays["type_error"] = np.array(rc["all_type_errors"], dtype=float)
-
-    rs = npz["room_similarity"].item() if "room_similarity" in npz else None
-    if rs and isinstance(rs, dict) and "all_scores" in rs:
-        arrays["similarity"] = np.array(rs["all_scores"], dtype=float)
-
-    ad = npz["area_proportion_error"].item() if "area_proportion_error" in npz else None
-    if ad and isinstance(ad, dict) and "all_scores" in ad:
-        arrays["area_prop_err"] = np.array(ad["all_scores"], dtype=float)
-
+    for npz_key, metric_name in _NPZ_KEY_TO_METRIC.items():
+        if npz_key in npz:
+            arrays[metric_name] = np.array(npz[npz_key], dtype=float)
     return arrays
 
 
@@ -246,7 +237,7 @@ def main():
     parser.add_argument("--cache_pickle", type=str, required=True,
                         help="Path to cached generations pickle")
     parser.add_argument("--results_npz", type=str, required=True,
-                        help="Path to benchmark_results.npz")
+                        help="Path to results.npz")
     parser.add_argument("--num_variations", type=int, default=None,
                         help="Variations per sample (auto-detected from NPZ"
                              " if omitted)")
@@ -264,7 +255,6 @@ def main():
         print(f"Error: NPZ file not found: {npz_path}")
         return 1
 
-    # Load cache
     with open(cache_path, "rb") as f:
         cache = pickle.load(f)
     gt_samples = cache.get("samples") or cache.get("ground_truth")
@@ -272,11 +262,9 @@ def main():
         print(f"Error: unknown cache format (keys: {list(cache.keys())})")
         return 1
 
-    # Load NPZ
     npz = np.load(str(npz_path), allow_pickle=True)
     metric_arrays = _extract_metric_arrays(npz)
 
-    # Determine num_variations
     num_variations = args.num_variations
     if num_variations is None:
         nv = npz["num_variations"].item() if "num_variations" in npz else None
@@ -286,7 +274,7 @@ def main():
             num_variations = len(metric_arrays.get("ged", [])) // len(gt_samples)
             if num_variations < 1:
                 num_variations = 1
-    
+
     model_name = "HouseGAN++" if args.model == "houseganpp" else "House-Diffusion"
 
     print(f"{'=' * 80}")

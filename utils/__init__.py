@@ -26,3 +26,4 @@ from .metrics import (
     produce_room_list,
     produce_room_area_list,
 )
+from .report_results import report_results
