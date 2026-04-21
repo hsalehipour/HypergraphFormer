@@ -80,10 +80,8 @@ HypergraphFormer/
 │
 ├── scripts/                        # ── Pipelines & CLI tools ──────────
 │   │
-│   │  # Data preparation (--mode jsonl | eval-format | room-lists)
-│   ├── data_preparation.py          JSON → JSONL, eval-format .txt, or room-list JSONs
-│   ├── data_preparation_access.py   Prepare access-graph .txt files from RPLAN
-│   │                                      dataset_access for evaluator.py
+│   │  # Data preparation (--mode train | eval | room-lists)
+│   ├── data_preparation.py          JSON → JSONL, eval .txt, or room-list JSONs
 │   │
 │   │  # Training
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
@@ -269,7 +267,7 @@ The dataset ships pre-split (`train.json`, `validation.json`,
 `sft_pipeline.py` expects:
 
 ```bash
-python scripts/data_preparation.py --mode jsonl \
+python scripts/data_preparation.py --mode train \
     --dataset-dir dataset/hypergraph
 ```
 
@@ -298,7 +296,7 @@ Checkpoints are written to
 Prepare RL training JSONL (footprint prompt) into `dataset/hypergraph/rl/`:
 
 ```bash
-python scripts/data_preparation.py --mode jsonl \
+python scripts/data_preparation.py --mode train \
     --dataset-dir dataset/hypergraph --footprint
 ```
 
@@ -335,9 +333,18 @@ accelerate launch --num_processes=8 scripts/rlft_pipeline.py --multi-gpu
 Prepare the eval-format directory (one `{id}.txt` per sample):
 
 ```bash
-python scripts/data_preparation.py --mode eval-format \
+python scripts/data_preparation.py --mode eval \
     --input-file dataset/hypergraph/test.json \
     --output-dir dataset/hypergraph/test
+```
+
+Optionally pass `--aggregate` to merge same-type, spatially adjacent,
+access-connected rooms into single nodes in the output access graphs:
+
+```bash
+python scripts/data_preparation.py --mode eval --aggregate \
+    --input-file dataset/hypergraph/test.json \
+    --output-dir dataset/hypergraph/test_aggregated
 ```
 
 Run evaluation (generates hypergraphs + inline scoring):

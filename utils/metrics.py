@@ -374,7 +374,7 @@ def compute_room_area_difference_score(room_list_A, room_list_B):
     }
 
 
-def room_type_accuracy(expected_room_types, generated_room_types, strict=False):
+def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     """Core room-type multiset comparison on two flat lists.
 
     This is the low-level function shared by
@@ -460,7 +460,7 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=False):
     }
 
 
-def compute_room_type_accuracy(accessgraph, hypergraph, strict=False):
+def compute_room_type_accuracy(accessgraph, hypergraph, strict=True):
     """Compare room-type multisets between an access-graph dict and a hypergraph dict.
 
     Extracts room-type lists from the raw dictionaries and delegates to
