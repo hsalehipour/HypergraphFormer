@@ -1102,8 +1102,8 @@ def main():
     # Collect all GED results (with NaN for failed computations to preserve structure)
     all_dists = []
     room_count_accuracies = []
-    room_count_errors = []
-    room_type_errors = []
+    room_count_accuracy_scores = []
+    room_type_accuracy_scores = []
     similarity_scores = []
     area_proportion_errors = []
     unmatched_pred_rooms = []
@@ -1124,8 +1124,8 @@ def main():
             room_count_info['actual_room_types']
         )
         room_count_accuracies.append(room_count_metric['accuracy'])
-        room_count_errors.append(room_count_metric['count_error'])
-        room_type_errors.append(room_count_metric['type_error'])
+        room_count_accuracy_scores.append(room_count_metric['room_count_accuracy'])
+        room_type_accuracy_scores.append(room_count_metric['room_type_accuracy'])
         
         # Collect similarity scores and matching stats
         similarity_scores.append(similarity_result['similarity_score'])
@@ -1144,8 +1144,8 @@ def main():
         args.out,
         geds=np.array(all_dists),
         accuracies=np.array(room_count_accuracies),
-        count_errors=np.array(room_count_errors),
-        type_errors=np.array(room_type_errors),
+        room_count_accuracies=np.array(room_count_accuracy_scores),
+        room_type_accuracies=np.array(room_type_accuracy_scores),
         similarity_scores=np.array(similarity_scores),
         area_proportion_errors=np.array(area_proportion_errors),
         num_variations=args.num_variations,

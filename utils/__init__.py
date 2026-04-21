@@ -22,7 +22,6 @@ from .metrics import (
     compute_room_area_proportion_error,
     room_type_accuracy,
     compute_room_type_accuracy,
-    bucketed_room_accuracy,
     produce_room_list,
     produce_room_area_list,
 )

@@ -423,26 +423,23 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
-        strict: When ``True`` (default), ``accuracy`` is binary —
-            1.0 only if both count and types match exactly, else 0.0.
-            When ``False``, ``accuracy`` is a continuous score in
-            ``[0, 1]``: multiset intersection size divided by
-            ``max(|expected|, |generated|)``, giving partial credit
-            for partially correct room-type sets.
+        strict: When ``True`` (default), all three accuracy values are
+            binary (1.0 for exact match, 0.0 otherwise).  When
+            ``False``, they are continuous in ``[0, 1]``:
+
+            - ``accuracy`` = ``overlap / max(|E|, |G|)``
+            - ``room_count_accuracy`` = ``min(|E|, |G|) / max(|E|, |G|)``
+            - ``room_type_accuracy`` = ``overlap / min(|E|, |G|)``
+
+            where ``overlap`` is the multiset intersection size.
 
     Returns:
         dict with keys:
 
-        - ``room_count_match`` (bool)
-        - ``room_types_match`` (bool)
-        - ``accuracy`` (float): see *strict* parameter
-        - ``expected_rooms`` / ``generated_rooms`` (int)
-        - ``expected_types`` / ``generated_types`` (dict)
-        - ``missing_types`` / ``extra_types`` (list)
-        - ``count_error`` (int): absolute count difference
-        - ``type_error`` (int): number of mismatched room slots
-        - ``relative_count_error`` (float)
-        - ``excess_rooms`` (int): positive = too many, negative = too few
+        - ``accuracy`` (float): combined accuracy (count **and** types).
+        - ``room_count_accuracy`` (float): room-count accuracy only.
+        - ``room_type_accuracy`` (float): room-type-set accuracy only
+          (among the rooms that could potentially match, how many do).
     """
     from collections import Counter
 
@@ -455,46 +452,30 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     room_count_match = n_expected == n_generated
     room_types_match = expected_counter == generated_counter
 
-    missing_types = []
-    extra_types = []
-    for room_type, count in expected_counter.items():
-        diff = count - generated_counter.get(room_type, 0)
-        if diff > 0:
-            missing_types.extend([room_type] * diff)
-    for room_type, count in generated_counter.items():
-        diff = count - expected_counter.get(room_type, 0)
-        if diff > 0:
-            extra_types.extend([room_type] * diff)
-
-    count_error = abs(n_generated - n_expected)
-    type_error = (len(missing_types) + len(extra_types)) // 2
+    all_keys = set(expected_counter) | set(generated_counter)
 
     if strict:
         accuracy = 1.0 if (room_count_match and room_types_match) else 0.0
+        rc_accuracy = 1.0 if room_count_match else 0.0
+        rt_accuracy = 1.0 if room_types_match else 0.0
     else:
         denom = max(n_expected, n_generated)
         if denom == 0:
             accuracy = float('nan')
+            rc_accuracy = float('nan')
+            rt_accuracy = float('nan')
         else:
-            all_keys = set(expected_counter) | set(generated_counter)
             overlap = sum(min(expected_counter[k], generated_counter[k])
                           for k in all_keys)
             accuracy = overlap / denom
+            rc_accuracy = min(n_expected, n_generated) / denom
+            min_count = min(n_expected, n_generated)
+            rt_accuracy = (overlap / min_count) if min_count > 0 else float('nan')
 
     return {
-        'room_count_match': room_count_match,
-        'room_types_match': room_types_match,
         'accuracy': accuracy,
-        'expected_rooms': n_expected,
-        'generated_rooms': n_generated,
-        'expected_types': dict(expected_counter),
-        'generated_types': dict(generated_counter),
-        'missing_types': missing_types,
-        'extra_types': extra_types,
-        'count_error': count_error,
-        'type_error': type_error,
-        'relative_count_error': count_error / n_expected if n_expected > 0 else 0.0,
-        'excess_rooms': n_generated - n_expected,
+        'room_count_accuracy': rc_accuracy,
+        'room_type_accuracy': rt_accuracy,
     }
 
 
@@ -516,101 +497,3 @@ def compute_room_type_accuracy(accessgraph, hypergraph, strict=True):
     leaves = Hypergraph(hypergraph).leaves
     generated_room_types = [leaf['mergeid'] for leaf in leaves]
     return room_type_accuracy(expected_room_types, generated_room_types, strict=strict)
-
-
-def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
-                           skip_ids=None):
-    """Compute room-type accuracy grouped into room-count buckets.
-
-    Per-sample score is multiset **edit proximity** in ``[0, 1]``: intersection
-    size of GT vs predicted room-type multisets divided by ``max(n_gt, n_pred)``.
-    Bucket and overall aggregates use the **sum** of these scores in
-    ``matches`` (so ``matches / total`` is the mean proximity in that bucket).
-
-    Args:
-        accessgraphs: ``{sample_id: accessgraph_dict}``
-        hypergraphs:  ``{sample_id: hypergraph_dict}``
-        buckets: Ordered list of bucket boundaries.  Each entry is an
-            ``int`` or a string like ``'<=4'`` / ``'>=9'``.  Integers
-            create an exact-match bucket; ``'<=N'`` catches everything
-            at or below *N*; ``'>=N'`` catches everything at or above *N*.
-        skip_ids: Optional set of sample IDs to exclude.
-
-    Returns:
-        dict with keys:
-
-        - ``categories``: ``{label: {matches, total}}`` — *matches* is the
-          sum of per-sample proximity scores (float-compatible).
-        - ``category_order``: list of bucket labels in input order
-        - ``overall_matches``: sum of per-sample proximity scores
-        - ``overall_total``: number of samples counted (same as before)
-        - ``skipped``: int
-    """
-    from tqdm import tqdm
-
-    skip_ids = skip_ids or set()
-
-    lower_bound = None
-    upper_bound = None
-    exact_values = []
-
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            lower_bound = int(s.lstrip("<=≤"))
-        elif s.startswith(">=") or s.startswith("≥"):
-            upper_bound = int(s.lstrip(">=≥"))
-        else:
-            exact_values.append(int(s))
-
-    def _bucket_label(n):
-        if lower_bound is not None and n <= lower_bound:
-            return f"<={lower_bound}"
-        if upper_bound is not None and n >= upper_bound:
-            return f">={upper_bound}"
-        if n in exact_values:
-            return str(n)
-        return None
-
-    category_labels = []
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            category_labels.append(f"<={s.lstrip('<=≤')}")
-        elif s.startswith(">=") or s.startswith("≥"):
-            category_labels.append(f">={s.lstrip('>=≥')}")
-        else:
-            category_labels.append(s)
-
-    categories = {label: {"matches": 0, "total": 0} for label in category_labels}
-    overall_matches = 0
-    overall_total = 0
-    skipped = 0
-
-    for sample_id in tqdm(hypergraphs, desc="Comparing rooms"):
-        if sample_id in skip_ids:
-            skipped += 1
-            continue
-        if sample_id not in accessgraphs:
-            continue
-
-        result = compute_room_type_accuracy(
-            accessgraphs[sample_id], hypergraphs[sample_id]
-        )
-        label = _bucket_label(result["expected_rooms"])
-        if label is None:
-            continue
-
-        score = result["accuracy"]
-        categories[label]["total"] += 1
-        overall_total += 1
-        categories[label]["matches"] += score
-        overall_matches += score
-
-    return {
-        "categories": categories,
-        "category_order": category_labels,
-        "overall_matches": overall_matches,
-        "overall_total": overall_total,
-        "skipped": skipped,
-    }

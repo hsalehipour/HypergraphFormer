@@ -33,13 +33,12 @@ Usage:
         --metrics ged \\
         --correct-accessgraph
 
-    # Accuracy with custom buckets
+    # Accuracy only
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
         --output-dir eval_output \\
-        --metrics accuracy \\
-        --buckets '<=4' 5 6 7 8 '>=9'
+        --metrics accuracy
 """
 
 from __future__ import annotations
@@ -58,9 +57,9 @@ import numpy as np
 from tqdm import tqdm
 
 from utils import (
-    bucketed_room_accuracy,
     compute_room_area_proportion_error,
     compute_room_similarity_score,
+    compute_room_type_accuracy,
     produce_room_area_list,
     produce_room_list,
 )
@@ -282,20 +281,38 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
 # Metric: Accuracy
 # ===================================================================
 
-def score_accuracy(results, ground_truth, skip_ids, buckets):
-    """Compute bucketed room-type accuracy.
+def score_accuracy(results, ground_truth, skip_ids):
+    """Compute per-sample room-type accuracy (combined, count, type).
 
-    Delegates to :func:`utils.metrics.bucketed_room_accuracy`.
-    Returns ``{"per_sample": None, "summary": {...}}``.
+    Returns ``{"per_sample": [{"accuracy": ..., "room_count_accuracy": ...,
+    "room_type_accuracy": ...}, ...]}``.
     """
-    accessgraphs = {
-        sid: gt["accessgraph"]
-        for sid, gt in ground_truth.items()
-    }
-    stats = bucketed_room_accuracy(
-        accessgraphs, results, buckets, skip_ids=skip_ids,
-    )
-    return {"per_sample": None, "summary": stats}
+    per_sample = []
+    skipped = 0
+
+    for sample_id in tqdm(results, desc="Computing accuracy", unit="sample"):
+        if sample_id in skip_ids:
+            skipped += 1
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+
+        accessgraph = gt["accessgraph"]
+        try:
+            result = compute_room_type_accuracy(accessgraph, results[sample_id])
+            per_sample.append(result)
+        except Exception as exc:
+            logger.warning("Accuracy failed for %s: %s", sample_id, exc)
+            per_sample.append({
+                "accuracy": None,
+                "room_count_accuracy": None,
+                "room_type_accuracy": None,
+            })
+
+    if skipped:
+        logger.info("Accuracy: skipped %d samples", skipped)
+    return {"per_sample": per_sample}
 
 
 # ===================================================================
@@ -449,11 +466,6 @@ def cli():
         help="Newline-delimited file of sample IDs to exclude "
              "(default: no skipping)",
     )
-    parser.add_argument(
-        "--buckets", nargs="+",
-        default=["<=4", "5", "6", "7", "8", ">=9"],
-        help="Accuracy bucket boundaries (default: <=4 5 6 7 8 >=9)",
-    )
     args = parser.parse_args()
 
     results_path = Path(args.results_file)
@@ -490,7 +502,7 @@ def cli():
             )
         elif metric == "accuracy":
             metric_results["accuracy"] = score_accuracy(
-                results, ground_truth, skip_ids, args.buckets,
+                results, ground_truth, skip_ids,
             )
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
@@ -507,6 +519,16 @@ def cli():
             r["ged"] if r["ged"] is not None else np.nan
             for r in ged_result["per_sample"]
         ])
+
+    acc_result = metric_results.get("accuracy")
+    if acc_result and acc_result["per_sample"]:
+        for key, kwarg in [("accuracy", "accuracies"),
+                           ("room_count_accuracy", "room_count_accuracies"),
+                           ("room_type_accuracy", "room_type_accuracies")]:
+            report_kwargs[kwarg] = np.array([
+                r[key] if r[key] is not None else np.nan
+                for r in acc_result["per_sample"]
+            ])
 
     delta_result = metric_results.get("delta")
     if delta_result and delta_result["per_sample"]:

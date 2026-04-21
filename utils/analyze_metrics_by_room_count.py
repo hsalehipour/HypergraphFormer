@@ -75,8 +75,8 @@ def _stats(values: np.ndarray) -> dict:
 _NPZ_KEY_TO_METRIC = {
     "geds": "ged",
     "accuracies": "accuracy",
-    "count_errors": "count_error",
-    "type_errors": "type_error",
+    "room_count_accuracies": "room_count_accuracy",
+    "room_type_accuracies": "room_type_accuracy",
     "similarity_scores": "similarity",
     "area_proportion_errors": "area_prop_err",
 }

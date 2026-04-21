@@ -69,37 +69,26 @@ def _safe(val, fmt=".4f"):
 # ── Room-count accuracy helpers ───────────────────────────────────────
 
 
-def _room_count_summary(accuracies, count_errors, type_errors,
-                        num_variations, extra):
-    """Build a rich summary dict for room-count accuracy."""
+def _room_accuracy_summary(accuracies, room_count_accuracies,
+                           room_type_accuracies, num_variations, extra):
+    """Build a rich summary dict for the three room accuracy metrics."""
     acc = np.asarray(accuracies, dtype=float)
-    ce = np.asarray(count_errors, dtype=float)
-    te = np.asarray(type_errors, dtype=float)
+    rca = np.asarray(room_count_accuracies, dtype=float)
+    rta = np.asarray(room_type_accuracies, dtype=float)
     total = extra.get("total_samples", len(acc)) if extra else len(acc)
 
     d = {
-        "exact_match_rate": float(np.mean(acc) * 100),
-        "mean_count_error": float(np.mean(ce)),
-        "median_count_error": float(np.median(ce)),
-        "max_count_error": float(np.max(ce)),
-        "mean_type_error": float(np.mean(te)),
-        "median_type_error": float(np.median(te)),
-        "max_type_error": float(np.max(te)),
+        "accuracy": _stats(acc),
+        "room_count_accuracy": _stats(rca),
+        "room_type_accuracy": _stats(rta),
     }
 
-    acc_std = cnt_std = typ_std = 0.0
     if num_variations > 1:
-        n = len(acc) // num_variations
-        if n > 0 and len(acc) % num_variations == 0:
-            acc_std = float(np.std(
-                np.mean(acc.reshape(n, num_variations), axis=0), ddof=1))
-            cnt_std = float(np.std(
-                np.mean(ce.reshape(n, num_variations), axis=0), ddof=1))
-            typ_std = float(np.std(
-                np.mean(te.reshape(n, num_variations), axis=0), ddof=1))
-    d["accuracy_std"] = acc_std
-    d["count_error_std"] = cnt_std
-    d["type_error_std"] = typ_std
+        for key, arr in [("accuracy", acc), ("room_count_accuracy", rca),
+                         ("room_type_accuracy", rta)]:
+            vs = _variation_std(arr, num_variations)
+            if vs is not None:
+                d[key]["std_of_variation_means"] = vs
 
     if extra:
         dc = extra.get("disconnected_count")
@@ -134,20 +123,16 @@ def _emit_metric(write_fn, title, st, var_std=None, extra_lines=None):
         write_fn(f"  {line}")
 
 
-def _emit_room_count(write_fn, rc):
+def _emit_room_accuracies(write_fn, rc):
     if not rc:
         return
-    write_fn(f"\n--- Room Count Accuracy ---")
-    write_fn(f"  Exact match: {rc['exact_match_rate']:.1f}%"
-             f"  (std: {_safe(rc.get('accuracy_std', 0))})")
-    write_fn(f"  Count error: mean={rc['mean_count_error']:.3f}"
-             f"  median={rc['median_count_error']:.1f}"
-             f"  max={rc['max_count_error']:.0f}"
-             f"  (std: {_safe(rc.get('count_error_std', 0))})")
-    write_fn(f"  Type error:  mean={rc['mean_type_error']:.3f}"
-             f"  median={rc['median_type_error']:.1f}"
-             f"  max={rc['max_type_error']:.0f}"
-             f"  (std: {_safe(rc.get('type_error_std', 0))})")
+    for key, title in [("accuracy", "Room Accuracy (combined)"),
+                       ("room_count_accuracy", "Room Count Accuracy"),
+                       ("room_type_accuracy", "Room Type Accuracy")]:
+        st = rc.get(key)
+        if st and st.get("mean") is not None:
+            _emit_metric(write_fn, title, st,
+                         var_std=st.get("std_of_variation_means"))
     if rc.get("disconnected_samples") is not None:
         write_fn(f"  Disconnected: {rc['disconnected_samples']:,}"
                  f" ({rc['disconnected_rate']:.1f}%)")
@@ -179,8 +164,8 @@ def report_results(
     *,
     geds: np.ndarray | None = None,
     accuracies: np.ndarray | None = None,
-    count_errors: np.ndarray | None = None,
-    type_errors: np.ndarray | None = None,
+    room_count_accuracies: np.ndarray | None = None,
+    room_type_accuracies: np.ndarray | None = None,
     similarity_scores: np.ndarray | None = None,
     area_proportion_errors: np.ndarray | None = None,
     num_variations: int = 1,
@@ -196,9 +181,9 @@ def report_results(
     Args:
         output_dir: Directory for ``results.npz`` and ``results.txt``.
         geds: Per-sample GED values.
-        accuracies: Per-sample room-type accuracy (0 or 1, or continuous).
-        count_errors: Per-sample absolute room-count error.
-        type_errors: Per-sample room-type mismatch count.
+        accuracies: Per-sample combined room accuracy (count and types).
+        room_count_accuracies: Per-sample room-count accuracy.
+        room_type_accuracies: Per-sample room-type-set accuracy.
         similarity_scores: Per-sample delta / room-similarity scores.
         area_proportion_errors: Per-sample area-proportion error.
         num_variations: Generation variations per sample (default 1).
@@ -224,10 +209,10 @@ def report_results(
         metric_entries.append(("geds", "GED", geds))
     if accuracies is not None:
         accuracies = np.asarray(accuracies, dtype=float)
-    if count_errors is not None:
-        count_errors = np.asarray(count_errors, dtype=float)
-    if type_errors is not None:
-        type_errors = np.asarray(type_errors, dtype=float)
+    if room_count_accuracies is not None:
+        room_count_accuracies = np.asarray(room_count_accuracies, dtype=float)
+    if room_type_accuracies is not None:
+        room_type_accuracies = np.asarray(room_type_accuracies, dtype=float)
     if similarity_scores is not None:
         similarity_scores = np.asarray(similarity_scores, dtype=float)
         metric_entries.append(
@@ -245,10 +230,12 @@ def report_results(
             summary[npz_key]["std_of_variation_means"] = vs
 
     rc_summary = None
-    if accuracies is not None and count_errors is not None and type_errors is not None:
-        rc_summary = _room_count_summary(
-            accuracies, count_errors, type_errors, num_variations, extra)
-        summary["room_count_accuracy"] = rc_summary
+    if (accuracies is not None and room_count_accuracies is not None
+            and room_type_accuracies is not None):
+        rc_summary = _room_accuracy_summary(
+            accuracies, room_count_accuracies, room_type_accuracies,
+            num_variations, extra)
+        summary["room_accuracies"] = rc_summary
 
     # ── Build output lines (shared by console + TXT) ──────────────────
     lines: list[str] = []
@@ -289,9 +276,9 @@ def report_results(
             cv = (vs / st["mean"] * 100) if st["mean"] else 0
             _line(f"  Std (variation means): {_safe(vs)}  (CV: {cv:.2f}%)")
 
-    # Room count accuracy
+    # Room accuracies
     if rc_summary:
-        _emit_room_count(_line, rc_summary)
+        _emit_room_accuracies(_line, rc_summary)
 
     # Generic metrics (similarity, area proportion error)
     for npz_key, title, _arr in metric_entries:
@@ -315,10 +302,10 @@ def report_results(
         save_dict["geds"] = geds
     if accuracies is not None:
         save_dict["accuracies"] = accuracies
-    if count_errors is not None:
-        save_dict["count_errors"] = count_errors
-    if type_errors is not None:
-        save_dict["type_errors"] = type_errors
+    if room_count_accuracies is not None:
+        save_dict["room_count_accuracies"] = room_count_accuracies
+    if room_type_accuracies is not None:
+        save_dict["room_type_accuracies"] = room_type_accuracies
     if similarity_scores is not None:
         save_dict["similarity_scores"] = similarity_scores
     if area_proportion_errors is not None:

@@ -940,8 +940,8 @@ def _make_results_dict():
         'all_geds': [],
         'ged_pairs': [],
         'room_count_accuracies': [],
-        'room_count_errors': [],
-        'room_type_errors': [],
+        'room_count_accuracy_scores': [],
+        'room_type_accuracy_scores': [],
         'similarity_scores': [],
         'area_proportion_errors': [],
         'unmatched_pred_rooms': [],
@@ -1046,8 +1046,8 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
             room_count_info['actual_room_types']
         )
         results['room_count_accuracies'].append(room_count_metric['accuracy'])
-        results['room_count_errors'].append(room_count_metric['count_error'])
-        results['room_type_errors'].append(room_count_metric['type_error'])
+        results['room_count_accuracy_scores'].append(room_count_metric['room_count_accuracy'])
+        results['room_type_accuracy_scores'].append(room_count_metric['room_type_accuracy'])
 
         similarity_result = compute_room_similarity_score_polygons(
             pred_polygons, gt_polygons
@@ -1121,8 +1121,8 @@ def _build_report_kwargs(results):
     """Package raw per-sample arrays as keyword args for ``report_results``."""
     return {
         'accuracies': np.array(results['room_count_accuracies']),
-        'count_errors': np.array(results['room_count_errors']),
-        'type_errors': np.array(results['room_type_errors']),
+        'room_count_accuracies': np.array(results['room_count_accuracy_scores']),
+        'room_type_accuracies': np.array(results['room_type_accuracy_scores']),
         'similarity_scores': np.array(results['similarity_scores']),
         'area_proportion_errors': np.array(results['area_proportion_errors']),
         'extra': {
