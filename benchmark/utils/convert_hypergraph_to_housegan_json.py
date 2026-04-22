@@ -157,6 +157,59 @@ def _place_door_polygon(wall, door_width=0.8, door_thickness=0.1):
     ]
 
 
+def _find_front_door_edge(room_verts, circ_segs, tolerance=0.1):
+    """Find the room boundary edge that overlaps a circulation segment.
+
+    Returns (x0, y0, x1, y1) of the best overlapping room edge,
+    or the longest boundary edge as fallback.
+    """
+    room_edges = _edges_from_vertices(room_verts)
+
+    best_edge = None
+    best_overlap = 0
+
+    for rx0, ry0, rx1, ry1 in room_edges:
+        rdx, rdy = rx1 - rx0, ry1 - ry0
+        rlen = (rdx ** 2 + rdy ** 2) ** 0.5
+        if rlen < 1e-6:
+            continue
+        for (cx0, cy0), (cx1, cy1) in circ_segs:
+            cdx, cdy = cx1 - cx0, cy1 - cy0
+            clen = (cdx ** 2 + cdy ** 2) ** 0.5
+            if clen < 1e-6:
+                continue
+            dot = (rdx * cdx + rdy * cdy) / (rlen * clen)
+            if abs(abs(dot) - 1.0) > 0.01:
+                continue
+            if abs(rdx) > abs(rdy):
+                if abs(ry0 - cy0) > tolerance:
+                    continue
+                o_min = max(min(rx0, rx1), min(cx0, cx1))
+                o_max = min(max(rx0, rx1), max(cx0, cx1))
+                overlap = o_max - o_min
+            else:
+                if abs(rx0 - cx0) > tolerance:
+                    continue
+                o_min = max(min(ry0, ry1), min(cy0, cy1))
+                o_max = min(max(ry0, ry1), max(cy0, cy1))
+                overlap = o_max - o_min
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_edge = (rx0, ry0, rx1, ry1)
+
+    if best_edge is not None:
+        return best_edge
+
+    longest_edge = None
+    longest_len = 0
+    for rx0, ry0, rx1, ry1 in room_edges:
+        elen = ((rx1 - rx0) ** 2 + (ry1 - ry0) ** 2) ** 0.5
+        if elen > longest_len:
+            longest_len = elen
+            longest_edge = (rx0, ry0, rx1, ry1)
+    return longest_edge
+
+
 # ── Normalization ──────────────────────────────────────────────────────
 
 def _normalize_to_256(all_vertices_list: list[list[tuple[float, float]]]):
@@ -263,13 +316,41 @@ def convert_entry(entry: dict) -> dict | None:
             door_verts_list.append(dpoly)
             door_connections.append((ri, rj))
 
+    # ── Front door (type 15) for outside-connected room ──────────────
+    front_door_verts = None
+    front_door_room_idx = None
+
+    for li, leaf in enumerate(leaves):
+        if "outside" in (leaf.get("connected") or []):
+            front_door_room_idx = li
+            break
+
+    if front_door_room_idx is not None:
+        circ_raw = entry.get("circulation", "[]")
+        circ_segs_parsed = json.loads(circ_raw) if isinstance(circ_raw, str) else circ_raw
+        circ_tuples = [
+            ((seg["start"]["X"], seg["start"]["Y"]),
+             (seg["end"]["X"], seg["end"]["Y"]))
+            for seg in circ_segs_parsed
+        ]
+        fd_edge = _find_front_door_edge(
+            room_verts[front_door_room_idx], circ_tuples
+        )
+        if fd_edge is not None:
+            front_door_verts = _place_door_polygon(fd_edge)
+
     all_verts = room_verts + door_verts_list
+    if front_door_verts is not None:
+        all_verts.append(front_door_verts)
     normed, s, cx, cy = _normalize_to_256(all_verts)
 
     n_doors = len(door_verts_list)
-    total_nodes = n_rooms + n_doors
+    has_front_door = front_door_verts is not None
+    total_nodes = n_rooms + n_doors + (1 if has_front_door else 0)
 
     all_types = room_types_rplan + [DOOR_TYPE] * n_doors
+    if has_front_door:
+        all_types.append(FRONT_DOOR_TYPE)
 
     boxes = []
     for verts in normed:
@@ -354,6 +435,16 @@ def convert_entry(entry: dict) -> dict | None:
         for k, si in enumerate(range(door_segs_start, door_segs_start + n_door_segs)):
             if si < len(ed_rm):
                 ed_rm[si] = [door_node_idx, targets[k % len(targets)]]
+
+    if has_front_door:
+        fd_node_idx = total_nodes - 1
+        fd_segs_start = sum(
+            len(_edges_from_vertices(normed[ni])) for ni in range(fd_node_idx)
+        )
+        n_fd_segs = len(_edges_from_vertices(normed[fd_node_idx]))
+        for si in range(fd_segs_start, fd_segs_start + n_fd_segs):
+            if si < len(ed_rm):
+                ed_rm[si] = [fd_node_idx, front_door_room_idx]
 
     return {
         "room_type": all_types,
