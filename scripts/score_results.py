@@ -510,6 +510,16 @@ def cli():
             metric_results["area_proportion_error"] = score_area_proportion_error(
                 results, ground_truth, skip_ids)
 
+    # ── Collect per-sample room counts from GT ─────────────────────────
+    per_sample_room_counts = []
+    for sample_id in results:
+        if sample_id in skip_ids:
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+        per_sample_room_counts.append(len(gt["accessgraph"].get("nodes", {})))
+
     # ── Collect per-sample values into flat arrays for the reporter ──
     all_metrics: dict[str, tuple[str, np.ndarray]] = {}
 
@@ -558,7 +568,11 @@ def cli():
             ]),
         )
 
-    report_results(args.output_dir, metrics=all_metrics)
+    report_results(
+        args.output_dir,
+        metrics=all_metrics,
+        room_counts=np.array(per_sample_room_counts),
+    )
 
     return 0
 

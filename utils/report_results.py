@@ -174,6 +174,7 @@ def report_results(
     output_dir: str,
     *,
     metrics: dict[str, tuple[str, np.ndarray]] | None = None,
+    room_counts: np.ndarray | None = None,
     num_variations: int = 1,
     checkpoint_path: str | None = None,
     data_path: str | None = None,
@@ -194,6 +195,10 @@ def report_results(
                     "room_type_accuracies": ("Room Type Accuracy", rta_array),
                     "similarity_scores": ("Room Similarity (delta)", sim_array),
                 }
+        room_counts: Per-sample GT room count (1-D, one entry per unique
+            sample, **not** expanded by *num_variations*).  Saved as
+            ``room_counts`` in the NPZ for downstream per-room-count
+            analysis.
         num_variations: Generation variations per sample (default 1).
             Must be >= 1.
         checkpoint_path: Included in TXT header when provided.
@@ -314,8 +319,10 @@ def report_results(
         print(line)
 
     # ── Save NPZ ──────────────────────────────────────────────────────
-    reserved_keys = {"num_variations", "summary"}
+    reserved_keys = {"num_variations", "summary", "room_counts"}
     save_dict: dict = {"num_variations": num_variations, "summary": summary}
+    if room_counts is not None:
+        save_dict["room_counts"] = np.asarray(room_counts, dtype=int)
     for npz_key, arr in resolved.items():
         save_dict[npz_key] = arr
 

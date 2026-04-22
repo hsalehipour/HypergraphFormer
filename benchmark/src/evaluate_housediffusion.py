@@ -977,6 +977,7 @@ def _make_results_dict():
         'unmatched_pred_rooms': [],
         'unmatched_gt_rooms': [],
         'matched_room_pairs': [],
+        'per_sample_room_counts': [],
         'hidden_room_count': 0,
     }
 
@@ -1045,6 +1046,7 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
         int(p['room_type']) for p in gt_polygons
         if p['room_type'] not in [15, 17]
     ]
+    results['per_sample_room_counts'].append(len(gt_room_type_list))
 
     syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
     syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
@@ -1167,6 +1169,7 @@ def _build_report_kwargs(results):
             'area_proportion_errors': ('Area Proportion Error', np.array(results['area_proportion_errors'])),
             'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(results['spatial_overlap_ratios'])),
         },
+        'room_counts': np.array(results['per_sample_room_counts']),
         'extra': {
             'hidden_count': results['hidden_room_count'],
             'total_samples': len(results['room_count_accuracies']),

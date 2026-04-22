@@ -104,16 +104,12 @@ All metrics are saved to `results.npz` and a human-readable
 ```bash
 # Bin metrics by room count (auto-detects all available metrics in the NPZ)
 python utils/analyze_metrics_by_room_count.py \
-    --model houseganpp \
-    --cache_pickle eval_results_houseganpp/generations.pkl \
     --results_npz eval_results_houseganpp/results.npz
 
-# Explicit variation count + JSON export
+# With display title + JSON export
 python utils/analyze_metrics_by_room_count.py \
-    --model housediffusion \
-    --cache_pickle eval_results_housediffusion/generations.pkl \
     --results_npz eval_results_housediffusion/results.npz \
-    --num_variations 5 \
+    --title "House-Diffusion" \
     --output_json binned_stats.json
 ```
 
@@ -213,7 +209,7 @@ Convert HouseGAN++ JSON files to NPZ format expected by House-Diffusion's
 - **`utils/report_results.py`** -- unified NPZ + TXT reporting used by both
   benchmark eval scripts and `scripts/score_results.py`.
 - **`utils/analyze_metrics_by_room_count.py`** -- bins NPZ metrics by room
-  count and produces per-bin statistics.
+  count (read from ``room_counts`` in the NPZ) and produces per-bin statistics.
 
 ---
 

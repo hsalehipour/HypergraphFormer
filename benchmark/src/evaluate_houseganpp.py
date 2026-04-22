@@ -1149,9 +1149,12 @@ def main():
     unmatched_pred_rooms = []
     unmatched_gt_rooms = []
     matched_room_pairs = []
+    per_sample_room_counts = []
     disconnected_count = 0
     
     for (min_dist, graph_len), (G_pred, G_true, _id, _var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio) in zip(results, graphs):
+        if _var == 0:
+            per_sample_room_counts.append(len(gt_room_type_list))
         if min_dist is not None:
             all_dists.append(min_dist)
         else:
@@ -1192,6 +1195,7 @@ def main():
             'area_proportion_errors': ('Area Proportion Error', np.array(area_proportion_errors)),
             'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(spatial_overlap_ratios)),
         },
+        room_counts=np.array(per_sample_room_counts),
         num_variations=args.num_variations,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
