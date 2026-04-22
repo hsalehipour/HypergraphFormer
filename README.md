@@ -94,7 +94,7 @@ HypergraphFormer/
 │   ├── evaluator.py                 Unified evaluator (trained, rooms-only,
 │   │                                      fewshot-qwen, fewshot-gpt)
 │   │
-│   │  # Post-inference scoring (--metrics ged accuracy delta area_difference)
+│   │  # Post-inference scoring (--metrics ged accuracy delta area_proportion_error)
 │   └── score_results.py             Score saved results against ground truth
 │
 ├── rplan/                          # ── RPLAN dataset processing ───────
@@ -109,8 +109,10 @@ HypergraphFormer/
 ├── utils/                          # ── Shared utility library ─────────
 │   ├── __init__.py                     Public API re-exports
 │   ├── utils.py                        Validation, JSON extraction, timeout
-│   ├── metrics.py                      GED, delta, area difference, room-type accuracy,
+│   ├── metrics.py                      GED, delta, area proportion error, room-type accuracy,
 │   │                                        produce_room_list
+│   ├── report_results.py              Unified reporting: NPZ + TXT output
+│   ├── analyze_metrics_by_room_count.py  Bin metrics by room count from NPZ
 │   ├── hypergraph.py                   Hypergraph class, HypergraphPlotter
 │   ├── prompts.py                      BSP rules, prompt templates
 │   ├── data_loading.py                 Dataset helpers, example loading
@@ -150,9 +152,7 @@ HypergraphFormer/
 │   ├── utils/
 │   │   ├── convert_hypergraph_to_housegan_json.py   WMR24 JSON → HouseGAN++ JSON
 │   │   ├── convert_json_to_pickle.py                HouseGAN++ JSON → pickle
-│   │   ├── convert_json_to_npz.py                   HouseGAN++ JSON → NPZ
-│   │   ├── score_benchmark_result.py                Compute & save benchmark metrics
-│   │   └── analyze_metrics_by_room_count.py         Post-eval metric binning
+│   │   └── convert_json_to_npz.py                   HouseGAN++ JSON → NPZ
 │   └── src/
 │       ├── dataset_loader.py            Shared PyTorch dataset module
 │       ├── evaluate_houseganpp.py       HouseGAN++ evaluation
@@ -379,7 +379,7 @@ python scripts/evaluator.py --mode fewshot-gpt \
 
 ### 6. Score saved results (post-inference)
 
-Compute any combination of GED, accuracy, delta, and area difference
+Compute any combination of GED, accuracy, delta, and area proportion error
 metrics on saved `*_hypergraphs.json` files:
 
 ```bash
@@ -387,34 +387,23 @@ metrics on saved `*_hypergraphs.json` files:
 python scripts/score_results.py \
     --results-file path/to/results_test_hypergraphs.json \
     --test-dir dataset/hypergraph/test \
-    --metrics ged accuracy delta area_difference
+    --output-dir eval_output \
+    --metrics ged accuracy delta area_proportion_error
 
 # Just GED
 python scripts/score_results.py \
     --results-file path/to/results_test_hypergraphs.json \
     --test-dir dataset/hypergraph/test \
+    --output-dir eval_output \
     --metrics ged
 
 # GED with corrected access graph (mesh-adjacency corrected)
 python scripts/score_results.py \
     --results-file path/to/results_test_hypergraphs.json \
     --test-dir dataset/hypergraph/test \
+    --output-dir eval_output \
     --metrics ged \
     --correct-accessgraph
-
-# Delta with CSV output
-python scripts/score_results.py \
-    --results-file path/to/results_test_hypergraphs.json \
-    --test-dir dataset/hypergraph/test \
-    --metrics delta \
-    --output-csv delta_metrics.csv
-
-# Summary-only (machine-readable, for scripting)
-python scripts/score_results.py \
-    --results-file path/to/results_test_hypergraphs.json \
-    --test-dir dataset/hypergraph/test \
-    --metrics ged accuracy \
-    --summary-only
 ```
 
 ### 7. Benchmark against baselines (HouseGAN++, House-Diffusion)
@@ -468,7 +457,7 @@ bash run_fewshot_experiments.sh --score-only \
 | **GED** | Graph Edit Distance — minimum-cost sequence of vertex and edge edits to transform one access graph into another, used as the primary structural similarity metric. |
 | **Room-Set Accuracy** | Fraction of test samples where the generated floor plan exactly matches the ground-truth room composition (count and types). |
 | **Geometric Compactness Deviation (\(\delta\))** | Per-room shape deviation measuring how much a generated room polygon departs from the compactness of its ground-truth counterpart. |
-| **Area Difference** | Relative room-area error between paired predicted and ground-truth rooms, averaged per sample. |
+| **Area Proportion Error** | Mean absolute difference between room-area proportions of paired predicted and ground-truth rooms, averaged per sample. |
 | **LoRA** | Low-Rank Adaptation — parameter-efficient fine-tuning; default configuration: rank 64, alpha 128. |
 | **GRPO** | Group Relative Policy Optimization — RL algorithm used in the second training stage to optimize metric-based rewards (accuracy, GED, compactness). |
 
@@ -482,7 +471,9 @@ The `utils/` package provides shared helpers used by the pipeline scripts:
 |---|---|
 | `utils/hypergraph.py` | `Hypergraph` class (validation, transformers, RGL integration, parsing, access-graph component analysis), `HypergraphPlotter` (mesh sliver filtering, `unique_id`-based face labelling) |
 | `utils/utils.py` | `validate_hypergraph`, `TimeoutException`, `time_limit`, JSON extraction helpers |
-| `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `compute_room_area_difference_score`, `room_type_accuracy`, `bucketed_room_accuracy`, `produce_room_list` |
+| `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `compute_room_area_proportion_error`, `room_type_accuracy`, `compute_room_type_accuracy`, `produce_room_list` |
+| `utils/report_results.py` | `report_results` -- unified NPZ + TXT reporting for all evaluation pipelines |
+| `utils/analyze_metrics_by_room_count.py` | CLI script to bin NPZ metrics by room count and produce per-bin statistics |
 | `utils/prompts.py` | BSP rules text, prompt templates (`create_structured_prompt`, `create_simple_prompt`, etc.) |
 | `utils/data_loading.py` | `load_example_hypergraphs`, `load_target_from_dataset`, `save_training_data`, `log_slow_generation`, `HypergraphDataset`, `collate_fn` |
 | `utils/benchmark_qwen_inference.py` | Inference timing benchmark for Qwen models |

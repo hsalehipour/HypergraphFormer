@@ -4,8 +4,8 @@ Metric functions for evaluating hypergraph generation quality.
 Provides canonical metrics:
 - GED (Graph Edit Distance): structural similarity between access graphs
 - Delta metric: shape regularity deviation between room lists
-- Area difference: relative error of **total area per canonical room type** (bathrooms summed, etc.),
-  averaged over room types present in **both** apartments only
+- Area proportion error: mean absolute difference between room-area proportions
+  (each room's area / total apartment area), paired 1-to-1 within each type
 - Room-type accuracy: multiset comparison of room types
 """
 
@@ -312,65 +312,103 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
     return sum(list_of_sigmas) / len(list_of_sigmas)
 
 
-def compute_room_area_difference_score(room_list_A, room_list_B):
-    """Compute mean relative area error between two apartment meshes.
+def compute_room_area_proportion_error(room_list_A, room_list_B, aggregate=False):
+    """Compute mean area-proportion error between two apartment meshes.
 
     Each room list is a list of ``(merge_id, area)`` tuples from
     :func:`produce_room_area_list`.
 
-    For each canonical room type (kitchen, bathroom, …), **sum** all room face
-    areas of that type in each apartment, then take
-    ``abs(A_sum - B_sum) / B_sum`` for each type that appears in **both**
-    apartments. Types present in only one apartment are tracked as unmatched.
-    The score is the mean of those relative errors over matching types.
+    Proportions are computed as ``area_i / total_area`` for each room (or
+    room-type sum when *aggregate* is True).  The error is the mean of
+    ``|prop_pred_i - prop_gt_i|`` and is bounded in ``[0, 1]``.
+
+    Args:
+        room_list_A: Predicted rooms -- ``[(merge_id, area), ...]``.
+        room_list_B: Ground-truth rooms -- ``[(merge_id, area), ...]``.
+        aggregate: If ``True``, sum all room areas per canonical type before
+            computing proportions (one term per type).  If ``False``
+            (default), keep individual rooms: within each canonical type,
+            rooms are sorted by area and paired 1-to-1; unmatched rooms
+            on either side contribute their full proportion as error.
 
     Returns:
         dict with keys:
 
-        - ``area_difference_score`` (float): mean relative error (NaN if
-          no comparable types).
-        - ``matched_types`` (int): number of room types compared.
-        - ``unmatched_pred`` (int): room types in pred only.
-        - ``unmatched_gt`` (int): room types in GT only.
-        - ``per_type_scores`` (list[float]): per-type relative errors.
-        - ``skipped_types_pred`` (list[str]): type keys present only in pred.
-        - ``skipped_types_gt`` (list[str]): type keys present only in GT.
+        - ``area_proportion_error`` (float): mean absolute proportion
+          error (NaN if both apartments have zero total area).
+        - ``num_terms`` (int): number of proportion-error terms averaged.
+        - ``per_term_errors`` (list[float]): individual absolute
+          proportion errors.
+        - ``types_only_in_pred`` (list[str]): canonical type keys present
+          only in pred.
+        - ``types_only_in_gt`` (list[str]): canonical type keys present
+          only in GT.
     """
     import numpy as np
+    from collections import defaultdict
 
-    sums_A = _aggregate_area_by_room_type(room_list_A)
-    sums_B = _aggregate_area_by_room_type(room_list_B)
+    total_A = sum(area for _, area in room_list_A)
+    total_B = sum(area for _, area in room_list_B)
 
-    common_types = set(sums_A.keys()) & set(sums_B.keys())
-    only_in_A = set(sums_A.keys()) - set(sums_B.keys())
-    only_in_B = set(sums_B.keys()) - set(sums_A.keys())
-
-    per_type_scores = []
-    for category in sorted(common_types):
-        area_A = sums_A[category]
-        area_B = sums_B[category]
-        if area_B == 0:
-            continue
-        per_type_scores.append(abs(area_A - area_B) / area_B)
-
-    if len(per_type_scores) == 0:
+    if total_A == 0 and total_B == 0:
         warnings.warn(
-            "compute_room_area_difference_score: no comparable room types with "
-            "nonzero GT area (empty sigmas); returning nan",
+            "compute_room_area_proportion_error: both apartments have zero "
+            "total area; returning nan",
             stacklevel=2,
         )
-        avg_error = float('nan')
+        return {
+            'area_proportion_error': float('nan'),
+            'num_terms': 0,
+            'per_term_errors': [],
+            'types_only_in_pred': [],
+            'types_only_in_gt': [],
+        }
+
+    if aggregate:
+        sums_A = _aggregate_area_by_room_type(room_list_A)
+        sums_B = _aggregate_area_by_room_type(room_list_B)
+
+        all_types = sorted(set(sums_A.keys()) | set(sums_B.keys()))
+        only_in_A = sorted(set(sums_A.keys()) - set(sums_B.keys()))
+        only_in_B = sorted(set(sums_B.keys()) - set(sums_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            prop_A = sums_A.get(category, 0.0) / total_A if total_A > 0 else 0.0
+            prop_B = sums_B.get(category, 0.0) / total_B if total_B > 0 else 0.0
+            per_term_errors.append(abs(prop_A - prop_B))
     else:
-        avg_error = float(np.mean(per_type_scores))
+        rooms_A: defaultdict[str, list[float]] = defaultdict(list)
+        rooms_B: defaultdict[str, list[float]] = defaultdict(list)
+        for merge_id, area in room_list_A:
+            rooms_A[_canonical_room_type_key(merge_id)].append(float(area))
+        for merge_id, area in room_list_B:
+            rooms_B[_canonical_room_type_key(merge_id)].append(float(area))
+
+        all_types = sorted(set(rooms_A.keys()) | set(rooms_B.keys()))
+        only_in_A = sorted(set(rooms_A.keys()) - set(rooms_B.keys()))
+        only_in_B = sorted(set(rooms_B.keys()) - set(rooms_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            areas_a = sorted(rooms_A.get(category, []), reverse=True)
+            areas_b = sorted(rooms_B.get(category, []), reverse=True)
+            n = max(len(areas_a), len(areas_b))
+            for i in range(n):
+                a = areas_a[i] if i < len(areas_a) else 0.0
+                b = areas_b[i] if i < len(areas_b) else 0.0
+                prop_a = a / total_A if total_A > 0 else 0.0
+                prop_b = b / total_B if total_B > 0 else 0.0
+                per_term_errors.append(abs(prop_a - prop_b))
+
+    avg_error = float(np.mean(per_term_errors)) if per_term_errors else float('nan')
 
     return {
-        'area_difference_score': avg_error,
-        'matched_types': len(per_type_scores),
-        'unmatched_pred': len(only_in_A),
-        'unmatched_gt': len(only_in_B),
-        'per_type_scores': per_type_scores,
-        'skipped_types_pred': sorted(only_in_A),
-        'skipped_types_gt': sorted(only_in_B),
+        'area_proportion_error': avg_error,
+        'num_terms': len(per_term_errors),
+        'per_term_errors': per_term_errors,
+        'types_only_in_pred': only_in_A,
+        'types_only_in_gt': only_in_B,
     }
 
 
@@ -382,29 +420,29 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     hypergraph dicts) and the benchmark evaluation scripts (which
     extract lists from pixel masks or polygon outputs).
 
+    The continuous definitions are always used internally:
+
+    - ``accuracy`` = ``overlap / max(|E|, |G|)``
+    - ``room_count_accuracy`` = ``min(|E|, |G|) / max(|E|, |G|)``
+    - ``room_type_accuracy`` = ``overlap / min(|E|, |G|)``
+
+    where ``overlap`` is the multiset intersection size.
+
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
-        strict: When ``True`` (default), ``accuracy`` is binary —
-            1.0 only if both count and types match exactly, else 0.0.
-            When ``False``, ``accuracy`` is a continuous score in
-            ``[0, 1]``: multiset intersection size divided by
-            ``max(|expected|, |generated|)``, giving partial credit
-            for partially correct room-type sets.
+        strict: When ``True`` (default), the continuous values are
+            thresholded to binary: 1.0 if the continuous value equals
+            1.0, else 0.0.  When ``False``, the raw continuous values
+            in ``[0, 1]`` are returned.
 
     Returns:
         dict with keys:
 
-        - ``room_count_match`` (bool)
-        - ``room_types_match`` (bool)
-        - ``accuracy`` (float): see *strict* parameter
-        - ``expected_rooms`` / ``generated_rooms`` (int)
-        - ``expected_types`` / ``generated_types`` (dict)
-        - ``missing_types`` / ``extra_types`` (list)
-        - ``count_error`` (int): absolute count difference
-        - ``type_error`` (int): number of mismatched room slots
-        - ``relative_count_error`` (float)
-        - ``excess_rooms`` (int): positive = too many, negative = too few
+        - ``accuracy`` (float): combined accuracy (count **and** types).
+        - ``room_count_accuracy`` (float): room-count accuracy only.
+        - ``room_type_accuracy`` (float): room-type-set accuracy only
+          (among the rooms that could potentially match, how many do).
     """
     from collections import Counter
 
@@ -414,49 +452,34 @@ def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     n_expected = len(expected_room_types)
     n_generated = len(generated_room_types)
 
-    room_count_match = n_expected == n_generated
-    room_types_match = expected_counter == generated_counter
+    all_keys = set(expected_counter) | set(generated_counter)
 
-    missing_types = []
-    extra_types = []
-    for room_type, count in expected_counter.items():
-        diff = count - generated_counter.get(room_type, 0)
-        if diff > 0:
-            missing_types.extend([room_type] * diff)
-    for room_type, count in generated_counter.items():
-        diff = count - expected_counter.get(room_type, 0)
-        if diff > 0:
-            extra_types.extend([room_type] * diff)
+    denom = max(n_expected, n_generated)
+    if denom == 0:
+        return {
+            'accuracy': float('nan'),
+            'room_count_accuracy': float('nan'),
+            'room_type_accuracy': float('nan'),
+        }
 
-    count_error = abs(n_generated - n_expected)
-    type_error = (len(missing_types) + len(extra_types)) // 2
+    overlap = sum(min(expected_counter[k], generated_counter[k])
+                  for k in all_keys)
+    accuracy = overlap / denom
+    rc_accuracy = min(n_expected, n_generated) / denom
+    min_count = min(n_expected, n_generated)
+    rt_accuracy = (overlap / min_count) if min_count > 0 else float('nan')
 
     if strict:
-        accuracy = 1.0 if (room_count_match and room_types_match) else 0.0
-    else:
-        denom = max(n_expected, n_generated)
-        if denom == 0:
-            accuracy = float('nan')
-        else:
-            all_keys = set(expected_counter) | set(generated_counter)
-            overlap = sum(min(expected_counter[k], generated_counter[k])
-                          for k in all_keys)
-            accuracy = overlap / denom
+        import math
+        accuracy = 1.0 if accuracy == 1.0 else 0.0
+        rc_accuracy = 1.0 if rc_accuracy == 1.0 else 0.0
+        if not math.isnan(rt_accuracy):
+            rt_accuracy = 1.0 if rt_accuracy == 1.0 else 0.0
 
     return {
-        'room_count_match': room_count_match,
-        'room_types_match': room_types_match,
         'accuracy': accuracy,
-        'expected_rooms': n_expected,
-        'generated_rooms': n_generated,
-        'expected_types': dict(expected_counter),
-        'generated_types': dict(generated_counter),
-        'missing_types': missing_types,
-        'extra_types': extra_types,
-        'count_error': count_error,
-        'type_error': type_error,
-        'relative_count_error': count_error / n_expected if n_expected > 0 else 0.0,
-        'excess_rooms': n_generated - n_expected,
+        'room_count_accuracy': rc_accuracy,
+        'room_type_accuracy': rt_accuracy,
     }
 
 
@@ -478,101 +501,3 @@ def compute_room_type_accuracy(accessgraph, hypergraph, strict=True):
     leaves = Hypergraph(hypergraph).leaves
     generated_room_types = [leaf['mergeid'] for leaf in leaves]
     return room_type_accuracy(expected_room_types, generated_room_types, strict=strict)
-
-
-def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
-                           skip_ids=None):
-    """Compute room-type accuracy grouped into room-count buckets.
-
-    Per-sample score is multiset **edit proximity** in ``[0, 1]``: intersection
-    size of GT vs predicted room-type multisets divided by ``max(n_gt, n_pred)``.
-    Bucket and overall aggregates use the **sum** of these scores in
-    ``matches`` (so ``matches / total`` is the mean proximity in that bucket).
-
-    Args:
-        accessgraphs: ``{sample_id: accessgraph_dict}``
-        hypergraphs:  ``{sample_id: hypergraph_dict}``
-        buckets: Ordered list of bucket boundaries.  Each entry is an
-            ``int`` or a string like ``'<=4'`` / ``'>=9'``.  Integers
-            create an exact-match bucket; ``'<=N'`` catches everything
-            at or below *N*; ``'>=N'`` catches everything at or above *N*.
-        skip_ids: Optional set of sample IDs to exclude.
-
-    Returns:
-        dict with keys:
-
-        - ``categories``: ``{label: {matches, total}}`` — *matches* is the
-          sum of per-sample proximity scores (float-compatible).
-        - ``category_order``: list of bucket labels in input order
-        - ``overall_matches``: sum of per-sample proximity scores
-        - ``overall_total``: number of samples counted (same as before)
-        - ``skipped``: int
-    """
-    from tqdm import tqdm
-
-    skip_ids = skip_ids or set()
-
-    lower_bound = None
-    upper_bound = None
-    exact_values = []
-
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            lower_bound = int(s.lstrip("<=≤"))
-        elif s.startswith(">=") or s.startswith("≥"):
-            upper_bound = int(s.lstrip(">=≥"))
-        else:
-            exact_values.append(int(s))
-
-    def _bucket_label(n):
-        if lower_bound is not None and n <= lower_bound:
-            return f"<={lower_bound}"
-        if upper_bound is not None and n >= upper_bound:
-            return f">={upper_bound}"
-        if n in exact_values:
-            return str(n)
-        return None
-
-    category_labels = []
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            category_labels.append(f"<={s.lstrip('<=≤')}")
-        elif s.startswith(">=") or s.startswith("≥"):
-            category_labels.append(f">={s.lstrip('>=≥')}")
-        else:
-            category_labels.append(s)
-
-    categories = {label: {"matches": 0, "total": 0} for label in category_labels}
-    overall_matches = 0
-    overall_total = 0
-    skipped = 0
-
-    for sample_id in tqdm(hypergraphs, desc="Comparing rooms"):
-        if sample_id in skip_ids:
-            skipped += 1
-            continue
-        if sample_id not in accessgraphs:
-            continue
-
-        result = compute_room_type_accuracy(
-            accessgraphs[sample_id], hypergraphs[sample_id]
-        )
-        label = _bucket_label(result["expected_rooms"])
-        if label is None:
-            continue
-
-        score = result["accuracy"]
-        categories[label]["total"] += 1
-        overall_total += 1
-        categories[label]["matches"] += score
-        overall_matches += score
-
-    return {
-        "categories": categories,
-        "category_order": category_labels,
-        "overall_matches": overall_matches,
-        "overall_total": overall_total,
-        "skipped": skipped,
-    }

@@ -1,60 +1,49 @@
 #!/usr/bin/env python3
 """
 Score saved inference results against ground truth using metrics from
-``utils/metrics.py``.
+``utils/metrics.py``, then write unified NPZ + TXT reports via
+``utils.report_results``.
 
 Available metrics:
     ged       -- Graph Edit Distance between access graphs
     accuracy  -- Room-type multiset matching (bucketed by room count)
     delta     -- Shape regularity deviation via RGL mesh comparison
-    area_difference -- Relative area error aggregated per room type (see metrics)
+    area_proportion_error -- Area proportion error per room type (see metrics)
 
 Usage:
     # All metrics
     python scripts/score_results.py \\
         --results-file checkpoints/model/test_hypergraphs.json \\
         --test-dir dataset/hypergraph/test \\
-        --metrics ged accuracy delta
+        --output-dir checkpoints/model/eval \\
+        --metrics ged accuracy delta area_proportion_error
 
     # Just GED
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
+        --output-dir eval_output \\
         --metrics ged
 
     # GED with corrected accessgraph (mesh-adjacency corrected)
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
+        --output-dir eval_output \\
         --metrics ged \\
         --correct-accessgraph
 
-    # Accuracy with custom buckets
+    # Accuracy only
     python scripts/score_results.py \\
         --results-file results.json \\
         --test-dir dataset/hypergraph/test \\
-        --metrics accuracy \\
-        --buckets '<=4' 5 6 7 8 '>=9'
-
-    # Delta with CSV output
-    python scripts/score_results.py \\
-        --results-file results.json \\
-        --test-dir dataset/hypergraph/test \\
-        --metrics delta \\
-        --output-csv delta_scores.csv
-
-    # Summary-only (machine-readable, for scripting)
-    python scripts/score_results.py \\
-        --results-file results.json \\
-        --test-dir dataset/hypergraph/test \\
-        --metrics ged accuracy \\
-        --summary-only
+        --output-dir eval_output \\
+        --metrics accuracy
 """
 
 from __future__ import annotations
 
 import copy
-import csv
 import json
 import logging
 import re
@@ -64,20 +53,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 from utils import (
-    bucketed_room_accuracy,
-    compute_room_area_difference_score,
+    compute_room_area_proportion_error,
     compute_room_similarity_score,
+    compute_room_type_accuracy,
     produce_room_area_list,
     produce_room_list,
 )
 from utils.hypergraph import Hypergraph
+from utils.report_results import report_results
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_difference")
+AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_proportion_error")
 
 
 # ===================================================================
@@ -290,20 +281,38 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
 # Metric: Accuracy
 # ===================================================================
 
-def score_accuracy(results, ground_truth, skip_ids, buckets):
-    """Compute bucketed room-type accuracy.
+def score_accuracy(results, ground_truth, skip_ids):
+    """Compute per-sample room-type accuracy (combined, count, type).
 
-    Delegates to :func:`utils.metrics.bucketed_room_accuracy`.
-    Returns ``{"per_sample": None, "summary": {...}}``.
+    Returns ``{"per_sample": [{"accuracy": ..., "room_count_accuracy": ...,
+    "room_type_accuracy": ...}, ...]}``.
     """
-    accessgraphs = {
-        sid: gt["accessgraph"]
-        for sid, gt in ground_truth.items()
-    }
-    stats = bucketed_room_accuracy(
-        accessgraphs, results, buckets, skip_ids=skip_ids,
-    )
-    return {"per_sample": None, "summary": stats}
+    per_sample = []
+    skipped = 0
+
+    for sample_id in tqdm(results, desc="Computing accuracy", unit="sample"):
+        if sample_id in skip_ids:
+            skipped += 1
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+
+        accessgraph = gt["accessgraph"]
+        try:
+            result = compute_room_type_accuracy(accessgraph, results[sample_id])
+            per_sample.append(result)
+        except Exception as exc:
+            logger.warning("Accuracy failed for %s: %s", sample_id, exc)
+            per_sample.append({
+                "accuracy": None,
+                "room_count_accuracy": None,
+                "room_type_accuracy": None,
+            })
+
+    if skipped:
+        logger.info("Accuracy: skipped %d samples", skipped)
+    return {"per_sample": per_sample}
 
 
 # ===================================================================
@@ -353,21 +362,22 @@ def score_delta(results, ground_truth, skip_ids):
 
 
 # ===================================================================
-# Metric: Area difference
+# Metric: Area proportion error
 # ===================================================================
 
-def score_area_difference(results, ground_truth, skip_ids):
-    """Compute relative area error for every sample (aggregated per room type).
+def score_area_proportion_error(results, ground_truth, skip_ids):
+    """Compute area-proportion error for every sample.
 
-    Uses :func:`utils.metrics.compute_room_area_difference_score`: areas are summed
-    per canonical room type in pred vs GT mesh; only types present in both are
-    compared; mean relative error ``abs(A - B) / B`` over those types.
+    Uses :func:`utils.metrics.compute_room_area_proportion_error`: each room's
+    area is converted to a proportion of total apartment area, rooms are paired
+    1-to-1 within each type, and the mean absolute proportion difference is
+    returned.
     """
     per_sample = []
     skipped = 0
     errors = 0
 
-    for sample_id in tqdm(results, desc="Computing area_difference", unit="sample"):
+    for sample_id in tqdm(results, desc="Computing area_proportion_error", unit="sample"):
         if sample_id in skip_ids:
             skipped += 1
             continue
@@ -379,21 +389,21 @@ def score_area_difference(results, ground_truth, skip_ids):
             bounds = gt["bounds"]
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
             gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
-            result = compute_room_area_difference_score(
+            result = compute_room_area_proportion_error(
                 produce_room_area_list(gen_mesh),
                 produce_room_area_list(gt_mesh),
             )
             per_sample.append({
                 "sample_id": sample_id,
-                "area_difference": result['area_difference_score'],
-                "area_difference_detail": result,
+                "area_proportion_error": result['area_proportion_error'],
+                "area_proportion_error_detail": result,
             })
         except Exception as e:
-            logger.warning(f"Area difference failed for {sample_id}: {e}")
-            per_sample.append({"sample_id": sample_id, "area_difference": None, "error": str(e)})
+            logger.warning(f"Area proportion error failed for {sample_id}: {e}")
+            per_sample.append({"sample_id": sample_id, "area_proportion_error": None, "error": str(e)})
             errors += 1
 
-    values = [r["area_difference"] for r in per_sample if r["area_difference"] is not None]
+    values = [r["area_proportion_error"] for r in per_sample if r["area_proportion_error"] is not None]
     summary = {
         "mean": sum(values) / len(values) if values else float("nan"),
         "successful": len(values),
@@ -405,122 +415,12 @@ def score_area_difference(results, ground_truth, skip_ids):
 
 
 # ===================================================================
-# Reporting
-# ===================================================================
-
-def _print_ged_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("GED (Graph Edit Distance)")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.2f}")
-    print(f"  Min:        {s['min']:.2f}")
-    print(f"  Max:        {s['max']:.2f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-
-
-def _print_accuracy_report(result, summary_only):
-    stats = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("ACCURACY BY NUMBER OF ROOMS")
-    print(f"{'=' * 70}\n")
-    print(f"{'Category':<12} {'Matches':<10} {'Total':<10} {'Accuracy'}")
-    print(f"{'-' * 70}")
-
-    for label in stats["category_order"]:
-        cat = stats["categories"][label]
-        if cat["total"] > 0:
-            acc = cat["matches"] / cat["total"] * 100
-            print(f"{label:<12} {cat['matches']:<10} {cat['total']:<10} {acc:>6.1f}%")
-        else:
-            print(f"{label:<12} {cat['matches']:<10} {cat['total']:<10} {'N/A':>6}")
-
-    print(f"{'-' * 70}")
-    if stats["overall_total"] > 0:
-        overall = stats["overall_matches"] / stats["overall_total"] * 100
-        print(
-            f"{'Overall':<12} {stats['overall_matches']:<10} "
-            f"{stats['overall_total']:<10} {overall:>6.1f}%"
-        )
-    print(f"  Excluded:   {stats['skipped']}")
-
-
-def _print_delta_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("DELTA (Shape Regularity)")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.4f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-    if s["errors"]:
-        print(f"  Errors:     {s['errors']}")
-
-
-def _print_area_difference_report(result, summary_only):
-    s = result["summary"]
-    print(f"\n{'=' * 70}")
-    print("AREA DIFFERENCE (Relative Room-Area Error)")
-    print(f"{'=' * 70}")
-    print(f"  Mean:       {s['mean']:.4f}")
-    print(f"  Successful: {s['successful']}/{s['total']}")
-    print(f"  Excluded:   {s['skipped']}")
-    if s["errors"]:
-        print(f"  Errors:     {s['errors']}")
-
-
-_REPORT_PRINTERS = {
-    "ged": _print_ged_report,
-    "accuracy": _print_accuracy_report,
-    "delta": _print_delta_report,
-    "area_difference": _print_area_difference_report,
-}
-
-
-def print_report(metric_name, result, summary_only=False):
-    _REPORT_PRINTERS[metric_name](result, summary_only)
-
-
-def write_csv(path, metric_results, results_keys):
-    """Write a combined CSV with one row per sample.
-
-    Columns: ``sample_id`` + one column per metric that has per-sample data.
-    """
-    col_map = {}
-    for name in ("ged", "delta", "area_difference"):
-        if name in metric_results and metric_results[name]["per_sample"]:
-            col_map[name] = {
-                r["sample_id"]: r.get(name)
-                for r in metric_results[name]["per_sample"]
-            }
-
-    if not col_map:
-        logger.info("No per-sample data to write to CSV.")
-        return
-
-    fieldnames = ["sample_id"] + list(col_map.keys())
-    path = Path(path)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for sid in results_keys:
-            row = {"sample_id": sid}
-            for metric_name, lookup in col_map.items():
-                row[metric_name] = lookup.get(sid)
-            writer.writerow(row)
-
-    logger.info(f"CSV written to {path}")
-
-
-# ===================================================================
 # CLI
 # ===================================================================
 
 def cli():
     import argparse
 
-    # Worker mode: re-invoked as subprocess to compute GED for a single sample.
     if "--_ged-worker" in sys.argv:
         sys.exit(_ged_worker_main())
 
@@ -540,9 +440,13 @@ def cli():
         help="Directory with ground-truth .txt files",
     )
     parser.add_argument(
+        "--output-dir", required=True,
+        help="Directory for results.npz and results.txt output",
+    )
+    parser.add_argument(
         "--metrics", nargs="+", required=True,
         choices=AVAILABLE_METRICS,
-        help="Metrics to compute (ged, accuracy, delta, area_difference)",
+        help="Metrics to compute (ged, accuracy, delta, area_proportion_error)",
     )
     parser.add_argument(
         "--correct-accessgraph",
@@ -560,20 +464,7 @@ def cli():
     parser.add_argument(
         "--skip-ids-file", default=None,
         help="Newline-delimited file of sample IDs to exclude "
-             "(default: utils/skipped_ids)",
-    )
-    parser.add_argument(
-        "--buckets", nargs="+",
-        default=["<=4", "5", "6", "7", "8", ">=9"],
-        help="Accuracy bucket boundaries (default: <=4 5 6 7 8 >=9)",
-    )
-    parser.add_argument(
-        "--output-csv", default=None,
-        help="Write per-sample results to this CSV file",
-    )
-    parser.add_argument(
-        "--summary-only", action="store_true",
-        help="Print only aggregate statistics",
+             "(default: no skipping)",
     )
     args = parser.parse_args()
 
@@ -582,13 +473,11 @@ def cli():
         logger.error(f"Results file not found: {results_path}")
         return 1
 
-    skip_ids_path = (
-        args.skip_ids_file
-        or str(Path(__file__).parent.parent / "utils" / "skipped_ids")
-    )
-    skip_ids = load_skip_ids(skip_ids_path)
-    if skip_ids:
-        logger.info(f"Loaded {len(skip_ids)} skip IDs from {skip_ids_path}")
+    skip_ids = set()
+    if args.skip_ids_file:
+        skip_ids = load_skip_ids(args.skip_ids_file)
+        if skip_ids:
+            logger.info(f"Loaded {len(skip_ids)} skip IDs from {args.skip_ids_file}")
 
     logger.info(f"Loading results from {results_path} ...")
     with open(results_path) as f:
@@ -613,18 +502,77 @@ def cli():
             )
         elif metric == "accuracy":
             metric_results["accuracy"] = score_accuracy(
-                results, ground_truth, skip_ids, args.buckets,
+                results, ground_truth, skip_ids,
             )
         elif metric == "delta":
             metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
-        elif metric == "area_difference":
-            metric_results["area_difference"] = score_area_difference(results, ground_truth, skip_ids)
+        elif metric == "area_proportion_error":
+            metric_results["area_proportion_error"] = score_area_proportion_error(
+                results, ground_truth, skip_ids)
 
-    for metric in args.metrics:
-        print_report(metric, metric_results[metric], args.summary_only)
+    # ── Collect per-sample room counts from GT ─────────────────────────
+    per_sample_room_counts = []
+    for sample_id in results:
+        if sample_id in skip_ids:
+            continue
+        gt = ground_truth.get(sample_id)
+        if gt is None:
+            continue
+        per_sample_room_counts.append(len(gt["accessgraph"].get("nodes", {})))
 
-    if args.output_csv:
-        write_csv(args.output_csv, metric_results, results.keys())
+    # ── Collect per-sample values into flat arrays for the reporter ──
+    all_metrics: dict[str, tuple[str, np.ndarray]] = {}
+
+    ged_result = metric_results.get("ged")
+    if ged_result and ged_result["per_sample"]:
+        all_metrics["geds"] = (
+            "GED",
+            np.array([
+                r["ged"] if r["ged"] is not None else np.nan
+                for r in ged_result["per_sample"]
+            ]),
+        )
+
+    acc_result = metric_results.get("accuracy")
+    if acc_result and acc_result["per_sample"]:
+        for key, npz_key, title in [
+            ("accuracy", "accuracies", "Room Accuracy"),
+            ("room_count_accuracy", "room_count_accuracies", "Room Count Accuracy"),
+            ("room_type_accuracy", "room_type_accuracies", "Room Type Accuracy"),
+        ]:
+            all_metrics[npz_key] = (
+                title,
+                np.array([
+                    r[key] if r[key] is not None else np.nan
+                    for r in acc_result["per_sample"]
+                ]),
+            )
+
+    delta_result = metric_results.get("delta")
+    if delta_result and delta_result["per_sample"]:
+        all_metrics["similarity_scores"] = (
+            "Room Similarity (delta)",
+            np.array([
+                r["delta"] if r["delta"] is not None else np.nan
+                for r in delta_result["per_sample"]
+            ]),
+        )
+
+    ape_result = metric_results.get("area_proportion_error")
+    if ape_result and ape_result["per_sample"]:
+        all_metrics["area_proportion_errors"] = (
+            "Area Proportion Error",
+            np.array([
+                r["area_proportion_error"] if r["area_proportion_error"] is not None else np.nan
+                for r in ape_result["per_sample"]
+            ]),
+        )
+
+    report_results(
+        args.output_dir,
+        metrics=all_metrics,
+        room_counts=np.array(per_sample_room_counts),
+    )
 
     return 0
 

@@ -6,7 +6,7 @@ Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
-  4. Area Difference -- Relative room-area error between paired rooms
+  4. Area Proportion Error -- Mean absolute area-proportion difference between paired rooms
 
 Expects a pre-processed NPZ file via --data_path.  To convert from
 RPLAN JSON files, use benchmark/utils/convert_json_to_npz.py first
@@ -32,9 +32,9 @@ import pickle
 
 from utils.metrics import ged_between_graphs
 from utils.metrics import room_type_accuracy
-from utils.metrics import compute_room_area_difference_score as compute_area_diff_metric
+from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
 from benchmark.src.evaluate_houseganpp import draw_masks
-from benchmark.utils.score_benchmark_result import score_benchmark_result
+from utils.report_results import report_results
 from house_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
@@ -339,6 +339,35 @@ def extract_room_geometries_from_polygons(polygons):
             continue
     
     return room_geometries
+
+
+def compute_spatial_overlap_ratio_from_polygons(polygons):
+    """Spatial overlap ratio for predicted polygons (Shapely-based).
+
+    Returns ``1 - (union_area / sum_of_areas)`` over all room polygons
+    (skipping doors), or ``nan`` if no valid room area exists.
+    """
+    from shapely.ops import unary_union
+
+    shapely_polys = []
+    for poly_data in polygons:
+        if poly_data['room_type'] in [15, 17]:
+            continue
+        try:
+            sp = ShapelyPolygon(poly_data['coords'])
+            if not sp.is_valid:
+                sp = make_valid(sp)
+            if sp.area > 0:
+                shapely_polys.append(sp)
+        except Exception:
+            continue
+    if not shapely_polys:
+        return float('nan')
+    sum_of_areas = sum(p.area for p in shapely_polys)
+    if sum_of_areas == 0:
+        return float('nan')
+    union = unary_union(shapely_polys)
+    return 1.0 - (union.area / sum_of_areas)
 
 
 def compute_room_similarity_score_polygons(pred_polygons, gt_polygons):
@@ -940,13 +969,15 @@ def _make_results_dict():
         'all_geds': [],
         'ged_pairs': [],
         'room_count_accuracies': [],
-        'room_count_errors': [],
-        'room_type_errors': [],
+        'room_count_accuracy_scores': [],
+        'room_type_accuracy_scores': [],
         'similarity_scores': [],
-        'area_difference_scores': [],
+        'area_proportion_errors': [],
+        'spatial_overlap_ratios': [],
         'unmatched_pred_rooms': [],
         'unmatched_gt_rooms': [],
         'matched_room_pairs': [],
+        'per_sample_room_counts': [],
         'hidden_room_count': 0,
     }
 
@@ -1011,6 +1042,12 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
 
     G_true = build_access_graph_from_polygons(gt_polygons)
 
+    gt_room_type_list = [
+        int(p['room_type']) for p in gt_polygons
+        if p['room_type'] not in [15, 17]
+    ]
+    results['per_sample_room_counts'].append(len(gt_room_type_list))
+
     syn_room_types_oh = sample_data.get('syn_room_types_oh', sample_data['gt_room_types_oh'])
     syn_room_indices_oh = sample_data.get('syn_room_indices_oh', sample_data['gt_room_indices_oh'])
     syn_padding_mask = sample_data.get('syn_padding_mask', sample_data['gt_padding_mask'])
@@ -1042,12 +1079,12 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
             results['hidden_room_count'] += 1
 
         room_count_metric = room_type_accuracy(
-            room_count_info['expected_room_types'],
+            gt_room_type_list,
             room_count_info['actual_room_types']
         )
         results['room_count_accuracies'].append(room_count_metric['accuracy'])
-        results['room_count_errors'].append(room_count_metric['count_error'])
-        results['room_type_errors'].append(room_count_metric['type_error'])
+        results['room_count_accuracy_scores'].append(room_count_metric['room_count_accuracy'])
+        results['room_type_accuracy_scores'].append(room_count_metric['room_type_accuracy'])
 
         similarity_result = compute_room_similarity_score_polygons(
             pred_polygons, gt_polygons
@@ -1059,11 +1096,14 @@ def postprocess_sample(sample_data, results, save_graphs, output_dir,
 
         pred_rooms = extract_room_geometries_from_polygons(pred_polygons)
         gt_rooms = extract_room_geometries_from_polygons(gt_polygons)
-        area_diff_result = compute_area_diff_metric(
+        area_prop_result = compute_area_prop_metric(
             _room_geometries_to_area_tuples(pred_rooms),
             _room_geometries_to_area_tuples(gt_rooms),
         )
-        results['area_difference_scores'].append(area_diff_result['area_difference_score'])
+        results['area_proportion_errors'].append(area_prop_result['area_proportion_error'])
+
+        results['spatial_overlap_ratios'].append(
+            compute_spatial_overlap_ratio_from_polygons(pred_polygons))
 
         results['ged_pairs'].append(
             (G_pred, G_true, sample_idx, ged_upper_bound)
@@ -1117,24 +1157,25 @@ def load_and_process_cached_samples(cached_data_path, num_variations, save_graph
     results['all_geds'] = _parallel_ged(results['ged_pairs'])
     return results
 
-def _build_additional_info(results):
-    """Package raw per-sample arrays for ``score_benchmark_result``."""
+def _build_report_kwargs(results):
+    """Package raw per-sample arrays as keyword args for ``report_results``."""
     return {
-        'room_count_accuracy': {
-            'accuracies': results['room_count_accuracies'],
-            'count_errors': results['room_count_errors'],
-            'type_errors': results['room_type_errors'],
+        'metrics': {
+            'geds': ('GED', np.array(results['all_geds'])),
+            'accuracies': ('Room Accuracy', np.array(results['room_count_accuracies'])),
+            'room_count_accuracies': ('Room Count Accuracy', np.array(results['room_count_accuracy_scores'])),
+            'room_type_accuracies': ('Room Type Accuracy', np.array(results['room_type_accuracy_scores'])),
+            'similarity_scores': ('Room Similarity (delta)', np.array(results['similarity_scores'])),
+            'area_proportion_errors': ('Area Proportion Error', np.array(results['area_proportion_errors'])),
+            'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(results['spatial_overlap_ratios'])),
+        },
+        'room_counts': np.array(results['per_sample_room_counts']),
+        'extra': {
             'hidden_count': results['hidden_room_count'],
             'total_samples': len(results['room_count_accuracies']),
-        },
-        'room_similarity': {
-            'scores': results['similarity_scores'],
             'matched_room_pairs': results['matched_room_pairs'],
             'unmatched_pred_rooms': results['unmatched_pred_rooms'],
             'unmatched_gt_rooms': results['unmatched_gt_rooms'],
-        },
-        'area_difference': {
-            'scores': results['area_difference_scores'],
         },
     }
     
@@ -1438,13 +1479,12 @@ def main():
 
         results['all_geds'] = _parallel_ged(results['ged_pairs'])
     
-    score_benchmark_result(
-        all_geds=np.array(results['all_geds']),
+    report_results(
+        args.out,
         num_variations=args.num_variations,
-        output_dir=args.out,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
-        additional_info=_build_additional_info(results),
+        **_build_report_kwargs(results),
     )
     
     return 0

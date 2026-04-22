@@ -965,7 +965,7 @@ class RoomsOnlyEvaluator(Evaluator):
 
     def build_result_template(self, sample):
         r = super().build_result_template(sample)
-        r.update({"room_count_match": False, "room_types_match": False, "room_matching": None})
+        r.update({"room_count_accuracy": 0.0, "room_type_accuracy": 0.0, "room_matching": None})
         return r
 
     def load_model(self):
@@ -1012,9 +1012,9 @@ class RoomsOnlyEvaluator(Evaluator):
         from utils import compute_room_type_accuracy
         rm = compute_room_type_accuracy(sample["accessgraph"], hg.data)
         result["room_matching"] = rm
-        result["room_count_match"] = rm["room_count_match"]
-        result["room_types_match"] = rm["room_types_match"]
-        if rm["room_types_match"]:
+        result["room_count_accuracy"] = rm["room_count_accuracy"]
+        result["room_type_accuracy"] = rm["room_type_accuracy"]
+        if rm["room_type_accuracy"] == 1.0:
             result["success"] = True
 
     def compute_statistics(self, results):
@@ -1022,8 +1022,8 @@ class RoomsOnlyEvaluator(Evaluator):
         timed_out = [r for r in results if r.get("timed_out")]
         json_ok = [r for r in results if r not in json_failed and r not in timed_out]
         valid = [r for r in results if r.get("validation", {}).get("is_valid")]
-        count_match = [r for r in results if r.get("room_count_match")]
-        types_match = [r for r in results if r.get("room_types_match")]
+        count_match = [r for r in results if r.get("room_count_accuracy", 0) == 1.0]
+        types_match = [r for r in results if r.get("room_type_accuracy", 0) == 1.0]
 
         stats: dict = {
             "json_extracted": len(json_ok),

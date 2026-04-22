@@ -3,7 +3,7 @@
 This benchmark evaluates **HouseGAN++** and **House-Diffusion** on the WMR24
 dataset.  It includes automated setup scripts, data conversion utilities, and
 evaluation pipelines with four metrics: GED, room accuracy, delta (geometric
-similarity), and area difference.
+similarity), and area proportion error.
 
 ## Table of Contents
 
@@ -53,8 +53,8 @@ python src/evaluate_houseganpp.py \
     --save_graphs
 ```
 
-Results are saved to `eval_results_houseganpp/benchmark_results.npz` and
-`benchmark_results.txt`.  Comparison images go into `eval_results_houseganpp/fig/`.
+Results are saved to `eval_results_houseganpp/results.npz` and
+`results.txt`.  Comparison images go into `eval_results_houseganpp/fig/`.
 
 ---
 
@@ -80,40 +80,36 @@ cd benchmark
 ./eval_housediffusion.sh
 ```
 
-Results are saved to `eval_results_housediffusion/benchmark_results.npz`.
+Results are saved to `eval_results_housediffusion/results.npz`.
 
 ---
 
 ## Evaluation Metrics
 
 Both evaluation scripts compute four metrics and delegate all statistics
-computation, printing, and file output to `utils/score_benchmark_result.py`:
+computation, printing, and file output to `utils/report_results.py`:
 
 | Metric | Description |
 |---|---|
 | **GED** | Graph Edit Distance between predicted and ground-truth door-based access graphs. Computed with a 10 s timeout per pair; timed-out cases are recorded as NaN. |
 | **Room Count Accuracy** | Exact match rate, mean count error, and mean type error between predicted and expected room sets. |
 | **Delta (Room Similarity)** | Geometric shape similarity between matched predicted and ground-truth room pairs, based on area and perimeter ratios. |
-| **Area Difference** | Mean relative room-area error between paired predicted and ground-truth rooms of the same type. |
+| **Area Proportion Error** | Mean absolute difference between room-area proportions of paired predicted and ground-truth rooms of the same type. |
 
-All metrics are saved to `benchmark_results.npz` and optionally to a
-human-readable `benchmark_results.txt` summary.
+All metrics are saved to `results.npz` and a human-readable
+`results.txt` summary.
 
 ### Inspecting results
 
 ```bash
 # Bin metrics by room count (auto-detects all available metrics in the NPZ)
-python benchmark/utils/analyze_metrics_by_room_count.py \
-    --model houseganpp \
-    --cache_pickle eval_results_houseganpp/generations.pkl \
-    --results_npz eval_results_houseganpp/benchmark_results.npz
+python utils/analyze_metrics_by_room_count.py \
+    --results_npz eval_results_houseganpp/results.npz
 
-# Explicit variation count + JSON export
-python benchmark/utils/analyze_metrics_by_room_count.py \
-    --model housediffusion \
-    --cache_pickle eval_results_housediffusion/generations.pkl \
-    --results_npz eval_results_housediffusion/benchmark_results.npz \
-    --num_variations 5 \
+# With display title + JSON export
+python utils/analyze_metrics_by_room_count.py \
+    --results_npz eval_results_housediffusion/results.npz \
+    --title "House-Diffusion" \
     --output_json binned_stats.json
 ```
 
@@ -166,7 +162,7 @@ HouseGAN++ format.
 ### `src/evaluate_houseganpp.py`
 
 Evaluate HouseGAN++ with four metrics (GED, room accuracy, delta, area
-difference).
+proportion error).
 
 - Incremental generation — generates floorplans room-by-room using
   HouseGAN++'s iterative refinement
@@ -207,22 +203,13 @@ Convert HouseGAN++ JSON files to NPZ format expected by House-Diffusion's
 `RPlanhgDataset`.  Remaps room types and structures the data as `houses`,
 `graphs`, `door_masks`, `self_masks`, `gen_masks`, and `ids` arrays.
 
-### `utils/score_benchmark_result.py`
+**Note:** Reporting and per-room-count analysis have been moved to the shared
+`utils/` package:
 
-Compute, report, and persist benchmark evaluation metrics.  Accepts raw
-per-sample score arrays from evaluation scripts and handles all statistics
-(mean, median, std, variation consistency, etc.), console output, text-file
-summaries, and NPZ serialisation.  Both evaluation scripts pass raw arrays
-here; no statistics are computed in the evaluation scripts themselves.
-
-### `utils/analyze_metrics_by_room_count.py`
-
-Post-evaluation analysis that bins all available metrics by room count.
-Automatically discovers every per-sample score array in the
-`benchmark_results.npz` (GED, accuracy, count error, type error, similarity,
-area difference) and groups samples into bins (\(\leq 4\), 5, 6, 7, 8,
-\(> 8\) rooms).  `num_variations` is auto-detected from the NPZ when
-omitted.
+- **`utils/report_results.py`** -- unified NPZ + TXT reporting used by both
+  benchmark eval scripts and `scripts/score_results.py`.
+- **`utils/analyze_metrics_by_room_count.py`** -- bins NPZ metrics by room
+  count (read from ``room_counts`` in the NPZ) and produces per-bin statistics.
 
 ---
 
@@ -318,13 +305,11 @@ benchmark/
 │   ├── convert_hypergraph_to_housegan_json.py  # WMR24 JSON → HouseGAN++ JSON
 │   ├── convert_json_to_pickle.py               # HouseGAN++ JSON → pickle
 │   ├── convert_json_to_npz.py                  # HouseGAN++ JSON → NPZ
-│   ├── score_benchmark_result.py               # Shared benchmark scoring & saving
-│   ├── analyze_metrics_by_room_count.py        # Post-eval metric binning
 │   └── visualize_rplan_json.py                 # RPLAN JSON visualization
 │
 └── eval_results_*/                      # Output directories (per experiment)
-    ├── benchmark_results.npz                # All metric arrays + summary dicts
-    ├── benchmark_results.txt                # Human-readable summary
+    ├── results.npz                          # All metric arrays + summary dicts
+    ├── results.txt                          # Human-readable summary
     ├── fig/                                 # Comparison images (if --save_graphs)
     └── generations*.pkl                     # Cached generations (if --save_generations)
 ```
