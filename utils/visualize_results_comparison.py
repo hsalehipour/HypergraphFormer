@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Render per-sample comparison figures for generated hypergraphs.
 
-Creates one PNG per sample showing:
+Creates one PNG per sample (2×3 grid):
 1. Ground-truth access graph
-2. Ground-truth apartment mesh
-3. Generated access graph
-4. Generated apartment mesh
+2. Ground-truth mesh
+3. Generated access graph (leaf connectivity)
+4. Generated mesh
+5. Corrected access graph (:meth:`~utils.hypergraph.Hypergraph.correct_accessgraph`)
+6. Same generated mesh (aligned under corrected graph)
 
 By default this script targets the checkpoint-5256 RPLAN results discussed in
 the current workflow and writes images into ``checkpoint-5256-viz/`` at the
@@ -107,6 +109,19 @@ def access_graph_with_outside(hg: Hypergraph, base_ag: dict) -> dict:
     return ag
 
 
+def _corrected_access_graph_for_viz(gen_hg: Hypergraph, bounds: dict) -> dict | None:
+    """``correct_accessgraph`` plus outside-node augmentation for plotting; ``None`` on failure."""
+    if not (isinstance(bounds, dict) and bounds.get("corners")):
+        return None
+    try:
+        corr = gen_hg.correct_accessgraph(bounds)
+    except Exception:
+        return None
+    if not corr or not corr.get("nodes"):
+        return None
+    return access_graph_with_outside(gen_hg, corr)
+
+
 def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path: Path) -> None:
     import networkx as nx
 
@@ -118,10 +133,11 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
     gen_ag = access_graph_with_outside(gen_hg, gen_hg.access_graph)
     bounds = gt.get("bounds", {}) or {}
     polygon = boundary_polygon(bounds)
+    gen_ag_corr = _corrected_access_graph_for_viz(gen_hg, bounds)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    ax_gt_ag, ax_gt_mesh = axes[0]
-    ax_gen_ag, ax_gen_mesh = axes[1]
+    fig, axes = plt.subplots(2, 3, figsize=(24, 12))
+    ax_gt_ag, ax_gen_ag, ax_gen_corr = axes[0]
+    ax_gt_mesh, ax_gen_mesh, ax_gen_mesh_b = axes[1]
 
     fig.suptitle(sample_id, fontsize=14, fontweight="bold")
 
@@ -140,6 +156,29 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
         components=list(nx.connected_components(accessgraph_dict_to_nx(gen_ag))),
         node_labels=plotter.make_distinct_labels(gen_ag),
     )
+
+    if gen_ag_corr is not None:
+        plotter.plot_access_graph_on_axis(
+            gen_ag_corr,
+            ax_gen_corr,
+            title="Generated (correct_accessgraph)",
+            components=list(
+                nx.connected_components(accessgraph_dict_to_nx(gen_ag_corr))
+            ),
+            node_labels=plotter.make_distinct_labels(gen_ag_corr),
+        )
+    else:
+        ax_gen_corr.text(
+            0.5,
+            0.5,
+            "correct_accessgraph\nunavailable\n(no bounds or mesh failed)",
+            ha="center",
+            va="center",
+            transform=ax_gen_corr.transAxes,
+            fontsize=10,
+        )
+        ax_gen_corr.set_title("Generated (correct_accessgraph)")
+        ax_gen_corr.axis("off")
 
     try:
         gt_mesh = gt_hg.to_mesh(bounds=bounds)
@@ -165,15 +204,39 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
             title="Generated Mesh",
             face_labels=face_labels_for_mesh(gen_mesh, plotter.make_distinct_labels(gen_ag)),
         )
+        plotter.plot_mesh_on_axis(
+            gen_mesh,
+            ax_gen_mesh_b,
+            boundary_polygon=polygon,
+            title="Generated Mesh (same)",
+            face_labels=face_labels_for_mesh(gen_mesh, plotter.make_distinct_labels(gen_ag)),
+        )
     except Exception as exc:
         ax_gen_mesh.text(0.5, 0.5, f"Generated mesh failed:\n{exc}", ha="center", va="center",
                          transform=ax_gen_mesh.transAxes, wrap=True)
         ax_gen_mesh.set_title("Generated Mesh")
         ax_gen_mesh.axis("off")
+        ax_gen_mesh_b.text(0.5, 0.5, f"Generated mesh failed:\n{exc}", ha="center", va="center",
+                             transform=ax_gen_mesh_b.transAxes, wrap=True)
+        ax_gen_mesh_b.set_title("Generated Mesh (same)")
+        ax_gen_mesh_b.axis("off")
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _results_key_for_id(results: dict, sid: str):
+    """Return the key present in *results* for string id *sid* (str or int JSON keys)."""
+    if sid in results:
+        return sid
+    try:
+        n = int(sid, 10)
+        if n in results:
+            return n
+    except ValueError:
+        pass
+    return None
 
 
 def main() -> int:
@@ -182,6 +245,13 @@ def main() -> int:
     parser.add_argument("--test-dir", type=Path, default=DEFAULT_TEST_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        default=None,
+        metavar="ID",
+        help="Render only these sample IDs, in this order (e.g. --only 0 1 103)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -192,15 +262,29 @@ def main() -> int:
     ground_truth = load_ground_truth(args.test_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    sample_ids = sorted(results.keys())
-    if args.max_samples is not None:
-        sample_ids = sample_ids[: args.max_samples]
+    if args.only is not None:
+        id_and_key: list[tuple[str, object]] = []
+        for raw in args.only:
+            sid = str(raw)
+            rk = _results_key_for_id(results, sid)
+            if rk is None:
+                LOGGER.warning("Sample %s not in results file, skipping", sid)
+                continue
+            id_and_key.append((sid, rk))
+        sample_ids = id_and_key
+        if args.max_samples is not None:
+            LOGGER.warning("--max-samples ignored when --only is set")
+    else:
+        sample_ids = sorted(results.keys())
+        if args.max_samples is not None:
+            sample_ids = sample_ids[: args.max_samples]
+        sample_ids = [(str(s), s) for s in sample_ids]
 
     LOGGER.info("Rendering %d samples into %s", len(sample_ids), args.output_dir)
 
     rendered = 0
     skipped = 0
-    for sample_id in sample_ids:
+    for sample_id, result_key in sample_ids:
         gt = ground_truth.get(sample_id)
         if gt is None:
             LOGGER.warning("Skipping %s: missing ground truth", sample_id)
@@ -208,7 +292,12 @@ def main() -> int:
             continue
 
         try:
-            render_sample(sample_id, gt, results[sample_id], args.output_dir / f"{sample_id}.png")
+            render_sample(
+                sample_id,
+                gt,
+                results[result_key],
+                args.output_dir / f"{sample_id}.png",
+            )
             rendered += 1
         except Exception as exc:
             LOGGER.warning("Skipping %s: %s", sample_id, exc)

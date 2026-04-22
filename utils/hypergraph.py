@@ -106,57 +106,31 @@ class Hypergraph:
 
     @property
     def access_graph(self) -> dict:
-        """Extract ``{nodes, edges}`` access graph from leaf connectivity.
-
-        **One graph node per final BSP leaf**, with stable ids ``\"1\"``…``\"N\"`` in
-        :meth:`leaves` order. Room type is each leaf's ``mergeid``. Edges follow
-        ``connected`` lists; when several leaves share the same ``name``, a neighbor
-        name may refer to multiple indices — we pick a unique target when possible
-        (single candidate, or the only reciprocal ``connected`` match).
-        """
+        """Extract ``{nodes, edges}`` access graph from leaf connectivity."""
         leaves = self.leaves
         if not leaves:
             return {"nodes": {}, "edges": []}
 
-        n = len(leaves)
-        nodes = {
-            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(n)
+        leaf_name_to_id = {
+            leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)
         }
 
-        name_to_indices: dict[str, list[int]] = {}
-        for i, leaf in enumerate(leaves):
-            nm = leaf.get("name", "")
-            name_to_indices.setdefault(nm, []).append(i)
+        nodes = {}
+        for leaf in leaves:
+            lid = leaf_name_to_id[leaf["name"]]
+            nodes[lid] = leaf.get("mergeid", "Unknown")
 
-        edges: list[list[str]] = []
-        edges_set: set[tuple[str, str]] = set()
-        my_name = [leaves[i].get("name", "") for i in range(n)]
-
-        for i, leaf in enumerate(leaves):
-            lid = str(i + 1)
+        edges = []
+        edges_set: set = set()
+        for leaf in leaves:
+            lid = leaf_name_to_id[leaf["name"]]
             for connected_name in leaf.get("connected", []):
-                if not connected_name:
-                    continue
-                candidates = [
-                    j for j in name_to_indices.get(connected_name, []) if j != i
-                ]
-                if not candidates:
-                    continue
-                if len(candidates) == 1:
-                    chosen = candidates[0]
-                else:
-                    reciprocal = [
-                        j
-                        for j in candidates
-                        if my_name[i] in (leaves[j].get("connected") or [])
-                    ]
-                    chosen = reciprocal[0] if len(reciprocal) == 1 else candidates[0]
-
-                cid = str(chosen + 1)
-                edge = tuple(sorted([lid, cid], key=lambda x: int(x)))
-                if edge not in edges_set:
-                    edges_set.add(edge)
-                    edges.append([edge[0], edge[1]])
+                if connected_name in leaf_name_to_id:
+                    cid = leaf_name_to_id[connected_name]
+                    edge = tuple(sorted([lid, cid], key=lambda x: int(x)))
+                    if edge not in edges_set:
+                        edges_set.add(edge)
+                        edges.append([edge[0], edge[1]])
 
         return {"nodes": nodes, "edges": edges}
 
@@ -644,95 +618,187 @@ class Hypergraph:
         return labels
 
     def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
-        """Correct access graph to match mesh adjacency. Returns {nodes, edges} dict."""
-        import networkx as nx
-        from shapely.geometry import Polygon
-        from shapely.affinity import scale as _scale
+        """Correct the leaf access graph using **mesh adjacency between access node ids**.
 
-        ag = copy.deepcopy(self.access_graph or {})
+        Pipeline (all geometric reasoning uses ids, not room types):
+
+        1. Start from :attr:`access_graph` edges as pairs of node ids ``\"1\"``…``\"N\"``.
+        2. Build mesh adjacency: each face’s ``unique_id`` is the BSP leaf ``name``; map that to
+           the same access id as :attr:`access_graph`. Two ids are mesh-adjacent if some pair of
+           their faces has a shared wall / non-sliver contact (see below).
+        3. Drop predicted edges that are not mesh-adjacent; add mesh edges (sorted by id) until the
+           graph is connected when possible.
+        4. **Only then** fill ``nodes`` with each id’s ``mergeid`` (room type) from the hypergraph
+           leaves — edges stay id–id pairs.
+
+        Args:
+            bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
+            scale_factor: Uniform scale of face polygons about the centroid before adjacency tests.
+                Default ``1.05`` matches the prior heuristic (bridges small mesh gaps); use ``1.0`` for
+                no inflation (stricter contact).
+        """
+        from shapely.affinity import scale as _scale
+        from shapely.geometry import Polygon
+
+        def _geoms_from_collection(geom) -> list:
+            if geom.geom_type == "GeometryCollection":
+                return list(geom.geoms)
+            return [geom]
+
+        def _polygons_adjacent(a: Polygon, b: Polygon) -> bool:
+            if a.is_empty or b.is_empty:
+                return False
+            try:
+                inter = a.intersection(b)
+            except Exception:
+                return False
+            if inter.is_empty:
+                return False
+            if inter.geom_type == "Point":
+                return False
+            if inter.geom_type in ("LineString", "LinearRing"):
+                return inter.length > 1e-4
+            if inter.geom_type == "MultiLineString":
+                return inter.length > 1e-4
+            if inter.geom_type == "Polygon":
+                return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
+            if inter.geom_type == "GeometryCollection":
+                for g in _geoms_from_collection(inter):
+                    if g.geom_type == "Point":
+                        continue
+                    if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "MultiLineString" and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "Polygon" and g.area > max(
+                        1e-4, 1e-3 * min(a.area, b.area)
+                    ):
+                        return True
+            return False
+
+        leaves = self.leaves
+        if not leaves:
+            return {"nodes": {}, "edges": []}
+
+        leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
+        node_ids = set(leaf_name_to_id.values())
+
+        ag = self.access_graph or {}
         if not isinstance(ag, dict):
             ag = {}
-        mesh = self.to_mesh(bounds=bounds)
 
-        n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-        if n <= 0:
-            return ag
-        face_types, polys = [], []
-        for i in range(n):
-            f = mesh.faceList[i]
-            face_types.append(str(getattr(f, "merge_id", "unknown")).strip().lower())
-            pts = f.getPoints()
-            corners = [(float(pts[j].X), float(pts[j].Y)) for j in range(int(getattr(pts, "Count", 0) or 0))]
-            polys.append(Polygon(corners) if len(corners) >= 3 else Polygon())
-        polys = [_scale(p, xfact=scale_factor, yfact=scale_factor, origin="centroid") if not p.is_empty else p for p in polys]
-
-        adj_pairs = set()
-        for i in range(n):
-            if polys[i].is_empty:
-                continue
-            for j in range(i + 1, n):
-                if polys[j].is_empty:
-                    continue
-                try:
-                    if polys[i].intersection(polys[j]).area > 1e-12:
-                        adj_pairs.add(tuple(sorted([face_types[i], face_types[j]])))
-                except Exception:
-                    pass
-
-        nodes = (ag.get("nodes") or {}).copy()
-        edges = list((ag.get("edges") or []))
-        failed, lost = set(), set()
-        for e in edges:
+        raw_edges: list[list[str]] = []
+        for e in (ag.get("edges") or []):
             if not isinstance(e, (list, tuple)) or len(e) != 2:
                 continue
             u, v = str(e[0]), str(e[1])
-            a, b = sorted([str(nodes.get(u, "unknown")).strip().lower(), str(nodes.get(v, "unknown")).strip().lower()])
-            if (a, b) not in adj_pairs:
-                failed.add(tuple(sorted([u, v])))
-                lost.update([u, v])
-        edges = [[u, v] for u, v in edges if tuple(sorted([str(u), str(v)])) not in failed]
+            if u not in node_ids or v not in node_ids or u == v:
+                continue
+            raw_edges.append([u, v])
 
-        g = nx.Graph()
-        for nid, t in nodes.items():
-            g.add_node(str(nid), type=str(t).strip().lower())
-        for u, v in edges:
-            u, v = str(u), str(v)
-            if u in g and v in g and u != v:
-                g.add_edge(u, v)
+        def _edge_pair(u: str, v: str) -> tuple[str, str]:
+            return tuple(sorted((str(u), str(v)), key=int))
 
-        def adj_for(t):
-            t = str(t).strip().lower()
-            return {b if a == t else a for a, b in adj_pairs if t in (a, b)}
+        mesh = self.to_mesh(bounds=bounds)
+        n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+        if n_faces <= 0:
+            id_to_mergeid = {
+                str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+            }
+            return {
+                "nodes": {k: id_to_mergeid[k] for k in node_ids if k in id_to_mergeid},
+                "edges": [
+                    [p[0], p[1]]
+                    for p in sorted({_edge_pair(u, v) for u, v in raw_edges})
+                ],
+            }
 
-        for nid in [n for n in g.nodes() if g.degree(n) == 0]:
-            at = adj_for(g.nodes[nid].get("type", "unknown"))
-            for o in g.nodes():
-                if o != nid and str(g.nodes[o].get("type", "unknown")).strip().lower() in at:
-                    g.add_edge(nid, o)
-                    edges.append([nid, o])
-                    break
+        polys: list[Polygon] = []
+        face_node: list[str | None] = []
+        for i in range(n_faces):
+            face = mesh.faceList[i]
+            uid = getattr(face, "unique_id", "") or ""
+            face_node.append(leaf_name_to_id.get(uid))
+            pts = face.getPoints()
+            corners = [
+                (float(pts[j].X), float(pts[j].Y))
+                for j in range(int(getattr(pts, "Count", 0) or 0))
+            ]
+            poly = Polygon(corners) if len(corners) >= 3 else Polygon()
+            if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+                poly = _scale(
+                    poly,
+                    xfact=float(scale_factor),
+                    yfact=float(scale_factor),
+                    origin="centroid",
+                )
+            polys.append(poly)
 
-        while True:
-            comps = list(nx.connected_components(g))
-            if len(comps) <= 1:
-                break
-            merged = False
-            for comp in comps:
-                cand = next((n for n in comp if n in lost), next(iter(comp)))
-                at = adj_for(g.nodes[cand].get("type", "unknown"))
-                for o in g.nodes():
-                    if o in comp or str(g.nodes[o].get("type", "unknown")).strip().lower() not in at:
-                        continue
-                    g.add_edge(cand, o)
-                    edges.append([cand, o])
-                    merged = True
-                    break
-                if merged:
-                    break
-            if not merged:
-                break
+        mesh_adj: set[tuple[str, str]] = set()
+        for i in range(n_faces):
+            u = face_node[i]
+            if u is None or polys[i].is_empty:
+                continue
+            for j in range(i + 1, n_faces):
+                v = face_node[j]
+                if v is None or polys[j].is_empty or u == v:
+                    continue
+                try:
+                    if _polygons_adjacent(polys[i], polys[j]):
+                        mesh_adj.add(_edge_pair(u, v))
+                except Exception:
+                    continue
 
-        return {"nodes": {str(n): str(g.nodes[n].get("type", "unknown")) for n in g.nodes()}, "edges": [[str(u), str(v)] for u, v in g.edges()]}
+        kept: list[tuple[str, str]] = []
+        seen_kept: set[tuple[str, str]] = set()
+        for u, v in raw_edges:
+            ep = _edge_pair(u, v)
+            if ep in mesh_adj and ep not in seen_kept:
+                seen_kept.add(ep)
+                kept.append(ep)
+
+        parent = {n: n for n in node_ids}
+
+        def _find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(x: str, y: str) -> bool:
+            px, py = _find(x), _find(y)
+            if px == py:
+                return False
+            parent[px] = py
+            return True
+
+        final_pairs: list[tuple[str, str]] = list(kept)
+        for u, v in kept:
+            _union(u, v)
+
+        for u, v in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1]))):
+            if u not in node_ids or v not in node_ids:
+                continue
+            if _union(u, v):
+                final_pairs.append((u, v))
+
+        out_edges: list[list[str]] = []
+        seen_out: set[tuple[str, str]] = set()
+        for u, v in final_pairs:
+            ep = _edge_pair(u, v)
+            if ep not in seen_out:
+                seen_out.add(ep)
+                out_edges.append([ep[0], ep[1]])
+
+        out_edges.sort(key=lambda e: (int(e[0]), int(e[1])))
+
+        id_to_mergeid = {
+            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+        }
+        return {
+            "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
+            "edges": out_edges,
+        }
 
     def to_apartment(self, polygon, apt_id="generated",
                      RGL=None, Collections=None, verbose=False):
