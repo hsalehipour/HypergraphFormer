@@ -106,31 +106,57 @@ class Hypergraph:
 
     @property
     def access_graph(self) -> dict:
-        """Extract ``{nodes, edges}`` access graph from leaf connectivity."""
+        """Extract ``{nodes, edges}`` access graph from leaf connectivity.
+
+        **One graph node per final BSP leaf**, with stable ids ``\"1\"``…``\"N\"`` in
+        :meth:`leaves` order. Room type is each leaf's ``mergeid``. Edges follow
+        ``connected`` lists; when several leaves share the same ``name``, a neighbor
+        name may refer to multiple indices — we pick a unique target when possible
+        (single candidate, or the only reciprocal ``connected`` match).
+        """
         leaves = self.leaves
         if not leaves:
             return {"nodes": {}, "edges": []}
 
-        leaf_name_to_id = {
-            leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)
+        n = len(leaves)
+        nodes = {
+            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(n)
         }
 
-        nodes = {}
-        for leaf in leaves:
-            lid = leaf_name_to_id[leaf["name"]]
-            nodes[lid] = leaf.get("mergeid", "Unknown")
+        name_to_indices: dict[str, list[int]] = {}
+        for i, leaf in enumerate(leaves):
+            nm = leaf.get("name", "")
+            name_to_indices.setdefault(nm, []).append(i)
 
-        edges = []
-        edges_set: set = set()
-        for leaf in leaves:
-            lid = leaf_name_to_id[leaf["name"]]
+        edges: list[list[str]] = []
+        edges_set: set[tuple[str, str]] = set()
+        my_name = [leaves[i].get("name", "") for i in range(n)]
+
+        for i, leaf in enumerate(leaves):
+            lid = str(i + 1)
             for connected_name in leaf.get("connected", []):
-                if connected_name in leaf_name_to_id:
-                    cid = leaf_name_to_id[connected_name]
-                    edge = tuple(sorted([lid, cid], key=lambda x: int(x)))
-                    if edge not in edges_set:
-                        edges_set.add(edge)
-                        edges.append([edge[0], edge[1]])
+                if not connected_name:
+                    continue
+                candidates = [
+                    j for j in name_to_indices.get(connected_name, []) if j != i
+                ]
+                if not candidates:
+                    continue
+                if len(candidates) == 1:
+                    chosen = candidates[0]
+                else:
+                    reciprocal = [
+                        j
+                        for j in candidates
+                        if my_name[i] in (leaves[j].get("connected") or [])
+                    ]
+                    chosen = reciprocal[0] if len(reciprocal) == 1 else candidates[0]
+
+                cid = str(chosen + 1)
+                edge = tuple(sorted([lid, cid], key=lambda x: int(x)))
+                if edge not in edges_set:
+                    edges_set.add(edge)
+                    edges.append([edge[0], edge[1]])
 
         return {"nodes": nodes, "edges": edges}
 
