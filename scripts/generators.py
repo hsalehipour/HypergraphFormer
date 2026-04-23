@@ -485,6 +485,11 @@ class GPTGenerator(HypergraphGenerator):
             {"role": "user", "content": prompt},
         ]
 
+    def _openai_uses_max_completion_tokens(self) -> bool:
+        """``gpt-5*``, ``o1*``, ``o3*`` chat models reject ``max_tokens``; use ``max_completion_tokens``."""
+        name = self.model_name
+        return name.startswith("gpt-5") or name.startswith("o1") or name.startswith("o3")
+
     def generate(self, prompt: str, *, max_tokens: int | None = None,
                  temperature: float | None = None,
                  timeout: int | None = None) -> GenerationResult:
@@ -493,11 +498,15 @@ class GPTGenerator(HypergraphGenerator):
         msgs = self._messages(prompt)
         estimated_input = len(prompt) // 4
 
+        create_kwargs: dict = dict(model=self.model_name, messages=msgs)
+        if self._openai_uses_max_completion_tokens():
+            create_kwargs["max_completion_tokens"] = mt
+        else:
+            create_kwargs["max_tokens"] = mt
+            create_kwargs["temperature"] = temp
+
         start = time.time()
-        response = self.client.chat.completions.create(
-            model=self.model_name, messages=msgs,
-            max_tokens=mt, temperature=temp,
-        )
+        response = self.client.chat.completions.create(**create_kwargs)
         elapsed = time.time() - start
 
         text = response.choices[0].message.content
@@ -521,14 +530,8 @@ class GPTGenerator(HypergraphGenerator):
         start = time.time()
         generated = ""
 
-        use_new_api = (
-            self.model_name.startswith("gpt-5")
-            or self.model_name.startswith("o1")
-            or self.model_name.startswith("o3")
-        )
-
         create_kwargs = dict(model=self.model_name, messages=msgs, stream=True)
-        if use_new_api:
+        if self._openai_uses_max_completion_tokens():
             create_kwargs["max_completion_tokens"] = mt
         else:
             create_kwargs["max_tokens"] = mt
