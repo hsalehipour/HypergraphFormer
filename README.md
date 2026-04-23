@@ -87,8 +87,8 @@ HypergraphFormer/
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
 │   ├── rlft_pipeline.py             GRPO reinforcement learning fine-tuning (RLFT)
 │   │
-│   │  # Few-shot generation (single-sample CLI + generator library)
-│   ├── fewshot_generator.py         OOP generator (QwenGenerator, GPTGenerator)
+│   │  # Generator classes (library, no CLI)
+│   ├── generators.py                HypergraphGenerator, QwenGenerator, GPTGenerator
 │   │
 │   │  # Evaluation (all modes via --mode flag)
 │   ├── evaluator.py                 Unified evaluator (trained, rooms-only,
@@ -411,16 +411,16 @@ python scripts/score_results.py \
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++ and House-Diffusion baselines on the WMR24 dataset.
 
-### 8. Generate a single hypergraph (interactive)
+### 8. Evaluate a single hypergraph (quick test)
 
 ```bash
-# With Qwen (local, streaming progress bar)
-python scripts/fewshot_generator.py --backend qwen \
-    --from-dataset --examples-dir eval_format/train
+# Few-shot Qwen on one sample
+python scripts/evaluator.py --mode fewshot-qwen \
+    --dataset-dir eval_format/train --max-samples 1
 
-# With GPT (OpenAI API — requires OPENAI_API_KEY in .env)
-python scripts/fewshot_generator.py --backend gpt \
-    --from-dataset --examples-dir eval_format/train
+# Few-shot GPT on one sample (requires OPENAI_API_KEY in .env)
+python scripts/evaluator.py --mode fewshot-gpt \
+    --dataset-dir eval_format/train --max-samples 1
 ```
 
 ### 9. Run batch few-shot experiments

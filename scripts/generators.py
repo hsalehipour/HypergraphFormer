@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
-Few-Shot Hypergraph Generator -- OOP consolidation.
+Hypergraph generator classes (library module, no CLI).
 
-Provides ``QwenGenerator``, ``VllmQwenGenerator``, and ``GPTGenerator`` for
-generating floor-plan hypergraphs from access graphs using few-shot prompting.
+Provides ``QwenGenerator``, ``VllmQwenGenerator``, and ``GPTGenerator`` --
+prompt-agnostic inference engines for generating floor-plan hypergraphs.
 
-The generator classes are also imported by ``scripts/evaluator.py`` for batch
-evaluation.  For batch runs use the evaluator directly::
+Used by ``scripts/evaluator.py`` for evaluation::
 
     python scripts/evaluator.py --mode fewshot-qwen --dataset-dir data/test
-    python scripts/evaluator.py --mode fewshot-gpt  --dataset-dir data/test
-
-CLI usage (single-sample, interactive):
-    # Qwen (streaming; vLLM used by default if installed)
-    python scripts/fewshot_generator.py --backend qwen --from-dataset
-
-    # GPT
-    python scripts/fewshot_generator.py --backend gpt --from-dataset --model gpt-4
+    python scripts/evaluator.py --mode trained --model checkpoints/lora
 """
 
 from __future__ import annotations
@@ -24,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -35,8 +26,6 @@ from typing import Optional
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from utils.hypergraph import Hypergraph
-from utils.prompts import create_structured_prompt
-from utils.data_loading import load_example_hypergraphs, load_target_from_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +64,14 @@ class GenerationResult:
 # Base class
 # ---------------------------------------------------------------------------
 
-class FewShotGenerator(ABC):
-    """Abstract base for few-shot hypergraph generators."""
+class HypergraphGenerator(ABC):
+    """Abstract base for hypergraph generators."""
 
     def __init__(self, model_name: str, *, max_tokens: int = 5120,
                  temperature: float = 0.7):
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
-
-    # -- abstract interface --------------------------------------------------
 
     @abstractmethod
     def generate(self, prompt: str, *, max_tokens: int | None = None,
@@ -101,149 +88,12 @@ class FewShotGenerator(ABC):
     def extract_hypergraph(self, response: str) -> Hypergraph | None:
         """Extract a ``Hypergraph`` from the raw model response."""
 
-    # -- shared helpers ------------------------------------------------------
-
-    def load_examples(self, examples_dir, num_examples=3, exclude_file=None,
-                      seed=None):
-        return load_example_hypergraphs(
-            examples_dir, num_examples, exclude_file=exclude_file, seed=seed,
-        )
-
-    @staticmethod
-    def build_prompt(examples, target_accessgraph=None):
-        return create_structured_prompt(examples, target_accessgraph)
-
-    def validate_and_log(self, hg, target_accessgraph, *, debug=False):
-        is_valid, passed, failed, ged_info = hg.validate(
-            target_accessgraph, debug=debug,
-        )
-
-        logger.info("\n" + "=" * 80)
-        logger.info("VALIDATION RESULTS")
-        logger.info("=" * 80)
-        logger.info(f"\nPASSED CHECKS ({len(passed)}):")
-        for c in passed:
-            logger.info(f"  {c}")
-        if failed:
-            logger.warning(f"\nFAILED CHECKS ({len(failed)}):")
-            for c in failed:
-                logger.warning(f"  {c}")
-        else:
-            logger.info("\nFAILED CHECKS (0): None")
-        logger.info("=" * 80)
-        if is_valid:
-            logger.info("Overall: VALID")
-        else:
-            logger.warning(f"Overall: INVALID -- {len(failed)} check(s) failed")
-        logger.info("=" * 80 + "\n")
-
-        if ged_info:
-            logger.info("=" * 80)
-            logger.info("GRAPH EDIT DISTANCE ANALYSIS")
-            logger.info("=" * 80)
-            logger.info(f"Raw GED: {ged_info['ged']:.2f}")
-            logger.info("=" * 80 + "\n")
-
-        return is_valid, passed, failed, ged_info
-
-    # -- CLI runners ---------------------------------------------------------
-
-    def run_single(self, args) -> int:
-        """Single-sample generation (interactive)."""
-        target_accessgraph = None
-        target_filename = None
-        ground_truth_hypergraph = None
-
-        if args.from_dataset:
-            target_dir = getattr(args, "target_dir", None) or args.examples_dir
-            logger.info(f"Loading target from dataset: {target_dir}")
-            try:
-                target_accessgraph, target_filename, ground_truth_hypergraph = (
-                    load_target_from_dataset(target_dir, args.target_file)
-                )
-                nodes = len(target_accessgraph.get("nodes", {}))
-                edges = len(target_accessgraph.get("edges", []))
-                logger.info(f"Loaded target with {nodes} nodes, {edges} edges")
-            except Exception as e:
-                logger.error(f"Failed to load target from dataset: {e}")
-                return 1
-        elif args.accessgraph:
-            logger.info(f"Loading target access graph from: {args.accessgraph}")
-            try:
-                with open(args.accessgraph, "r") as f:
-                    target_accessgraph = json.load(f)
-                nodes = len(target_accessgraph.get("nodes", {}))
-                edges = len(target_accessgraph.get("edges", []))
-                logger.info(f"Loaded access graph with {nodes} nodes, {edges} edges")
-            except Exception as e:
-                logger.error(f"Failed to load access graph: {e}")
-                return 1
-        else:
-            logger.info("No target access graph -- will generate new floor plan")
-
-        examples = self.load_examples(
-            args.examples_dir, args.num_examples, exclude_file=target_filename,
-        )
-        logger.info(f"Loaded examples: {', '.join(e['filename'] for e in examples)}")
-
-        prompt = self.build_prompt(examples, target_accessgraph)
-
-        with open("last_prompt.txt", "w") as f:
-            f.write(prompt)
-        logger.info("Prompt saved to: last_prompt.txt")
-
-        logger.info("Generating hypergraph...")
-        result = self.generate_streaming(prompt)
-
-        if result.text is None:
-            logger.error("Generation returned no text")
-            return 1
-
-        with open("last_response.txt", "w") as f:
-            f.write(result.text)
-        logger.info("Full response saved to: last_response.txt")
-
-        hg = self.extract_hypergraph(result.text)
-        if hg is None:
-            logger.error("Failed to extract valid JSON from response")
-            return 1
-
-        logger.info("Successfully extracted JSON")
-
-        is_valid, _, _, ged_info = self.validate_and_log(
-            hg, target_accessgraph, debug=args.debug,
-        )
-
-        output_path = Path(args.output)
-        with open(output_path, "w") as f:
-            json.dump(hg.data, f, indent=2)
-        logger.info(f"Generated hypergraph saved to: {output_path}")
-
-        logger.info("=" * 80)
-        logger.info("GENERATION SUMMARY")
-        logger.info("=" * 80)
-        logger.info(f"Model: {self.model_name}")
-        logger.info(f"Examples used: {args.num_examples}")
-        logger.info(f"Input tokens: {result.input_tokens:,}")
-        logger.info(f"Generation time: {result.generation_time:.1f}s")
-        if target_accessgraph and target_filename:
-            nodes = len(target_accessgraph.get("nodes", {}))
-            edges = len(target_accessgraph.get("edges", []))
-            logger.info(f"Target: {target_filename} ({nodes} nodes, {edges} edges)")
-        logger.info(f"Output: {output_path}")
-        logger.info(f"Valid: {is_valid}")
-        if ged_info and target_accessgraph:
-            logger.info(f"GED: {ged_info['ged']:.2f}")
-        logger.info("=" * 80)
-
-        return 0 if is_valid else 1
-
 
 # ---------------------------------------------------------------------------
 # Qwen backend
 # ---------------------------------------------------------------------------
 
-class QwenGenerator(FewShotGenerator):
+class QwenGenerator(HypergraphGenerator):
     """Local Qwen (HuggingFace) generator."""
 
     def __init__(self, model_name: str = "Qwen/Qwen3-4B-Instruct-2507", *,
@@ -381,7 +231,7 @@ def _wrap_vllm_completion_for_qwen_parse(generated_text: str) -> str:
     return f"{marker}\n{g}\n<|redacted_im_end|>"
 
 
-class VllmQwenGenerator(FewShotGenerator):
+class VllmQwenGenerator(HypergraphGenerator):
     """Local Qwen via vLLM (faster batched inference; aligns with rlft_pipeline / evaluate_rl_model)."""
 
     def __init__(
@@ -609,7 +459,7 @@ class VllmQwenGenerator(FewShotGenerator):
 # GPT backend
 # ---------------------------------------------------------------------------
 
-class GPTGenerator(FewShotGenerator):
+class GPTGenerator(HypergraphGenerator):
     """OpenAI API generator."""
 
     def __init__(self, model_name: str = "gpt-4", *, api_key: str | None = None,
@@ -705,99 +555,3 @@ class GPTGenerator(FewShotGenerator):
     def extract_hypergraph(self, response: str) -> Hypergraph | None:
         return Hypergraph.from_gpt_response(response)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def cli():
-    import argparse
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
-    parser = argparse.ArgumentParser(
-        description="Few-shot hypergraph generation (Qwen / GPT)",
-    )
-    parser.add_argument("--backend", choices=["qwen", "gpt"], required=True)
-    parser.add_argument("--model", type=str, default=None,
-                        help="Model name (default: backend-dependent)")
-    parser.add_argument("--examples-dir", type=str,
-                        default="training_data/extracted_hypergraph_msd")
-    parser.add_argument("--num-examples", type=int, default=3)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--max-tokens", type=int, default=5120)
-    parser.add_argument("--output", type=str, default="generated_hypergraph.json")
-    parser.add_argument("--debug", action="store_true")
-
-    parser.add_argument("--from-dataset", action="store_true")
-    parser.add_argument("--target-file", type=str, default=None)
-    parser.add_argument("--target-dir", type=str, default=None,
-                        help="Target directory (GPT: separate test dir)")
-    parser.add_argument("--accessgraph", type=str, default=None)
-
-    vllm = parser.add_argument_group("vLLM (Qwen backend)")
-    vllm.add_argument(
-        "--no-vllm",
-        action="store_true",
-        help="Use HuggingFace generate instead of vLLM (slower)",
-    )
-    vllm.add_argument(
-        "--vllm-gpu-memory",
-        type=float,
-        default=0.85,
-        help=(
-            "vLLM gpu_memory_utilization (default: 0.85 for inference). "
-            "Use ~0.25 only when sharing the GPU (e.g. GRPO colocate); too low causes KV cache OOM."
-        ),
-    )
-    vllm.add_argument(
-        "--vllm-max-model-len",
-        type=int,
-        default=6900,
-        help="vLLM max_model_len (default: 6900, matches rlft_pipeline GRPOConfig)",
-    )
-    vllm.add_argument(
-        "--tensor-parallel",
-        type=int,
-        default=1,
-        help="vLLM tensor_parallel_size (default: 1)",
-    )
-    vllm.add_argument(
-        "--vllm-no-enforce-eager",
-        action="store_true",
-        help="Allow vLLM CUDA graphs (default is enforce_eager=True to avoid OOM during capture)",
-    )
-
-    args = parser.parse_args()
-
-    model_name = args.model
-    if args.backend == "qwen":
-        model_name = model_name or "Qwen/Qwen3-4B-Instruct-2507"
-        use_vllm = not args.no_vllm and VLLM_AVAILABLE
-        if not args.no_vllm and not VLLM_AVAILABLE:
-            logger.warning("vLLM not installed; falling back to HuggingFace generate (pip install vllm)")
-        if use_vllm:
-            gen = VllmQwenGenerator(
-                model_name,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                gpu_memory_utilization=args.vllm_gpu_memory,
-                max_model_len=args.vllm_max_model_len,
-                tensor_parallel_size=args.tensor_parallel,
-                enforce_eager=not args.vllm_no_enforce_eager,
-            )
-        else:
-            gen = QwenGenerator(model_name, max_tokens=args.max_tokens,
-                                temperature=args.temperature)
-    else:
-        model_name = model_name or "gpt-4"
-        gen = GPTGenerator(model_name, max_tokens=args.max_tokens,
-                           temperature=args.temperature)
-
-    return gen.run_single(args)
-
-
-if __name__ == "__main__":
-    sys.exit(cli())
