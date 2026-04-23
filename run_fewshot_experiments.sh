@@ -2,9 +2,8 @@
 #
 # Run few-shot hypergraph generation experiments and optionally score them.
 #
-# Calls scripts/fewshot_generator.py in batch mode for each (backend, shots,
-# round) combination, then optionally runs scripts/score_results.py on
-# every output file.
+# Calls scripts/evaluator.py for each (backend, shots, round) combination,
+# then optionally runs scripts/score_results.py on every output file.
 #
 # Usage:
 #   # GPT experiments (1/2/3-shot, 5 rounds each)
@@ -112,14 +111,15 @@ if ! $SCORE_ONLY; then
             OUTPUT_FILE="$SHOT_DIR/hypergraph_round_${R}.json"
             echo -ne "\r[$RUN/$TOTAL] ${SHOT}-shot round $R ..."
 
-            CMD=(python scripts/fewshot_generator.py
-                --backend "$BACKEND"
-                --examples-dir "$EXAMPLES_DIR"
+            CMD=(python scripts/evaluator.py
+                --mode "fewshot-$BACKEND"
+                --dataset-dir "$EXAMPLES_DIR"
                 --num-examples "$SHOT"
                 --max-tokens "$MAX_TOKENS"
                 --temperature "$TEMPERATURE"
                 --output "$OUTPUT_FILE"
-                --from-dataset
+                --max-samples 1
+                --seed "$R"
             )
             [[ -n "$MODEL" ]] && CMD+=(--model "$MODEL")
 
@@ -146,7 +146,7 @@ if $SCORE; then
     echo "  Scoring results in $OUTPUT_DIR/ with metrics:$METRICS"
     echo "========================================================================"
 
-    for RESULTS_FILE in "$OUTPUT_DIR"/*/*.json; do
+    for RESULTS_FILE in "$OUTPUT_DIR"/*/*_hypergraphs.json; do
         [[ -f "$RESULTS_FILE" ]] || continue
         echo ""
         echo "--- $RESULTS_FILE ---"

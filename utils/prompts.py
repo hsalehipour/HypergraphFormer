@@ -109,6 +109,8 @@ Your task is to learn how to generate a hypergraph from an access graph. An acce
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
+{_OUTSIDE_RULES_TEXT_1}
+
 You will be shown examples of access graphs paired with their corresponding hypergraphs, then generate a new hypergraph following the same structure and rules.
 
 {BSP_RULES_TEXT}
@@ -135,7 +137,7 @@ Below are examples showing how access graphs map to hypergraphs. Learn from thes
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph:
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
 
 ### Target Access Graph:
 ```json

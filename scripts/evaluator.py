@@ -54,7 +54,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# vLLM is imported by scripts.fewshot_generator; set env before that so V1 engine sees it.
+# vLLM is imported by scripts.generators; set env before that so V1 engine sees it.
 # V1 multiprocess backend + Accelerate often triggers "Engine core initialization failed"
 # (see https://github.com/vllm-project/vllm/issues/25837). Override with
 # VLLM_ENABLE_V1_MULTIPROCESSING=1 before launch if you need the default.
@@ -79,7 +79,7 @@ from tqdm import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from utils.hypergraph import Hypergraph
-from scripts.fewshot_generator import GPTGenerator, QwenGenerator, VLLM_AVAILABLE, VllmQwenGenerator
+from scripts.generators import GPTGenerator, QwenGenerator, VLLM_AVAILABLE, VllmQwenGenerator
 
 logger = logging.getLogger(__name__)
 

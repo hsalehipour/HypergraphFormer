@@ -399,8 +399,8 @@ def main():
     
     logger.info("="*80)
     
-    logger.info("\n💡 To use the fine-tuned model:")
-    logger.info(f"   python scripts/fewshot_generator.py --backend qwen --model {args.output_dir} --from-dataset")
+    logger.info("\n💡 To evaluate the fine-tuned model:")
+    logger.info(f"   python scripts/evaluator.py --mode trained --model {args.output_dir} --dataset-dir <test_dir>")
     logger.info(f"\n💡 To resume training from a checkpoint:")
     logger.info(f"   python scripts/sft_pipeline.py --output-dir {args.output_dir}")
     
