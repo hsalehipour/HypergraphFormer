@@ -9,6 +9,9 @@ Creates one PNG per sample (2×3 grid):
 5. Corrected access graph (:meth:`~utils.hypergraph.Hypergraph.correct_accessgraph`)
 6. Same generated mesh (aligned under corrected graph)
 
+Generated hypergraphs are passed through ``repair_bsp_tree_names`` before
+plotting (in-memory only; the results JSON file is not modified).
+
 By default this script targets the checkpoint-5256 RPLAN results discussed in
 the current workflow and writes images into ``checkpoint-5256-viz/`` at the
 repository root.
@@ -26,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.hypergraph import Hypergraph, HypergraphPlotter
+from utils.hypergraph import Hypergraph, HypergraphPlotter, repair_bsp_tree_names
 from utils.metrics import accessgraph_dict_to_nx
 
 
@@ -53,13 +56,6 @@ def load_ground_truth(test_dir: Path) -> dict[str, dict]:
             "bounds": _parse_jsonish(raw.get("bounds", "{}")),
         }
     return ground_truth
-
-
-def face_labels_for_mesh(mesh, distinct_labels: dict[str, str]) -> list[str]:
-    return [
-        distinct_labels.get(str(i + 1), f"room{i + 1}")
-        for i in range(int(getattr(mesh.faceList, "Count", 0) or 0))
-    ]
 
 
 def boundary_polygon(bounds: dict) -> list[tuple[float, float]]:
@@ -128,7 +124,7 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
     plotter = HypergraphPlotter()
 
     gt_hg = Hypergraph(gt["hypergraph"])
-    gen_hg = Hypergraph(generated_hg_data)
+    gen_hg = Hypergraph(repair_bsp_tree_names(generated_hg_data))
     gt_ag = access_graph_with_outside(gt_hg, gt.get("accessgraph", {}) or {})
     gen_ag = access_graph_with_outside(gen_hg, gen_hg.access_graph)
     bounds = gt.get("bounds", {}) or {}
@@ -187,7 +183,9 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
             ax_gt_mesh,
             boundary_polygon=polygon,
             title="Ground Truth Mesh",
-            face_labels=face_labels_for_mesh(gt_mesh, plotter.make_distinct_labels(gt_ag)),
+            face_labels=gt_hg.mesh_face_labels(
+                gt_mesh, plotter.make_distinct_labels(gt_ag)
+            ),
         )
     except Exception as exc:
         ax_gt_mesh.text(0.5, 0.5, f"GT mesh failed:\n{exc}", ha="center", va="center",
@@ -197,19 +195,21 @@ def render_sample(sample_id: str, gt: dict, generated_hg_data: dict, output_path
 
     try:
         gen_mesh = gen_hg.to_mesh(bounds=bounds)
+        distinct_gen = plotter.make_distinct_labels(gen_ag)
+        mesh_lbls = gen_hg.mesh_face_labels(gen_mesh, distinct_gen)
         plotter.plot_mesh_on_axis(
             gen_mesh,
             ax_gen_mesh,
             boundary_polygon=polygon,
             title="Generated Mesh",
-            face_labels=face_labels_for_mesh(gen_mesh, plotter.make_distinct_labels(gen_ag)),
+            face_labels=mesh_lbls,
         )
         plotter.plot_mesh_on_axis(
             gen_mesh,
             ax_gen_mesh_b,
             boundary_polygon=polygon,
             title="Generated Mesh (same)",
-            face_labels=face_labels_for_mesh(gen_mesh, plotter.make_distinct_labels(gen_ag)),
+            face_labels=mesh_lbls,
         )
     except Exception as exc:
         ax_gen_mesh.text(0.5, 0.5, f"Generated mesh failed:\n{exc}", ha="center", va="center",

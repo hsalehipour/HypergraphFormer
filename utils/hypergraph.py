@@ -36,6 +36,121 @@ def _parse_first_json_object(s: str):
     return obj if isinstance(obj, dict) else None
 
 
+def repair_bsp_tree_names(hypergraph: dict) -> dict:
+    """Reassign every node ``name`` from tree layout (``root``, ``rootL``, ``rootR``, …).
+
+    Model outputs sometimes reuse the same ``name`` on different leaves (e.g. two
+    ``rootRLL``), which breaks :attr:`Hypergraph.access_graph` and mesh ``unique_id``
+    mapping. This walks the BSP tree and sets:
+
+    - ``root`` for the root;
+    - ``<parent>L`` / ``<parent>R`` for the first two children;
+    - ``<parent>_2``, ``_3``, … if a node has more than two children.
+
+    Leaf ``connected`` lists are rewritten to use the new names. When an old name was
+    ambiguous, neighbors are resolved by **symmetric** ``connected`` (each side lists
+    the other’s old name) when possible; otherwise the first matching final leaf is used
+    and a warning is logged.
+
+    Internal nodes get ``mergeid`` set to the new structural name; final leaves keep
+    their room-type ``mergeid``. The special neighbor ``outside`` is left unchanged.
+
+    Args:
+        hypergraph: Root BSP dict (must contain ``children``, ``name``, etc.).
+
+    Returns:
+        Deep copy of *hypergraph* with updated ``name``, ``mergeid`` (internals), and
+        ``connected`` (final nodes only).
+    """
+    if not isinstance(hypergraph, dict):
+        raise TypeError(f"repair_bsp_tree_names expected dict root, got {type(hypergraph)!r}")
+
+    hg = copy.deepcopy(hypergraph)
+    all_nodes: List[dict] = []
+
+    def collect(n: dict) -> None:
+        all_nodes.append(n)
+        for c in n.get("children") or []:
+            collect(c)
+
+    collect(hg)
+
+    def assign_names(node: dict, parent_path: str, idx: int) -> None:
+        if parent_path == "":
+            new_name = "root"
+        elif idx == 0:
+            new_name = parent_path + "L"
+        elif idx == 1:
+            new_name = parent_path + "R"
+        else:
+            new_name = parent_path + f"_{idx}"
+
+        node["_old_name"] = node.get("name")
+        node["name"] = new_name
+        if not node.get("final"):
+            node["mergeid"] = new_name
+        children = node.get("children") or []
+        for i, ch in enumerate(children):
+            assign_names(ch, new_name, i)
+
+    assign_names(hg, "", 0)
+
+    by_old: Dict[str, List[dict]] = {}
+    for n in all_nodes:
+        old = n.get("_old_name")
+        if old is None:
+            continue
+        key = str(old)
+        by_old.setdefault(key, []).append(n)
+
+    for n in all_nodes:
+        if not n.get("final"):
+            continue
+        con = n.get("connected")
+        if not con:
+            continue
+        new_con: List[str] = []
+        my_old = n.get("_old_name")
+        for s in con:
+            st = str(s).strip()
+            if st.lower() == "outside":
+                new_con.append(st)
+                continue
+            cands = by_old.get(st, [])
+            if len(cands) == 1:
+                new_con.append(cands[0]["name"])
+            elif len(cands) == 0:
+                logger.warning(
+                    "repair_bsp_tree_names: leaf %r connected to unknown name %r",
+                    my_old,
+                    st,
+                )
+                new_con.append(st)
+            else:
+                sym = [c for c in cands if my_old in (c.get("connected") or [])]
+                if len(sym) == 1:
+                    new_con.append(sym[0]["name"])
+                else:
+                    finals = [c for c in cands if c.get("final")]
+                    chosen = finals[0] if finals else cands[0]
+                    if len(sym) != 1:
+                        logger.warning(
+                            "repair_bsp_tree_names: ambiguous neighbor %r for leaf %r "
+                            "(%d candidates); picked %r",
+                            st,
+                            my_old,
+                            len(cands),
+                            chosen.get("name"),
+                        )
+                    new_con.append(chosen["name"])
+        n["connected"] = new_con
+
+    for n in all_nodes:
+        n.pop("_old_name", None)
+
+    return hg
+
+
 class Hypergraph:
     """A BSP-tree hypergraph representing a spatial floor plan subdivision.
 
@@ -72,6 +187,13 @@ class Hypergraph:
 
     def to_json(self) -> str:
         return json.dumps(self._data)
+
+    def with_repaired_names(self) -> "Hypergraph":
+        """Copy of this hypergraph with :func:`repair_bsp_tree_names` applied to the tree."""
+        return Hypergraph(
+            repair_bsp_tree_names(copy.deepcopy(self._data)),
+            bounds=self._bounds,
+        )
 
     def __repr__(self) -> str:
         name = self._data.get("name", "?")

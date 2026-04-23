@@ -1,5 +1,5 @@
 from .hypergraph import HypergraphPlotter
-from .hypergraph import Hypergraph
+from .hypergraph import Hypergraph, repair_bsp_tree_names
 from .utils import (
     remove_mergeid_suffixes,
     extract_room_type,
