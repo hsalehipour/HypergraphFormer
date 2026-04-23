@@ -2,23 +2,21 @@
 """
 Few-Shot Hypergraph Generator -- OOP consolidation.
 
-Provides ``QwenGenerator`` and ``GPTGenerator`` for generating floor-plan
-hypergraphs from access graphs using few-shot prompting.
+Provides ``QwenGenerator``, ``VllmQwenGenerator``, and ``GPTGenerator`` for
+generating floor-plan hypergraphs from access graphs using few-shot prompting.
 
-Usage:
-    # Single-sample Qwen (interactive, streaming)
+The generator classes are also imported by ``scripts/evaluator.py`` for batch
+evaluation.  For batch runs use the evaluator directly::
+
+    python scripts/evaluator.py --mode fewshot-qwen --dataset-dir data/test
+    python scripts/evaluator.py --mode fewshot-gpt  --dataset-dir data/test
+
+CLI usage (single-sample, interactive):
+    # Qwen (streaming; vLLM used by default if installed)
     python scripts/fewshot_generator.py --backend qwen --from-dataset
 
-    # Single-sample GPT
+    # GPT
     python scripts/fewshot_generator.py --backend gpt --from-dataset --model gpt-4
-
-    # Batch generation
-    python scripts/fewshot_generator.py --backend gpt --batch \
-        --test-dir data/test --output results.json --resume
-
-    # Qwen via vLLM (default if installed; use --no-vllm for HuggingFace)
-    python scripts/fewshot_generator.py --backend qwen --batch --test-dir data/test \\
-        --output results.json --vllm-gpu-memory 0.85 --vllm-max-model-len 6900
 """
 
 from __future__ import annotations
@@ -239,109 +237,6 @@ class FewShotGenerator(ABC):
         logger.info("=" * 80)
 
         return 0 if is_valid else 1
-
-    def run_batch(self, args) -> int:
-        """Batch generation over a test directory with resume support."""
-        from tqdm import tqdm
-
-        logger.info("=" * 80)
-        logger.info("Batch Hypergraph Generation")
-        logger.info("=" * 80)
-        logger.info(f"Model: {self.model_name}")
-        logger.info(f"Test directory: {args.test_dir}")
-        logger.info(f"Few-shot examples: {args.num_examples}")
-        logger.info(f"Output: {args.output}")
-        logger.info("=" * 80)
-
-        test_dir = Path(args.test_dir)
-        test_files = sorted(test_dir.glob("*.txt"))
-        samples = []
-        for fp in test_files:
-            try:
-                with open(fp, "r") as f:
-                    data = json.load(f)
-                ag = data.get("accessgraph", {})
-                hg_str = data.get("hypergraph", "")
-                hg = json.loads(hg_str) if isinstance(hg_str, str) else hg_str
-                samples.append({
-                    "filename": fp.name,
-                    "accessgraph": ag,
-                    "ground_truth": hg,
-                })
-            except Exception as e:
-                logger.warning(f"Skipping {fp.name}: {e}")
-        logger.info(f"Loaded {len(samples)} test samples")
-
-        results: dict = {}
-        if args.resume and Path(args.output).exists():
-            with open(args.output, "r") as f:
-                results = json.load(f)
-            logger.info(f"Resumed {len(results)} existing results")
-
-        failed_samples: list[str] = []
-        start_time = time.time()
-
-        with tqdm(total=len(samples), desc="Generating", unit="sample") as pbar:
-            for sample in samples:
-                filename = sample["filename"]
-                sample_id = filename.replace(".txt", "")
-
-                if sample_id in results:
-                    pbar.update(1)
-                    continue
-
-                pbar.set_description(f"Processing {filename}")
-                try:
-                    examples = self.load_examples(
-                        args.test_dir, args.num_examples,
-                        exclude_file=filename,
-                    )
-                    prompt = self.build_prompt(examples, sample["accessgraph"])
-                    gen = self.generate(prompt)
-
-                    hg = self.extract_hypergraph(gen.text) if gen.text else None
-                    if hg is None:
-                        logger.warning(f"Failed to extract JSON for {filename}")
-                        failed_samples.append(filename)
-                        pbar.update(1)
-                        continue
-
-                    is_valid, _, _, _ = hg.validate(
-                        sample["accessgraph"], debug=True,
-                    )
-                    results[sample_id] = hg.data
-
-                    if len(results) % 10 == 0:
-                        with open(args.output, "w") as f:
-                            json.dump(results, f, indent=2)
-
-                    status = "Valid" if is_valid else "Invalid"
-                    pbar.set_postfix_str(f"{status} | Total: {len(results)}")
-
-                except Exception as e:
-                    logger.error(f"Error processing {filename}: {e}")
-                    failed_samples.append(filename)
-
-                pbar.update(1)
-
-        with open(args.output, "w") as f:
-            json.dump(results, f, indent=2)
-
-        elapsed = time.time() - start_time
-        logger.info("=" * 80)
-        logger.info("BATCH SUMMARY")
-        logger.info("=" * 80)
-        logger.info(f"Total: {len(samples)}")
-        logger.info(f"Generated: {len(results)}")
-        logger.info(f"Failed: {len(failed_samples)}")
-        if samples:
-            logger.info(f"Success rate: {len(results)/len(samples)*100:.1f}%")
-            logger.info(f"Time: {elapsed/60:.1f} min ({elapsed/len(samples):.1f}s/sample)")
-        if failed_samples:
-            logger.info(f"Failed samples: {failed_samples}")
-        logger.info("=" * 80)
-
-        return 0 if not failed_samples else 1
 
 
 # ---------------------------------------------------------------------------
@@ -836,17 +731,11 @@ def cli():
     parser.add_argument("--output", type=str, default="generated_hypergraph.json")
     parser.add_argument("--debug", action="store_true")
 
-    single = parser.add_argument_group("single-sample mode")
-    single.add_argument("--from-dataset", action="store_true")
-    single.add_argument("--target-file", type=str, default=None)
-    single.add_argument("--target-dir", type=str, default=None,
+    parser.add_argument("--from-dataset", action="store_true")
+    parser.add_argument("--target-file", type=str, default=None)
+    parser.add_argument("--target-dir", type=str, default=None,
                         help="Target directory (GPT: separate test dir)")
-    single.add_argument("--accessgraph", type=str, default=None)
-
-    batch = parser.add_argument_group("batch mode")
-    batch.add_argument("--batch", action="store_true")
-    batch.add_argument("--test-dir", type=str, default=None)
-    batch.add_argument("--resume", action="store_true")
+    parser.add_argument("--accessgraph", type=str, default=None)
 
     vllm = parser.add_argument_group("vLLM (Qwen backend)")
     vllm.add_argument(
@@ -907,10 +796,6 @@ def cli():
         gen = GPTGenerator(model_name, max_tokens=args.max_tokens,
                            temperature=args.temperature)
 
-    if args.batch:
-        if not args.test_dir:
-            parser.error("--batch requires --test-dir")
-        return gen.run_batch(args)
     return gen.run_single(args)
 
 

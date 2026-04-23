@@ -87,7 +87,7 @@ HypergraphFormer/
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
 │   ├── rlft_pipeline.py             GRPO reinforcement learning fine-tuning (RLFT)
 │   │
-│   │  # Few-shot generation (single + batch, Qwen + GPT)
+│   │  # Few-shot generation (single-sample CLI + generator library)
 │   ├── fewshot_generator.py         OOP generator (QwenGenerator, GPTGenerator)
 │   │
 │   │  # Evaluation (all modes via --mode flag)
@@ -425,7 +425,7 @@ python scripts/fewshot_generator.py --backend gpt \
 
 ### 9. Run batch few-shot experiments
 
-`run_fewshot_experiments.sh` automates running `fewshot_generator.py` across
+`run_fewshot_experiments.sh` automates running `evaluator.py` across
 multiple shot counts and rounds, with optional post-run scoring:
 
 ```bash
