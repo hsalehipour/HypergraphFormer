@@ -78,7 +78,7 @@ import torch
 from tqdm import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from utils.hypergraph import Hypergraph
+from utils.hypergraph import Hypergraph, repair_bsp_tree_names
 from scripts.generators import GPTGenerator, QwenGenerator, VLLM_AVAILABLE, VllmQwenGenerator
 
 logger = logging.getLogger(__name__)
@@ -1053,7 +1053,8 @@ class FewShotQwenEvaluator(Evaluator):
 
     def build_result_template(self, sample):
         r = super().build_result_template(sample)
-        r.update({"json_extracted": False, "ged_computed": False, "ged": None, "error_type": None})
+        r.update({"json_extracted": False, "ged_computed": False, "ged": None,
+                   "error_type": None, "timestamp": datetime.now().isoformat()})
         return r
 
     def load_model(self):
@@ -1104,30 +1105,44 @@ class FewShotQwenEvaluator(Evaluator):
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_qwen_response(response)
+        hg = Hypergraph.from_qwen_response(response)
+        if hg is not None:
+            hg = Hypergraph(repair_bsp_tree_names(hg.data))
+        return hg
 
     def score_result(self, result, hg, sample):
         result.pop("_ged_info", None)
         result["json_extracted"] = True
         from utils import compute_ged_from_hypergraph
-        ged, _ = compute_ged_from_hypergraph(sample["accessgraph"], hg.data, sample["filename"])
-        if ged is not None:
-            result["ged_computed"] = True
-            result["success"] = True
-            result["ged"] = ged
-        else:
-            result["error"] = "GED computation failed or timed out"
+        bounds = sample.get("bounds") or {}
+        try:
+            ged, _ = compute_ged_from_hypergraph(
+                sample["accessgraph"], hg.data, sample["filename"],
+                correct_accessgraph=bool(bounds.get("corners")),
+                bounds=bounds,
+            )
+            if ged is not None:
+                result["ged"] = ged
+                result["ged_computed"] = True
+                result["success"] = True
+            else:
+                result["error"] = "GED computation failed or timed out"
+                result["error_type"] = "ged_computation"
+        except Exception as e:
+            result["error"] = f"GED error: {e}"
             result["error_type"] = "ged_computation"
 
     def compute_statistics(self, results):
         ok = [r for r in results if r.get("success")]
         geds = [r["ged"] for r in ok if r.get("ged") is not None]
         json_ok = [r for r in results if r.get("json_extracted")]
+        times = [r["generation_time"] for r in ok if r.get("generation_time") is not None]
 
         stats: dict = {
             "successful": len(ok),
             "failed": len(results) - len(ok),
             "json_extracted": len(json_ok),
+            "success_rate": len(ok) / len(results) if results else 0,
         }
         if geds:
             stats["ged"] = {
@@ -1135,6 +1150,8 @@ class FewShotQwenEvaluator(Evaluator):
                 "min": min(geds),
                 "max": max(geds),
             }
+        if times:
+            stats["avg_generation_time"] = sum(times) / len(times)
 
         error_types: dict[str, int] = {}
         for r in results:
@@ -1177,14 +1194,22 @@ class FewShotGPTEvaluator(Evaluator):
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_gpt_response(response)
+        hg = Hypergraph.from_gpt_response(response)
+        if hg is not None:
+            hg = Hypergraph(repair_bsp_tree_names(hg.data))
+        return hg
 
     def score_result(self, result, hg, sample):
         result.pop("_ged_info", None)
         result["json_extracted"] = True
         from utils import compute_ged_from_hypergraph
+        bounds = sample.get("bounds") or {}
         try:
-            ged, _ = compute_ged_from_hypergraph(sample["accessgraph"], hg.data, sample["filename"])
+            ged, _ = compute_ged_from_hypergraph(
+                sample["accessgraph"], hg.data, sample["filename"],
+                correct_accessgraph=bool(bounds.get("corners")),
+                bounds=bounds,
+            )
             if ged is not None:
                 result["ged"] = ged
                 result["ged_computed"] = True

@@ -101,7 +101,7 @@ HypergraphFormer/
 │   ├── build_dataset_access.py      Build access graphs from DiffPlanner + original PNGs
 │   ├── rplan_to_hypergraph.py       Native Python BSP conversion (with look-ahead
 │   │                                      and evolutionary search)
-│   ├── postprocess_hypergraphs.py   Fix disconnected access graphs
+│   ├── fix_rplan_accessgraph_connectivity.py   Fix disconnected access graphs
 │   ├── visualize_rplan_hypergraph.py            Visualize BSP + RGL mesh
 │   ├── visualize_disconnected_accessgraphs.py   Visualize disconnected samples
 │   └── visualize_fixed_accessgraphs.py          Before/after comparison

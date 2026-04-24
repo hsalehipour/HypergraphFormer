@@ -245,12 +245,22 @@ def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=20000,
     Returns:
         ``(min_dist, num_gt_nodes)`` -- see :func:`ged_between_graphs`.
     """
+    if correct_accessgraph and not (isinstance(bounds, dict) and bounds.get("corners")):
+        raise ValueError(
+            f"correct_accessgraph=True requires bounds with 'corners' for sample {_id}"
+        )
+
     try:
         hg = Hypergraph(hypergraph)
 
         if correct_accessgraph:
             pred_ag = hg.correct_accessgraph(bounds)
         else:
+            warnings.warn(
+                f"Access graph correction skipped for sample {_id} "
+                f"(correct_accessgraph=False); GED uses raw leaf connectivity",
+                stacklevel=2,
+            )
             pred_ag = hg.access_graph
 
         if not pred_ag.get("nodes"):

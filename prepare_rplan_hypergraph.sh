@@ -160,7 +160,7 @@ echo ""
 # ── Step 5: Post-process (fix disconnected access graphs) ────────────
 echo ">> Post-processing: fixing disconnected access graphs..."
 rm -rf "${FIXED_DIR}"
-python rplan/postprocess_hypergraphs.py \
+python rplan/fix_rplan_accessgraph_connectivity.py \
     --dataset-dir "${HYPERGRAPH_DIR}" \
     --output-dir "${FIXED_DIR}" \
     -j "${WORKERS}"
