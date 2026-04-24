@@ -22,13 +22,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.zero_shot_edits import load_bounds, load_hypergraph, render_comparison
 from utils.hypergraph import Hypergraph
-from utils.metrics import produce_room_list
 
 logger = logging.getLogger(__name__)
-
-# Tier-1 add-room search: BSP side × axis-aligned angles × area fractions (mesh-scored).
-_ADD_MESH_SEARCH_ANGLES = (0.0, math.pi / 2, math.pi, 3.0 * math.pi / 2)
-_ADD_MESH_SEARCH_FRACTIONS = (0.35, 0.40)
 
 ROOM_ALIASES = {
     "bath": "bathroom",
@@ -206,24 +201,6 @@ def _compute_split_areas(old_area: float, frac_new: float) -> tuple[float, float
     return new_room_area, kept_area
 
 
-def _mesh_corrected_connectivity_score(hg_dict: dict, bounds: dict) -> tuple[int, int] | None:
-    """(num_connected_components, num_edges) on mesh-corrected access graph; ``None`` if unavailable."""
-    import networkx as nx
-
-    from utils.metrics import accessgraph_dict_to_nx
-
-    if not bounds or not isinstance(bounds, dict) or not bounds.get("corners"):
-        return None
-    try:
-        hg = Hypergraph(hg_dict)
-        ag = hg.correct_accessgraph(bounds)
-        g = accessgraph_dict_to_nx(ag)
-        return int(nx.number_connected_components(g)), int(g.number_of_edges())
-    except Exception as exc:
-        logger.debug("mesh connectivity score failed: %s", exc)
-        return None
-
-
 def _normalize_cardinal_angle(rad: float) -> float:
     """Map *rad* to ``{0, π/2, π, 3π/2}`` (axis-aligned BSP)."""
     two_pi = 2 * math.pi
@@ -232,40 +209,6 @@ def _normalize_cardinal_angle(rad: float) -> float:
         x += two_pi
     k = int(round(x / (math.pi / 2))) % 4
     return k * (math.pi / 2)
-
-
-def flip_hypergraph(hypergraph: dict, *, apply: bool = True) -> dict:
-    """Return ``copy.deepcopy(hypergraph)``; if *apply*, add π to the first non-leaf ``angle`` and recompute areas."""
-    root = copy.deepcopy(hypergraph)
-    if not apply:
-        return root
-    for n in iter_nodes(root):
-        if n.get("final", False) or "angle" not in n:
-            continue
-        n["angle"] = _normalize_cardinal_angle(float(n["angle"]) + math.pi)
-        break
-    recompute_areas(root)
-    return root
-
-
-def _apply_bsp_rotation_inplace(node: dict, delta_rad: float) -> None:
-    if "angle" in node:
-        node["angle"] = _normalize_cardinal_angle(float(node["angle"]) + delta_rad)
-    for c in node.get("children", []):
-        _apply_bsp_rotation_inplace(c, delta_rad)
-
-
-def _apply_bsp_reflect_x_inplace(node: dict) -> None:
-    """Mirror-like transform: swap L/R at each internal node; flip split angles."""
-    if not node.get("final", False):
-        ch = node.get("children") or []
-        if len(ch) == 2:
-            ch[0], ch[1] = ch[1], ch[0]
-    if "angle" in node:
-        a = float(node.get("angle", 0.0))
-        node["angle"] = _normalize_cardinal_angle(math.pi - a)
-    for c in node.get("children", []):
-        _apply_bsp_reflect_x_inplace(c)
 
 
 def swap_l_r_letters_in_string(s: str) -> str:
@@ -312,109 +255,6 @@ def apply_hypergraph_path_lr_name_swap_in_place(root: dict) -> None:
         n["connected"] = [_remap_ref(c) for c in conn]
 
 
-def _apply_bsp_reflect_y_inplace(node: dict) -> None:
-    if not node.get("final", False):
-        ch = node.get("children") or []
-        if len(ch) == 2:
-            ch[0], ch[1] = ch[1], ch[0]
-    if "angle" in node:
-        a = float(node.get("angle", 0.0))
-        node["angle"] = _normalize_cardinal_angle(-a)
-    for c in node.get("children", []):
-        _apply_bsp_reflect_y_inplace(c)
-
-
-def _apply_bsp_orientation_inplace(root: dict, degrees_ccw: float, reflect: str | None) -> None:
-    """Match footprint reflect-then-rotate symmetries on the BSP tree (in place)."""
-    if reflect == "x":
-        _apply_bsp_reflect_x_inplace(root)
-    elif reflect == "y":
-        _apply_bsp_reflect_y_inplace(root)
-    _apply_bsp_rotation_inplace(root, math.radians(degrees_ccw))
-
-
-def _mean_room_shape_irregularity(room_list: list) -> float:
-    """
-    Mean over rooms of |1 - P_square / P|, with P_square = 4√area (square with same area).
-
-    Lower is closer to square outlines (fewer spikes / L-shapes vs area).
-    """
-    if not room_list:
-        return float("inf")
-    acc = 0.0
-    n = 0
-    for _name, perim, sq_perim in room_list:
-        p = float(perim)
-        sp = float(sq_perim)
-        if p <= 1e-12:
-            continue
-        acc += abs(1.0 - sp / p)
-        n += 1
-    return acc / n if n else float("inf")
-
-
-def optimize_rotation(hypergraph: dict, bounds: dict) -> tuple[dict, str]:
-    """
-    Search BSP orientation (reflect + 90° rotations on split angles / child order) that
-    minimizes mean room-shape irregularity for :meth:`~utils.hypergraph.Hypergraph.to_mesh`
-    with the **given** *bounds*.
-
-    Returns a **deep copy** of *hypergraph* with the winning transforms applied in-place on
-    that copy. Dataset *bounds* are not modified.
-
-    Returns:
-        ``(edited_hypergraph, summary)``
-    """
-    if not bounds or not isinstance(bounds, dict) or not bounds.get("corners"):
-        return copy.deepcopy(hypergraph), "optimize_rotation: skipped (no bounds.corners)"
-
-    best_hg: dict | None = None
-    best_key: tuple[float, int, int, int] | None = None
-    best_summary = ""
-
-    reflect_modes: tuple[tuple[str | None, str], ...] = (
-        (None, "no_flip"),
-        ("x", "flip_x"),
-        ("y", "flip_y"),
-    )
-
-    for reflect_code, reflect_label in reflect_modes:
-        ref_rank = {None: 0, "x": 1, "y": 2}[reflect_code]
-        for deg in (0, 90, 180, 270):
-            trial = copy.deepcopy(hypergraph)
-            try:
-                _apply_bsp_orientation_inplace(trial, float(deg), reflect_code)
-                mesh = Hypergraph(trial).to_mesh(bounds=bounds)
-                rl = produce_room_list(mesh)
-                score = _mean_room_shape_irregularity(rl)
-                if not math.isfinite(score):
-                    continue
-            except Exception as exc:
-                logger.debug(
-                    "optimize_rotation failed deg=%s %s: %s",
-                    deg,
-                    reflect_label,
-                    exc,
-                )
-                continue
-            tie = (0 if deg == 0 else 1, ref_rank, deg)
-            cand_key = (score, *tie)
-            if best_key is None or cand_key < best_key:
-                best_key = cand_key
-                best_hg = trial
-                best_summary = (
-                    f"{reflect_label} rot={deg}° mean_shape_delta={score:.6f} n_rooms={len(rl)}"
-                )
-
-    if best_hg is None:
-        return (
-            copy.deepcopy(hypergraph),
-            "optimize_rotation: all variants failed; hypergraph unchanged",
-        )
-
-    return best_hg, f"optimize_rotation: chose {best_summary}"
-
-
 def _polygon_signed_area_xy(pts: list[tuple[float, float]]) -> float:
     """Shoelace signed area of a simple polygon (positive → CCW in a y-up system)."""
     n = len(pts)
@@ -435,9 +275,7 @@ def transform_bounds_polygon(
     """
     Apply a **2D** transform to *only* ``bounds['corners']``: translate to centroid,
     optional reflect in x and/or y (in that frame), then CCW rotation by *deg_ccw*,
-    then translate back. Order matches :func:`_apply_bsp_orientation_inplace`
-    (reflect, then rotation) for consistency with orientation experiments, but this
-    function **does not** modify the hypergraph.
+    then translate back. The hypergraph is **not** modified.
 
     A reflection in x or y **reverses** polygon orientation (CCW ↔ CW) while
     **preserving the same vertex list order**; that can confuse meshers that assume
@@ -485,10 +323,8 @@ def rotate_boundary(
     reflect_mode: str,
     hypergraph: dict,
     bounds: dict,
-    *,
-    first_split_add_180: bool = False,
 ) -> Any:
-    """Mesh *hypergraph* (via :func:`flip_hypergraph` when *first_split_add_180*) on :func:`transform_bounds_polygon` output. Input unchanged."""
+    """Return ``to_mesh`` for *hypergraph* using transformed bounds from :func:`transform_bounds_polygon` only. *hypergraph* is not reoriented."""
     if not (isinstance(bounds, dict) and bounds.get("corners")):
         raise ValueError("rotate_boundary: bounds with non-empty 'corners' is required for meshing")
 
@@ -506,8 +342,7 @@ def rotate_boundary(
         )
 
     bounds_t = transform_bounds_polygon(bounds, reflect_code, float(angle_deg))
-    root = flip_hypergraph(hypergraph, apply=first_split_add_180)
-    return Hypergraph(root).to_mesh(bounds=bounds_t)
+    return Hypergraph(copy.deepcopy(hypergraph)).to_mesh(bounds=bounds_t)
 
 
 def _split_leaf_for_add_impl(
@@ -617,16 +452,18 @@ def split_leaf_for_add(
     bounds: dict | None = None,
 ) -> tuple[str, str, float, float, str]:
     """
-    Split the largest matching anchor leaf to add *new_room*.
+    Split the first matching anchor leaf in preorder (see
+    :func:`collect_matching_leaf_paths`) to add *new_room*, with a default area fraction
+    and the leaf's own split axis.
 
-    When *bounds* is provided (with ``corners``), tries a small grid of BSP variants and
-    picks the one with fewest mesh-corrected access-graph components, then most edges.
+    *bounds* is accepted for call compatibility; mesh-scored add exploration is not used.
     """
+    _ = bounds
     paths = collect_matching_leaf_paths(root, anchor_room)
     if not paths:
         raise ValueError(f"No leaf found with room identifier {anchor_room!r}")
 
-    path = max(paths, key=lambda p: float(p[-1].get("area", 0.0)))
+    path = paths[0]
     leaf = path[-1]
     old_area = float(leaf.get("area", 0.0))
     if old_area <= 1.0:
@@ -634,113 +471,19 @@ def split_leaf_for_add(
 
     old_name = leaf.get("name", "")
     leaf_angle = float(leaf.get("angle", 0.0))
-
-    use_mesh = bool(bounds and isinstance(bounds, dict) and bounds.get("corners"))
-
-    if not use_mesh:
-        new_room_area, kept_area = _compute_split_areas(old_area, 0.35)
-        _on, _nl, kept_area, new_room_area = _split_leaf_for_add_impl(
-            root,
-            path,
-            anchor_room,
-            new_room,
-            new_room_mergeid=new_room_mergeid,
-            new_room_on_right=True,
-            split_angle=leaf_angle,
-            new_room_area=new_room_area,
-            kept_area=kept_area,
-        )
-        return _on, _nl, kept_area, new_room_area, ""
-
-    template = copy.deepcopy(root)
-    best_key: tuple[int, int, float] | None = None
-    best_payload: tuple[bool, float, float, float, str] | None = None
-
-    for new_room_on_right in (True, False):
-        for split_angle in _ADD_MESH_SEARCH_ANGLES:
-            for frac in _ADD_MESH_SEARCH_FRACTIONS:
-                try:
-                    new_room_area, kept_area = _compute_split_areas(old_area, frac)
-                except ValueError:
-                    continue
-                trial = copy.deepcopy(template)
-                try:
-                    t_paths = collect_matching_leaf_paths(trial, anchor_room)
-                    t_path = max(t_paths, key=lambda p: float(p[-1].get("area", 0.0)))
-                    _split_leaf_for_add_impl(
-                        trial,
-                        t_path,
-                        anchor_room,
-                        new_room,
-                        new_room_mergeid=new_room_mergeid,
-                        new_room_on_right=new_room_on_right,
-                        split_angle=split_angle,
-                        new_room_area=new_room_area,
-                        kept_area=kept_area,
-                    )
-                except ValueError:
-                    continue
-                score = _mesh_corrected_connectivity_score(trial, bounds)
-                if score is None:
-                    continue
-                n_comp, n_edges = score
-                key = (n_comp, -n_edges, abs(split_angle - leaf_angle))
-                if best_key is None or key < best_key:
-                    best_key = key
-                    new_leaf = f"{old_name}R" if new_room_on_right else f"{old_name}L"
-                    best_payload = (
-                        new_room_on_right,
-                        split_angle,
-                        new_room_area,
-                        kept_area,
-                        new_leaf,
-                    )
-
-    detail = ""
-    if best_payload is None:
-        logger.warning(
-            "add-room mesh search found no scorable variant for %s; using default split",
-            old_name,
-        )
-        root.clear()
-        root.update(template)
-        paths = collect_matching_leaf_paths(root, anchor_room)
-        path = max(paths, key=lambda p: float(p[-1].get("area", 0.0)))
-        new_room_area, kept_area = _compute_split_areas(old_area, 0.35)
-        _on, _nl, kept_area, new_room_area = _split_leaf_for_add_impl(
-            root,
-            path,
-            anchor_room,
-            new_room,
-            new_room_mergeid=new_room_mergeid,
-            new_room_on_right=True,
-            split_angle=leaf_angle,
-            new_room_area=new_room_area,
-            kept_area=kept_area,
-        )
-        return _on, _nl, kept_area, new_room_area, detail
-
-    root.clear()
-    root.update(template)
-    paths = collect_matching_leaf_paths(root, anchor_room)
-    path = max(paths, key=lambda p: float(p[-1].get("area", 0.0)))
-    new_room_on_right, split_angle, new_room_area, kept_area, new_leaf_name = best_payload
-    _split_leaf_for_add_impl(
+    new_room_area, kept_area = _compute_split_areas(old_area, 0.35)
+    _on, _nl, kept_area, new_room_area = _split_leaf_for_add_impl(
         root,
         path,
         anchor_room,
         new_room,
         new_room_mergeid=new_room_mergeid,
-        new_room_on_right=new_room_on_right,
-        split_angle=split_angle,
+        new_room_on_right=True,
+        split_angle=leaf_angle,
         new_room_area=new_room_area,
         kept_area=kept_area,
     )
-    detail = (
-        f" mesh_tier1: components={best_key[0]} corrected_edges={-best_key[1]} "
-        f"new_on_R={new_room_on_right} angle={split_angle:.4f} frac_new≈{new_room_area / old_area:.2f}"
-    )
-    return old_name, new_leaf_name, kept_area, new_room_area, detail
+    return _on, _nl, kept_area, new_room_area, ""
 
 
 def delete_room(root: dict, room_name: str) -> tuple[str, str]:
@@ -850,8 +593,8 @@ def split_leaf_for_add_on_path(
 ) -> str:
     """
     Binary-split a **specific** final leaf (after :func:`_resolve_bsp_path_by_names`), placing
-    the new room on the left or right and using *split_angle* (four axis directions are
-    the four values in ``_ADD_MESH_SEARCH_ANGLES``). Mutates *root* in place.
+    the new room on the left or right. *split_angle* is typically a multiple of ``π/2`` for
+    axis-aligned BSP cuts. Mutates *root* in place.
     """
     path = _resolve_bsp_path_by_names(root, path)
     leaf = path[-1]
@@ -877,118 +620,6 @@ def split_leaf_for_add_on_path(
         f"Y={leaf.get('name', '')!r} new_on_R={new_room_on_right} "
         f"angle={float(split_angle):.4f} frac_new≈{new_room_area / old_area:.2f}"
     )
-
-
-def split_leaf_for_add_topk(
-    root: dict,
-    anchor_room: str,
-    new_room: str,
-    *,
-    new_room_mergeid: str | None = None,
-    bounds: dict | None = None,
-    max_k: int = 4,
-) -> list[tuple[dict, str, tuple[int, int, float]]]:
-    """
-    Return up to *max_k* **distinct** split outcomes (by mesh key), best first, each a deep
-    copy of a hypergraph with one split applied. If mesh search is unavailable, returns one
-    leaf outcome like :func:`split_leaf_for_add`.
-    """
-    max_k = max(1, min(int(max_k), 16))
-    paths = collect_matching_leaf_paths(root, anchor_room)
-    if not paths:
-        raise ValueError(f"No leaf found with room identifier {anchor_room!r}")
-    path = max(paths, key=lambda p: float(p[-1].get("area", 0.0)))
-    leaf = path[-1]
-    old_area = float(leaf.get("area", 0.0))
-    if old_area <= 1.0:
-        raise ValueError(f"Target room {leaf.get('name', '')!r} is too small to split")
-    old_name = leaf.get("name", "")
-    leaf_angle = float(leaf.get("angle", 0.0))
-    use_mesh = bool(bounds and isinstance(bounds, dict) and bounds.get("corners"))
-    if not use_mesh:
-        t = copy.deepcopy(root)
-        new_room_area, kept_area = _compute_split_areas(old_area, 0.35)
-        _on, _nl, kept_area, new_room_area = _split_leaf_for_add_impl(
-            t,
-            path,
-            anchor_room,
-            new_room,
-            new_room_mergeid=new_room_mergeid,
-            new_room_on_right=True,
-            split_angle=leaf_angle,
-            new_room_area=new_room_area,
-            kept_area=kept_area,
-        )
-        return [(t, f" no_mesh: default split; new_leaf~{_nl}", (0, 0, 0.0))]
-
-    template = copy.deepcopy(root)
-    trials: list[tuple[dict, tuple[int, int, float], str]] = []
-
-    for new_room_on_right in (True, False):
-        for split_angle in _ADD_MESH_SEARCH_ANGLES:
-            for frac in _ADD_MESH_SEARCH_FRACTIONS:
-                try:
-                    new_room_area, kept_area = _compute_split_areas(old_area, frac)
-                except ValueError:
-                    continue
-                trial = copy.deepcopy(template)
-                try:
-                    t_paths = collect_matching_leaf_paths(trial, anchor_room)
-                    t_path = max(t_paths, key=lambda p: float(p[-1].get("area", 0.0)))
-                    _split_leaf_for_add_impl(
-                        trial,
-                        t_path,
-                        anchor_room,
-                        new_room,
-                        new_room_mergeid=new_room_mergeid,
-                        new_room_on_right=new_room_on_right,
-                        split_angle=split_angle,
-                        new_room_area=new_room_area,
-                        kept_area=kept_area,
-                    )
-                except ValueError:
-                    continue
-                score = _mesh_corrected_connectivity_score(trial, bounds)
-                if score is None:
-                    continue
-                n_comp, n_edges = score
-                key = (n_comp, -n_edges, abs(split_angle - leaf_angle))
-                detail = (
-                    f" mesh_tier1: components={n_comp} edges={n_edges} "
-                    f"new_on_R={new_room_on_right} angle={split_angle:.4f} frac~{new_room_area / old_area:.2f}"
-                )
-                trials.append((trial, key, detail))
-    if not trials:
-        t = copy.deepcopy(template)
-        t_paths = collect_matching_leaf_paths(t, anchor_room)
-        t_path = max(t_paths, key=lambda p: float(p[-1].get("area", 0.0)))
-        new_room_area, kept_area = _compute_split_areas(old_area, 0.35)
-        _on, _nl, kept_area, new_room_area = _split_leaf_for_add_impl(
-            t,
-            t_path,
-            anchor_room,
-            new_room,
-            new_room_mergeid=new_room_mergeid,
-            new_room_on_right=True,
-            split_angle=leaf_angle,
-            new_room_area=new_room_area,
-            kept_area=kept_area,
-        )
-        return [
-            (t, " fallback: single split" + f"; {old_name!r} -> {_nl!r}", (999, 0, 0.0))
-        ]
-    trials.sort(key=lambda x: (x[1], x[2]))
-    out: list[tuple[dict, str, tuple[int, int, float]]] = []
-    seen: set[tuple] = set()
-    for trial, key, det in trials:
-        sig = (key, det.split("frac~")[-1] if "frac~" in det else det)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append((trial, det, key))
-        if len(out) >= max_k:
-            break
-    return out if out else [(trials[0][0], trials[0][2] + " (raw)", trials[0][1])]
 
 
 def resize_room_area(root: dict, room_name: str, factor: float) -> tuple[str, float, float]:

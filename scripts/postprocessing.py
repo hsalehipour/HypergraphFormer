@@ -30,16 +30,13 @@ in either order at the multiset level). Fields ``command_step2`` and
 ``add X`` → ``add X by <anchor>``).  With ``--procedural-steps N`` (1–4), plans and applies up
 to **N** greedy multiset steps (see ``multiset_commands`` / ``detail.multiset_command_chain``).
 The anchor
-room type is chosen from the **ground-truth access graph**: neighbor types of a GT node whose
-label is *X* (room to add), restricted to types that exist in the prediction; tie-break by
-largest total leaf area in the pred hypergraph.  If that fails, falls back to splitting the
+room type is the **first** in sorted order among GT-neighbor types of *X* that also appear in
+the prediction.  If that fails, falls back to splitting the
 largest non-*X* leaf in the pred.  Runs on the **input** hypergraph from ``--results-hypergraphs``.
 For ``add``, the new leaf's ``mergeid`` is the most common raw GT label matching the multiset
 room type (via the same canonicalization as procedural_edits), when present, so strict multiset
 scoring aligns with eval access-graph spelling (e.g. ``bed`` vs ``bedroom``). Writes only a JSON
-dict ``sample_id -> hypergraph`` — no images or extra folders. **Orientation search** runs last
-by default (BSP reflect/rotate; bounds unchanged); use ``--skip-orientation-opt`` for add/remove
-only. Procedural + orientation stages are
+dict ``sample_id -> hypergraph`` — no images or extra folders. Procedural edits are
 **CPU-heavy** (RGL meshing via .NET); use ``--workers N`` to process samples in parallel
 (``spawn`` processes; default ``N=16``).
 """
@@ -50,7 +47,6 @@ import copy
 import json
 import logging
 import multiprocessing
-import re
 import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -363,15 +359,6 @@ def _representative_mergeid_for_type(hg: Hypergraph, room_type_lower: str) -> st
     return None
 
 
-def _total_leaf_area_for_type(hg: Hypergraph, room_type_lower: str) -> float:
-    rtl = room_type_lower.strip().lower()
-    return sum(
-        float(leaf.get("area", 0.0))
-        for leaf in hg.leaves
-        if str(leaf.get("mergeid", "")).strip().lower() == rtl
-    )
-
-
 def complete_add_command_for_procedural(
     hypergraph: dict,
     room_to_add: str,
@@ -380,9 +367,9 @@ def complete_add_command_for_procedural(
     """
     Build ``add <new> by <anchor>`` for :func:`scripts.procedural_edits.apply_command`.
 
-    Prefers an **anchor** room type that is a **neighbor in the GT access graph** of some
-    node typed *room_to_add*, and that exists in the predicted hypergraph.  Otherwise
-    falls back to :func:`_fallback_anchor_largest_non_target`.
+    Picks the **lexicographically first** anchor type that is a **neighbor in the GT access
+    graph** of some node typed *room_to_add*, and that exists in the predicted hypergraph.
+    Otherwise falls back to :func:`_fallback_anchor_largest_non_target`.
 
     Returns:
         ``(command_string, anchor_source)`` where *anchor_source* is ``gt_neighbor`` or
@@ -420,10 +407,7 @@ def complete_add_command_for_procedural(
                 neighbor_types.add(tnb)
 
     pred_types = {str(leaf.get("mergeid", "")).strip().lower() for leaf in hg.leaves}
-    candidates = sorted(
-        neighbor_types & pred_types,
-        key=lambda t: (-_total_leaf_area_for_type(hg, t), t),
-    )
+    candidates = sorted(neighbor_types & pred_types)
 
     if candidates:
         anchor_type = candidates[0]
@@ -433,58 +417,6 @@ def complete_add_command_for_procedural(
 
     anchor_mergeid = _fallback_anchor_largest_non_target(hypergraph, room_to_add)
     return f"add {new_room} by {anchor_mergeid}", "fallback_largest_leaf"
-
-
-def complete_add_command_candidates(
-    hypergraph: dict,
-    room_to_add: str,
-    gt_accessgraph: dict,
-    max_cand: int = 4,
-) -> list[tuple[str, str]]:
-    max_cand = max(1, min(int(max_cand), 4))
-    hg = Hypergraph(hypergraph)
-    t_new = str(room_to_add).strip().lower()
-    new_room = str(room_to_add).strip()
-    nodes = (gt_accessgraph or {}).get("nodes") or {}
-    edges = (gt_accessgraph or {}).get("edges") or []
-    adj: dict[str, set[str]] = {}
-    for e in edges:
-        if not isinstance(e, (list, tuple)) or len(e) != 2:
-            continue
-        a, b = str(e[0]), str(e[1])
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-    gt_nodes_new = [
-        str(nid)
-        for nid, typ in nodes.items()
-        if str(typ).strip().lower() == t_new
-    ]
-    neighbor_types: set[str] = set()
-    for nid in gt_nodes_new:
-        for nb in adj.get(nid, ()):
-            typ = nodes.get(nb)
-            if typ is None:
-                continue
-            tnb = str(typ).strip().lower()
-            if tnb and tnb not in _SKIP_NODE_TYPES and tnb != t_new:
-                neighbor_types.add(tnb)
-    pred_types = {str(leaf.get("mergeid", "")).strip().lower() for leaf in hg.leaves}
-    candidates = sorted(
-        neighbor_types & pred_types,
-        key=lambda t: (-_total_leaf_area_for_type(hg, t), t),
-    )
-    out: list[tuple[str, str]] = []
-    if candidates:
-        for anchor_type in candidates:
-            if len(out) >= max_cand:
-                break
-            anchor_mid = _representative_mergeid_for_type(hg, anchor_type)
-            if anchor_mid is not None:
-                out.append((f"add {new_room} by {anchor_mid}", "gt_neighbor"))
-    if not out:
-        anchor_mergeid = _fallback_anchor_largest_non_target(hypergraph, room_to_add)
-        return [(f"add {new_room} by {anchor_mergeid}", "fallback_largest_leaf")]
-    return out[:max_cand]
 
 
 def access_graph_light_distance(ag_pred: dict, ag_gt: dict) -> int:
@@ -521,499 +453,6 @@ def access_graph_light_distance(ag_pred: dict, ag_gt: dict) -> int:
     node_loss = sum(abs(np.get(k, 0) - ng.get(k, 0)) for k in keys_n)
     edge_loss = sum(abs(ep.get(k, 0) - eg.get(k, 0)) for k in keys_e)
     return int(node_loss + edge_loss)
-
-
-def _ged_corrected_vs_gt(
-    hypergraph: dict,
-    gt_accessgraph: dict,
-    bounds: dict | None,
-    sample_id: str,
-    timeout_ms: int,
-) -> tuple[float | None, int | None]:
-    from utils import compute_ged_from_hypergraph
-
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        return None, None
-    g, n = compute_ged_from_hypergraph(
-        copy.deepcopy(gt_accessgraph),
-        copy.deepcopy(hypergraph),
-        str(sample_id),
-        timeout=int(timeout_ms),
-        correct_accessgraph=True,
-        bounds=bounds,
-        upper_bound=40,
-        timeout_capture_best=False,
-    )
-    if g is None:
-        return None, n
-    return float(g), n if n is not None else None
-
-
-def _candidate_score_vs_gt(
-    hypergraph: dict,
-    gt_accessgraph: dict,
-    bounds: dict | None,
-    sample_id: str,
-    timeout_ms: int,
-    candidates_metric: str,
-) -> tuple[float | None, int | None]:
-    """
-    Score a candidate *hypergraph* against GT. ``candidates_metric`` / ``"ged"`` uses
-    :func:`_ged_corrected_vs_gt` (NetworkX; may time out). ``"light"`` uses
-    :func:`access_graph_light_distance` on **mesh-corrected** access graphs
-    (same ``correct_accessgraph`` as GED) — no GED, typically cheap.
-    """
-    if candidates_metric == "light":
-        if not (isinstance(bounds, dict) and bounds.get("corners")):
-            return None, None
-        try:
-            pred_ag = Hypergraph(hypergraph).correct_accessgraph(bounds)
-        except Exception as exc:
-            logger.debug("correct_accessgraph (candidates) failed %s: %s", sample_id, exc)
-            return None, None
-        d = float(access_graph_light_distance(pred_ag, gt_accessgraph))
-        return d, 0
-    g, n = _ged_corrected_vs_gt(
-        hypergraph, gt_accessgraph, bounds, sample_id, timeout_ms
-    )
-    return g, n
-
-
-def _mesh_connectivity_tie_key(hg: dict, bounds: dict) -> tuple[int, int] | None:
-    from scripts.procedural_edits import _mesh_corrected_connectivity_score
-
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        return None
-    s = _mesh_corrected_connectivity_score(hg, bounds)
-    if s is None:
-        return None
-    return int(s[0]), -int(s[1])
-
-
-def _pick_delete_by_ged_candidates(
-    sid: str,
-    current: dict,
-    room_name: str,
-    gt_ag: dict,
-    bounds: dict,
-    increase_factor: float,
-    ged_timeout_ms: int,
-    *,
-    candidates_metric: str = "ged",
-) -> tuple[dict, str, str, dict[str, Any], dict[str, Any]]:
-    from scripts.procedural_edits import apply_command, eligible_delete_paths
-
-    pcmd = f"delete {room_name}"
-    cm = candidates_metric if candidates_metric in ("ged", "light") else "ged"
-    try:
-        paths = eligible_delete_paths(current, room_name)
-    except ValueError as exc:
-        empty: dict[str, Any] = {}
-        edited, summary = apply_command(
-            copy.deepcopy(current), pcmd, increase_factor, bounds=None
-        )
-        return edited, summary, pcmd, empty, {"candidates_ged": "not_applicable", "error": str(exc)}
-
-    n_paths_raw = len(paths)
-    ded = collect_delete_candidate_variants(
-        current, room_name, increase_factor
-    )
-    scored: list[
-        tuple[
-            float | None,
-            str,
-            int,
-            list[dict] | None,
-            dict,
-            tuple[int, int] | str,
-        ]
-    ] = []
-    for t, pnm, path in ded:
-        g, _gn = _candidate_score_vs_gt(
-            t, gt_ag, bounds, sid, ged_timeout_ms, cm
-        )
-        path_name = str(path[-1].get("name", "")) if path else str(pnm)
-        neighb = (
-            _leaf_room_neighbor_count(path[-1])
-            if path and len(path) >= 1
-            else 0
-        )
-        mk = _mesh_connectivity_tie_key(t, bounds) or (999, 0)
-        scored.append((g, path_name, neighb, path, t, mk))
-    if not scored:
-        t0 = copy.deepcopy(current)
-        ed, sm = apply_command(t0, pcmd, increase_factor, bounds=None)
-        return ed, sm, pcmd, {}, {"candidates_ged": "all_paths_failed", "pick": "default_apply_command"}
-
-    ok = [x for x in scored if x[0] is not None]
-    if ok:
-        ok.sort(
-            key=lambda it: (it[0] if it[0] is not None else 1e9, it[5], it[2], it[1])
-        )
-        g, pnm, _nb, _path, best_h, _mk = (
-            ok[0][0],
-            ok[0][1],
-            ok[0][2],
-            ok[0][3],
-            ok[0][4],
-            ok[0][5],
-        )
-        mtag = "min_ged" if cm == "ged" else "min_access_light"
-        sym = "GED" if cm == "ged" else "access-light"
-        return (
-            best_h,
-            f"Deleted {room_name} ({sym} pick among {n_paths_raw} target leaves); leaf={pnm!r} score={g!r}",
-            pcmd,
-            {},
-            {
-                "candidates_metric": cm,
-                "candidates_ged": mtag,
-                "candidates_ged_value": g,
-                "candidates_tried": len(scored),
-                "candidates_paths": n_paths_raw,
-            },
-        )
-
-    best_tie = min(
-        scored,
-        key=lambda it: (it[5], it[2], it[1]),
-    )
-    g0, pnm, _nb, _path, best_h, _mk = (
-        best_tie[0],
-        best_tie[1],
-        best_tie[2],
-        best_tie[3],
-        best_tie[4],
-        best_tie[5],
-    )
-    ttag = (
-        "all_timeout_tiebreak_mesh" if cm == "ged" else "all_no_score_tiebreak_mesh"
-    )
-    tsym = "GED timeout" if cm == "ged" else "no score; mesh+neighbor"
-    return (
-        best_h,
-        f"Deleted {room_name} ({tsym} tie) leaf={pnm!r}",
-        pcmd,
-        {},
-        {
-            "candidates_metric": cm,
-            "candidates_ged": ttag,
-            "candidates_tried": len(scored),
-            "candidates_paths": n_paths_raw,
-        },
-    )
-
-
-def _leaf_room_neighbor_count(leaf: dict) -> int:
-    from scripts.procedural_edits import _leaf_room_neighbor_count as _ln
-
-    return _ln(leaf)
-
-
-def _add_candidate_budget_per_anchor(n_anchors: int, total: int = 4) -> list[int]:
-    """
-    Split *total* GED slots across *n_anchors* anchor choices (e.g. 1→4, 2→2+2, 3→2+1+1, 4→1+1+1+1).
-    """
-    n_anchors = max(1, min(int(n_anchors), total))
-    base, rem = total // n_anchors, total % n_anchors
-    return [base + (1 if i < rem else 0) for i in range(n_anchors)]
-
-
-def collect_add_candidate_variants(
-    current: dict,
-    room_phrase: str,
-    gt_ag: dict,
-    bounds: dict,
-    increase_factor: float,
-    new_room_mergeid: str | None,
-    *,
-    add_explore: bool = False,
-) -> tuple[list[tuple[dict, str, str, tuple | None]], list[int], int]:
-    """
-    Enumerate add split / anchor candidates before GED/light scoring.
-
-    * **Default** (``add_explore=False``): same as :func:`_pick_add_by_ged_candidates`
-      mesh top-k path (up to 4 candidates across anchors).
-    * **Explore** (``add_explore=True``): build ``add <new> by <anchor>`` via
-      :func:`complete_add_command_for_procedural`, list every final leaf matching
-      anchor *Y* via :func:`collect_matching_leaf_paths`, then for each leaf try the
-      four axis-aligned split angles in ``_ADD_MESH_SEARCH_ANGLES`` (new room on
-      the “right” half; “four directions” = four rotation choices for the cut).
-
-    Returns:
-        ``(unique, k_list, n_pc)`` — *unique* is ``(hypergraph, pcmd, tag, mesh_key)`` tuples.
-    """
-    from scripts.procedural_edits import (
-        _ADD_MESH_SEARCH_ANGLES,
-        apply_command,
-        collect_matching_leaf_paths,
-        split_leaf_for_add_on_path,
-        split_leaf_for_add_topk,
-    )
-
-    _add_re = re.compile(
-        r"add\s+([a-zA-Z_ ]+?)\s+by\s+([a-zA-Z_ ]+)", flags=re.IGNORECASE
-    )
-
-    if add_explore:
-        cands_ex: list[tuple[dict, str, str, tuple | None]] = []
-        try:
-            pcmd_def, src = complete_add_command_for_procedural(
-                current, room_phrase, gt_ag
-            )
-        except Exception as exc:
-            logger.debug("complete_add_command_for_procedural: %s", exc)
-            pcmd_def, src = "", ""
-        m0 = _add_re.fullmatch(pcmd_def.strip()) if pcmd_def else None
-        if m0:
-            new_r, anchor = m0.group(1).strip(), m0.group(2).strip()
-            try:
-                paths_y = collect_matching_leaf_paths(current, anchor)
-            except Exception as exc:
-                logger.debug("collect_matching_leaf_paths %s: %s", anchor, exc)
-                paths_y = []
-            for path in paths_y:
-                if len(path) < 2:
-                    continue
-                for ang in _ADD_MESH_SEARCH_ANGLES:
-                    t = copy.deepcopy(current)
-                    try:
-                        det = split_leaf_for_add_on_path(
-                            t,
-                            path,
-                            new_r,
-                            new_room_mergeid=new_room_mergeid,
-                            new_room_on_right=True,
-                            split_angle=float(ang),
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "split_leaf_for_add_on_path %s angle=%s: %s",
-                            path[-1].get("name"),
-                            ang,
-                            exc,
-                        )
-                        continue
-                    try:
-                        is_val, _, _, _ = Hypergraph(t).validate(quick=True)
-                    except Exception:
-                        continue
-                    if not is_val:
-                        continue
-                    pcmd_row = f"add {new_r} by {anchor}"
-                    leaf_nm = str(path[-1].get("name", ""))
-                    tag = f"anchor:{src};leaf:{leaf_nm};{det}"
-                    cands_ex.append(
-                        (
-                            t,
-                            pcmd_row,
-                            tag,
-                            _mesh_connectivity_tie_key(t, bounds),
-                        )
-                    )
-        seen_e: set[int] = set()
-        unique_e: list[tuple[dict, str, str, tuple | None]] = []
-        for it in cands_ex:
-            if id(it[0]) in seen_e:
-                continue
-            seen_e.add(id(it[0]))
-            unique_e.append(it)
-        if unique_e:
-            return unique_e, [], len(unique_e)
-
-    pcmds = complete_add_command_candidates(current, room_phrase, gt_ag, 4)
-    cands: list[tuple[dict, str, str, tuple | None]] = []
-    n_pc = len(pcmds)
-    k_list: list[int] = []
-    if pcmds:
-        k_list = _add_candidate_budget_per_anchor(n_pc, 4)
-        for (pcmd, src), ki in zip(pcmds, k_list):
-            m = _add_re.fullmatch(pcmd.strip())
-            if m is None:
-                continue
-            new_r, anchor = m.group(1).strip(), m.group(2).strip()
-            try:
-                pieces = split_leaf_for_add_topk(
-                    copy.deepcopy(current),
-                    anchor,
-                    new_r,
-                    new_room_mergeid=new_room_mergeid,
-                    bounds=bounds,
-                    max_k=max(1, int(ki)),
-                )
-            except Exception as exc:
-                logger.debug("add topk failed %s: %s", pcmd, exc)
-                continue
-            for piece in pieces[: int(ki)]:
-                tdict, det, mkey = piece
-                tag = f"anchor:{src};{det.strip() if det else 'split'}"
-                cands.append((tdict, pcmd, tag, mkey))
-    if not cands and pcmds:
-        t = copy.deepcopy(current)
-        p0, s0 = pcmds[0]
-        try:
-            ed, sm = apply_command(
-                t,
-                p0,
-                increase_factor,
-                new_room_mergeid=new_room_mergeid,
-                bounds=bounds,
-            )
-            cands.append(
-                (ed, p0, f"anchor:{s0},apply", _mesh_connectivity_tie_key(ed, bounds))
-            )
-        except Exception as exc:
-            logger.debug("add single fallback failed %s: %s", p0, exc)
-    seen: set[int] = set()
-    unique: list[tuple[dict, str, str, tuple | None]] = []
-    for it in cands:
-        if id(it[0]) in seen:
-            continue
-        seen.add(id(it[0]))
-        unique.append(it)
-    unique = unique[:4]
-    return unique, k_list, n_pc
-
-
-def collect_delete_candidate_variants(
-    current: dict,
-    room_name: str,
-    increase_factor: float,
-) -> list[tuple[dict, str, list[dict] | None]]:
-    """
-    One candidate per final leaf of the requested type: for each path from
-    :func:`eligible_delete_paths`, apply :func:`delete_room_at_path` (exactly one leaf
-    removed). There is no maximum count (unlike add-candidate enumeration). Optional
-    fallbacks use :func:`apply_command` only when there are no valid paths or all path
-    deletes fail validation.
-    """
-    from scripts.procedural_edits import apply_command, delete_room_at_path, eligible_delete_paths
-
-    pcmd = f"delete {room_name}"
-    try:
-        paths = eligible_delete_paths(current, room_name)
-    except ValueError:
-        t = copy.deepcopy(current)
-        ed, _sm = apply_command(t, pcmd, increase_factor, bounds=None)
-        return [(ed, "default_apply", None)]
-
-    out: list[tuple[dict, str, list[dict] | None]] = []
-    for path in paths:
-        t = copy.deepcopy(current)
-        try:
-            delete_room_at_path(t, path)
-            is_val, _, failed, _ = Hypergraph(t).validate(quick=True)
-            if not is_val:
-                continue
-        except Exception:
-            continue
-        out.append((t, str(path[-1].get("name", "")), path))
-    if not out:
-        t0 = copy.deepcopy(current)
-        ed, _sm = apply_command(t0, pcmd, increase_factor, bounds=None)
-        return [(ed, "default_apply_command", None)]
-    return out
-
-
-def _pick_add_by_ged_candidates(
-    sid: str,
-    current: dict,
-    room_phrase: str,
-    gt_ag: dict,
-    bounds: dict,
-    increase_factor: float,
-    new_room_mergeid: str | None,
-    ged_timeout_ms: int,
-    *,
-    candidates_metric: str = "ged",
-    add_explore: bool = False,
-) -> tuple[dict, str, str, dict[str, Any], dict[str, Any]]:
-    from scripts.procedural_edits import apply_command
-
-    cm = candidates_metric if candidates_metric in ("ged", "light") else "ged"
-    unique, k_list, n_pc = collect_add_candidate_variants(
-        current,
-        room_phrase,
-        gt_ag,
-        bounds,
-        increase_factor,
-        new_room_mergeid,
-        add_explore=add_explore,
-    )
-    enum_base: dict[str, Any] = {
-        "candidates_enumeration": (
-            "add_explore_each_Y_times_4_angles"
-            if add_explore
-            else "split_leaf_for_add_topk_per_anchor"
-        ),
-    }
-    if k_list:
-        enum_base["candidates_n_anchors"] = n_pc
-        enum_base["candidates_k_per_anchor"] = k_list
-    if not unique:
-        pcmd, src = complete_add_command_for_procedural(current, room_phrase, gt_ag)
-        t = copy.deepcopy(current)
-        ed, sm = apply_command(
-            t,
-            pcmd,
-            increase_factor,
-            new_room_mergeid=new_room_mergeid,
-            bounds=bounds,
-        )
-        return ed, sm, pcmd, {"add_anchor_source": src}, {"candidates_ged": "no_candidates_fallback"}
-
-    scored: list[tuple[float | None, tuple, dict, str, str]] = []
-    for ed, pcmd, tag, mkey in unique:
-        g, _n = _candidate_score_vs_gt(
-            ed, gt_ag, bounds, sid, ged_timeout_ms, cm
-        )
-        mk = mkey if mkey is not None else (999, 0)
-        scored.append((g, mk, ed, pcmd, tag))
-    enum_base["candidates_tried"] = len(scored)
-    enum_base["candidates_metric"] = cm
-    ok = [x for x in scored if x[0] is not None]
-    if ok:
-        ok.sort(key=lambda it: (it[0] if it[0] is not None else 1e9, it[1]))
-        g, _mk, best_h, pcmd, tag = ok[0]
-        mtag = "min_ged" if cm == "ged" else "min_access_light"
-        ex: dict[str, Any] = {
-            "add_anchor_source": "candidates_ged_min"
-            if cm == "ged"
-            else "candidates_access_light_min"
-        }
-        sym = "GED" if cm == "ged" else "access-light"
-        return (
-            best_h,
-            f"add {sym}-pick: {pcmd!r} ({tag}) score={g!r}",
-            pcmd,
-            ex,
-            {
-                **enum_base,
-                "candidates_ged": mtag,
-                "candidates_ged_value": g,
-                "candidates_tag": tag,
-            },
-        )
-    best_tie = min(
-        scored,
-        key=lambda it: (it[1], it[0] if it[0] is not None else 1e9),
-    )
-    g0, mkey0, best_h, pcmd, tag = best_tie
-    ttag = (
-        "all_timeout_tiebreak_mesh" if cm == "ged" else "all_no_score_tiebreak_mesh"
-    )
-    ex = {
-        "add_anchor_source": "candidates_ged_tiebreak_mesh"
-        if cm == "ged"
-        else "candidates_access_light_tiebreak_mesh"
-    }
-    return (
-        best_h,
-        f"add (no {('GED' if cm == 'ged' else 'light')} score; mesh tie) {pcmd!r} ({tag})",
-        pcmd,
-        ex,
-        {**enum_base, "candidates_ged": ttag, "candidates_tag": tag},
-    )
 
 
 def multiset_command_to_procedural(
@@ -1074,10 +513,6 @@ def _apply_procedural_chain_for_sample(
     bounds_b: dict,
     increase_factor: float,
     max_procedural_steps: int,
-    *,
-    candidates_mode: bool = False,
-    candidates_ged_timeout_ms: int = 3000,
-    candidates_metric: str = "ged",
 ) -> tuple[dict, dict[str, Any]]:
     """
     Run procedural add/delete chain for one sample. Returns ``(hypergraph, row_updates)``.
@@ -1093,10 +528,6 @@ def _apply_procedural_chain_for_sample(
         "procedural_step3_applied": False,
         "procedural_step4_applied": False,
     }
-    if candidates_mode:
-        meta["procedural_ged_candidates_enabled"] = True
-        meta["procedural_ged_candidates_timeout_ms"] = int(candidates_ged_timeout_ms)
-        meta["candidates_metric"] = str(candidates_metric)
 
     if row_error:
         return base, meta
@@ -1146,44 +577,14 @@ def _apply_procedural_chain_for_sample(
                 new_room_mergeid = _gt_preferred_mergeid_for_room_hint(
                     gt_ag, cmd[4:].strip()
                 )
-            use_cand = bool(candidates_mode and bounds_kw)
-            cmd_l = (cmd or "").strip().lower()
-            if use_cand and cmd_l.startswith("remove "):
-                room = cmd[7:].strip()
-                edited, summary, pcmd, proc_extra, cand_meta = _pick_delete_by_ged_candidates(
-                    sid,
-                    current,
-                    room,
-                    gt_ag,
-                    bounds_b,
-                    increase_factor,
-                    candidates_ged_timeout_ms,
-                    candidates_metric=candidates_metric,
-                )
-                meta[f"procedural_ged_candidates_step{step_i}"] = cand_meta
-            elif use_cand and cmd_l.startswith("add "):
-                room_phrase = cmd[4:].strip()
-                edited, summary, pcmd, proc_extra, cand_meta = _pick_add_by_ged_candidates(
-                    sid,
-                    current,
-                    room_phrase,
-                    gt_ag,
-                    bounds_b,
-                    increase_factor,
-                    new_room_mergeid,
-                    candidates_ged_timeout_ms,
-                    candidates_metric=candidates_metric,
-                )
-                meta[f"procedural_ged_candidates_step{step_i}"] = cand_meta
-            else:
-                pcmd, proc_extra = multiset_command_to_procedural(cmd, current, gt_ag)
-                edited, summary = apply_command(
-                    current,
-                    pcmd,
-                    increase_factor,
-                    new_room_mergeid=new_room_mergeid,
-                    bounds=bounds_kw,
-                )
+            pcmd, proc_extra = multiset_command_to_procedural(cmd, current, gt_ag)
+            edited, summary = apply_command(
+                current,
+                pcmd,
+                increase_factor,
+                new_room_mergeid=new_room_mergeid,
+                bounds=bounds_kw,
+            )
             is_valid, _, failed, _ = Hypergraph(edited).validate(quick=True)
             if not is_valid:
                 raise ValueError("validation failed: " + "; ".join(failed))
@@ -1220,9 +621,6 @@ def _procedural_worker_pack(
         dict,
         float,
         int,
-        bool,
-        int,
-        str,
     ],
 ) -> tuple[str, dict, dict[str, Any]]:
     """Picklable entry for :class:`ProcessPoolExecutor` (``spawn`` context)."""
@@ -1235,9 +633,6 @@ def _procedural_worker_pack(
         bounds_b,
         increase_factor,
         max_procedural_steps,
-        candidates_mode,
-        candidates_ged_timeout_ms,
-        candidates_metric,
     ) = pack
     hg, meta = _apply_procedural_chain_for_sample(
         sid,
@@ -1248,33 +643,8 @@ def _procedural_worker_pack(
         bounds_b,
         increase_factor,
         max_procedural_steps,
-        candidates_mode=candidates_mode,
-        candidates_ged_timeout_ms=candidates_ged_timeout_ms,
-        candidates_metric=candidates_metric,
     )
     return sid, hg, meta
-
-
-def _orientation_worker_pack(
-    pack: tuple[str, dict, dict],
-) -> tuple[str, dict, str | None, str]:
-    """
-    Returns ``(sid, hypergraph_out, orientation_summary_or_none, problem)``.
-    *problem* is ``\"\"`` on success, else ``no_bounds`` / ``invalid`` / exception text.
-    """
-    sid, hg, bounds = pack
-    from scripts.procedural_edits import optimize_rotation
-
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        return sid, hg, None, "no_bounds"
-    try:
-        oh, omsg = optimize_rotation(hg, bounds)
-        is_ok, _, failed, _ = Hypergraph(oh).validate(quick=True)
-        if not is_ok:
-            return sid, hg, None, "invalid:" + "; ".join(failed)
-        return sid, oh, omsg, ""
-    except Exception as exc:
-        return sid, hg, None, str(exc)
 
 
 def apply_procedural_step1_to_hypergraphs(
@@ -1287,16 +657,13 @@ def apply_procedural_step1_to_hypergraphs(
     procedural_steps: int = 1,
     workers: int = 16,
     show_progress: bool = True,
-    candidates_mode: bool = False,
-    candidates_ged_timeout_ms: int = 3000,
-    candidates_metric: str = "ged",
 ) -> dict[str, dict]:
     """
     For each sample, run up to *procedural_steps* (1–4) ``procedural_edits.apply_command``
     calls from ``row[\"multiset_commands\"]`` (greedy multiset plan in ``detail``).
 
-    *bounds_by_id* is used for each ``add`` so procedural_edits can mesh-score BSP split
-    variants (``correct_accessgraph`` connectivity).
+    *bounds_by_id* is passed to ``apply_command`` for ``add`` when corners exist (for mesh
+    adjacency in procedural splits).
 
     Mutates *output* rows with apply metadata. Returns ``id -> hypergraph`` (edited or
     original on skip/failure). Any failure in the chain reverts to the **input** hypergraph.
@@ -1339,9 +706,6 @@ def apply_procedural_step1_to_hypergraphs(
                 bounds_by_id.get(sid) or {},
                 increase_factor,
                 procedural_steps,
-                candidates_mode=candidates_mode,
-                candidates_ged_timeout_ms=candidates_ged_timeout_ms,
-                candidates_metric=candidates_metric,
             )
             _merge_row(sid, row, hg, meta)
         return hyper_out
@@ -1356,9 +720,6 @@ def apply_procedural_step1_to_hypergraphs(
             copy.deepcopy(bounds_by_id.get(sid) or {}),
             increase_factor,
             procedural_steps,
-            candidates_mode,
-            candidates_ged_timeout_ms,
-            candidates_metric,
         )
         for sid, row in output.items()
     ]
@@ -1496,12 +857,6 @@ def main() -> int:
         "for command_step2 fields in logs; avoid --no-two-step when using 3–4.",
     )
     parser.add_argument(
-        "--skip-orientation-opt",
-        action="store_true",
-        help="With --apply-procedural-step1, skip BSP orientation search (optimize_rotation); "
-        "only multiset-driven add/remove edits are applied.",
-    )
-    parser.add_argument(
         "--output-step1-hypergraphs",
         type=Path,
         default=None,
@@ -1514,35 +869,12 @@ def main() -> int:
         help="Passed to procedural_edits.apply_command (increase/reduce scaling).",
     )
     parser.add_argument(
-        "--candidates",
-        action="store_true",
-        help="With --apply-procedural-step1, choose among delete and add variants vs GT: "
-        "one candidate per eligible leaf to delete (no cap) and up to 4 add variants; "
-        "see --candidates-metric.",
-    )
-    parser.add_argument(
-        "--candidates-metric",
-        choices=("ged", "light"),
-        default="ged",
-        help="With --candidates: rank variants by ged (graph edit distance; may time out; "
-        "uses --candidates-ged-timeout-ms per candidate) or light (L1 on room-type multiset + "
-        "L1 on undirected (type,type) edge pairs after mesh-corrected access graph; fast).",
-    )
-    parser.add_argument(
-        "--candidates-ged-timeout-ms",
-        type=int,
-        default=3000,
-        metavar="MS",
-        help="With --candidates-metric ged, timeout per GED call in ms (default 3000). Ignored for light.",
-    )
-    parser.add_argument(
         "--workers",
         type=int,
         default=16,
         metavar="N",
         help="With --apply-procedural-step1, run procedural edits over samples in "
-        "N parallel processes (spawn); also used for orientation unless "
-        "--skip-orientation-opt. Default %(default)s. RGL mesh work is CPU-bound; "
+        "N parallel processes (spawn). Default %(default)s. RGL mesh work is CPU-bound; "
         "memory grows with N. Use 1 for sequential.",
     )
     parser.add_argument(
@@ -1625,11 +957,6 @@ def main() -> int:
             output[sid] = {"command": None, "error": str(exc)}
 
     if args.apply_procedural_step1:
-        if args.skip_orientation_opt:
-            for row in output.values():
-                if isinstance(row, dict):
-                    row.pop("orientation_opt_summary", None)
-
         hg_path = (
             args.output_step1_hypergraphs
             or (args.results_hypergraphs.parent / "results_hypergraphs_step1_procedural.json")
@@ -1643,90 +970,7 @@ def main() -> int:
             procedural_steps=args.procedural_steps,
             workers=args.workers,
             show_progress=not args.quiet,
-            candidates_mode=args.candidates,
-            candidates_ged_timeout_ms=args.candidates_ged_timeout_ms,
-            candidates_metric=args.candidates_metric if args.candidates else "ged",
         )
-
-        from scripts.procedural_edits import optimize_rotation
-
-        n_hg = len(hyper_step1)
-        n_orientation = 0
-        n_orientation_skip = 0
-        w = args.workers
-
-        if args.skip_orientation_opt:
-            logger.info("Skipping orientation optimization (--skip-orientation-opt).")
-        elif w <= 1:
-            orient_iter = hyper_step1.items()
-            if not args.quiet:
-                orient_iter = tqdm(
-                    orient_iter,
-                    total=n_hg,
-                    desc="Orientation",
-                    unit="sample",
-                )
-            for sid, hg in orient_iter:
-                b = bounds_by_id.get(sid) or {}
-                if not (isinstance(b, dict) and b.get("corners")):
-                    n_orientation_skip += 1
-                    continue
-                try:
-                    oh, omsg = optimize_rotation(hg, b)
-                    is_ok, _, failed, _ = Hypergraph(oh).validate(quick=True)
-                    if not is_ok:
-                        logger.warning(
-                            "orientation_opt invalid hypergraph %s: %s",
-                            sid,
-                            "; ".join(failed),
-                        )
-                        n_orientation_skip += 1
-                        continue
-                    hyper_step1[sid] = oh
-                    row = output.get(sid)
-                    if isinstance(row, dict):
-                        row["orientation_opt_summary"] = omsg
-                    n_orientation += 1
-                except Exception as exc:
-                    logger.warning("orientation_opt failed for %s: %s", sid, exc)
-                    n_orientation_skip += 1
-        else:
-            opacks = [
-                (sid, copy.deepcopy(hg), copy.deepcopy(bounds_by_id.get(sid) or {}))
-                for sid, hg in hyper_step1.items()
-            ]
-            ctx = multiprocessing.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=w, mp_context=ctx) as pool:
-                ofuts = [pool.submit(_orientation_worker_pack, p) for p in opacks]
-                with tqdm(
-                    total=n_hg,
-                    desc="Orientation",
-                    unit="sample",
-                    disable=args.quiet,
-                ) as opbar:
-                    for fut in as_completed(ofuts):
-                        sid, oh, omsg, problem = fut.result()
-                        if omsg is not None:
-                            hyper_step1[sid] = oh
-                            row = output.get(sid)
-                            if isinstance(row, dict):
-                                row["orientation_opt_summary"] = omsg
-                            n_orientation += 1
-                        else:
-                            n_orientation_skip += 1
-                            if problem == "no_bounds":
-                                pass
-                            elif problem.startswith("invalid:"):
-                                logger.warning(
-                                    "orientation_opt invalid hypergraph %s: %s",
-                                    sid,
-                                    problem[len("invalid:") :],
-                                )
-                            else:
-                                logger.warning(
-                                    "orientation_opt failed for %s: %s", sid, problem
-                                )
-                        opbar.update(1)
 
         hg_path.parent.mkdir(parents=True, exist_ok=True)
         with open(hg_path, "w") as f:
@@ -1737,14 +981,13 @@ def main() -> int:
         n_applied4 = sum(1 for r in output.values() if r.get("procedural_step4_applied"))
         logger.info(
             "Wrote procedural hypergraphs for %d ids to %s "
-            "(procedural steps applied: %d / %d / %d / %d; orientation-optimized: %d)",
+            "(procedural steps applied: %d / %d / %d / %d)",
             len(hyper_step1),
             hg_path,
             n_applied,
             n_applied2,
             n_applied3,
             n_applied4,
-            n_orientation,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
