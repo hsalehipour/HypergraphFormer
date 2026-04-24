@@ -24,5 +24,7 @@ from .metrics import (
     compute_room_type_accuracy,
     produce_room_list,
     produce_room_area_list,
+    produce_room_list_from_polygons,
+    produce_room_area_list_from_polygons,
 )
 from .report_results import report_results
