@@ -61,7 +61,9 @@ from utils import (
     compute_room_similarity_score,
     compute_room_type_accuracy,
     produce_room_area_list,
+    produce_room_area_list_from_polygons,
     produce_room_list,
+    produce_room_list_from_polygons,
 )
 from utils.hypergraph import Hypergraph
 from utils.report_results import report_results
@@ -69,6 +71,28 @@ from utils.report_results import report_results
 logger = logging.getLogger(__name__)
 
 AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_proportion_error")
+
+
+# ===================================================================
+# GT dispatch helpers  (auto-detect room_polygons vs. hypergraph)
+# ===================================================================
+
+def _gt_room_list(gt):
+    """Produce room list from GT, auto-detecting format."""
+    if gt.get("room_polygons"):
+        return produce_room_list_from_polygons(gt["room_polygons"])
+    return produce_room_list(
+        Hypergraph(gt["hypergraph"]).to_mesh(bounds=gt["bounds"])
+    )
+
+
+def _gt_room_area_list(gt):
+    """Produce room area list from GT, auto-detecting format."""
+    if gt.get("room_polygons"):
+        return produce_room_area_list_from_polygons(gt["room_polygons"])
+    return produce_room_area_list(
+        Hypergraph(gt["hypergraph"]).to_mesh(bounds=gt["bounds"])
+    )
 
 
 # ===================================================================
@@ -146,7 +170,11 @@ def load_skip_ids(path):
 def load_ground_truth(test_dir):
     """Load all ``.txt`` ground-truth files from *test_dir*.
 
-    Returns ``{sample_id: {"accessgraph": ..., "hypergraph": ..., "bounds": ...}}``.
+    Returns ``{sample_id: {"accessgraph": ..., "hypergraph": ...,
+    "room_polygons": ..., "bounds": ...}}``.
+
+    Exactly one of *hypergraph* and *room_polygons* will be populated per
+    sample; the other will be ``None``.
     """
     test_dir = Path(test_dir)
     ground_truth = {}
@@ -159,7 +187,8 @@ def load_ground_truth(test_dir):
 
         ground_truth[fp.stem] = {
             "accessgraph": raw.get("accessgraph", {}),
-            "hypergraph": _parse(raw.get("hypergraph", "{}")),
+            "hypergraph": _parse(raw.get("hypergraph", None)),
+            "room_polygons": raw.get("room_polygons", None),
             "bounds": _parse(raw.get("bounds", "{}")),
         }
     return ground_truth
@@ -339,10 +368,9 @@ def score_delta(results, ground_truth, skip_ids):
         try:
             bounds = gt["bounds"]
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
-            gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
             delta = compute_room_similarity_score(
                 produce_room_list(gen_mesh),
-                produce_room_list(gt_mesh),
+                _gt_room_list(gt),
             )
             per_sample.append({"sample_id": sample_id, "delta": delta})
         except Exception as e:
@@ -388,10 +416,9 @@ def score_area_proportion_error(results, ground_truth, skip_ids):
         try:
             bounds = gt["bounds"]
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
-            gt_mesh = Hypergraph(gt["hypergraph"]).to_mesh(bounds=bounds)
             result = compute_room_area_proportion_error(
                 produce_room_area_list(gen_mesh),
-                produce_room_area_list(gt_mesh),
+                _gt_room_area_list(gt),
             )
             per_sample.append({
                 "sample_id": sample_id,

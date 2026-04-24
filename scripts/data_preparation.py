@@ -17,21 +17,21 @@ Usage:
     python scripts/data_preparation.py --mode train \\
         --dataset-dir dataset/hypergraph --footprint
 
-    # Export eval-format .txt files
-    python scripts/data_preparation.py --mode eval \\
+    # Export eval .txt from dataset_access (room polygons + door adjacencies)
+    python scripts/data_preparation.py --mode eval --data-format access \\
+        --input-file dataset/rplan/dataset_access/data_test.json \\
+        --output-dir dataset/rplan/eval_test
+
+    # Export eval .txt from hypergraph JSON (BSP tree)
+    python scripts/data_preparation.py --mode eval --data-format hypergraph \\
         --input-file dataset/hypergraph/test.json \\
         --output-dir dataset/hypergraph/test
 
-    # Export eval-format with aggregated access graphs
-    python scripts/data_preparation.py --mode eval --aggregate \\
+    # Export eval .txt from hypergraph JSON with aggregated access graphs
+    python scripts/data_preparation.py --mode eval --data-format hypergraph \\
+        --aggregate \\
         --input-file dataset/hypergraph/test.json \\
         --output-dir dataset/hypergraph/test_aggregated
-
-    # Export eval-format using RPLAN door-based access graphs
-    python scripts/data_preparation.py --mode eval \\
-        --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \\
-        --access-file dataset/rplan/dataset_access/data_test.json \\
-        --output-dir dataset/rplan/eval_access/test
 
     # Generate room-list JSONs from a hypergraph JSON file
     python scripts/data_preparation.py --mode room-lists \\
@@ -44,6 +44,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -136,44 +137,115 @@ CATEGORY_TO_MERGEID = {
 }
 
 
-def load_access_lookup(access_file):
-    """Build a name -> access-graph dict from a dataset_access JSON file.
+# ===================================================================
+# Access-format eval helpers
+# ===================================================================
 
-    The returned dict maps ``str(name)`` to an access-graph dict
-    ``{nodes, edges}`` using the same 1-based IDs and room-type labels.
+def access_sample_to_eval_entry(sample: dict) -> dict | None:
+    """Convert one dataset_access item into an eval ``.txt`` dict.
+
+    Returns ``None`` when the sample has no valid rooms or access adjacencies.
     """
-    access_file = Path(access_file)
-    if not access_file.exists():
-        logger.warning(f"Access file not found: {access_file}")
-        return {}
+    from rplan.rplan_to_hypergraph import sample_to_rooms
 
-    with open(access_file, "r") as f:
-        data = json.load(f)
+    rooms_raw = sample.get("rooms", [])
+    adj_list = sample.get("access_adjacencies")
+    if not rooms_raw or adj_list is None:
+        return None
 
-    lookup: dict[str, dict] = {}
-    for item in data:
-        rooms = item.get("rooms", [])
-        adj_list = item.get("access_adjacencies")
-        if not rooms or adj_list is None:
+    valid_rooms = sample_to_rooms(sample)
+    if not valid_rooms:
+        return None
+
+    valid_ids = set(valid_rooms.keys())
+
+    nodes: dict[str, str] = {}
+    room_polygons: list[dict] = []
+    for room in rooms_raw:
+        rid_0 = room["id"]
+        if rid_0 not in valid_ids:
             continue
+        rid_1 = str(rid_0 + 1)
+        category = room.get("category", -1)
+        mergeid = CATEGORY_TO_MERGEID.get(category, f"unknown_{category}")
+        nodes[rid_1] = mergeid
+        room_polygons.append({
+            "id": rid_0 + 1,
+            "category": category,
+            "mergeid": mergeid,
+            "coords": room["r_boundary"],
+        })
 
-        nodes = {}
-        for room in rooms:
-            rid = str(room["id"] + 1)
-            category = room.get("category", -1)
-            nodes[rid] = CATEGORY_TO_MERGEID.get(category, f"unknown_{category}")
+    if not nodes:
+        return None
 
-        edges = []
-        for pair in adj_list:
-            a, b = str(pair[0] + 1), str(pair[1] + 1)
-            if a in nodes and b in nodes:
-                edges.append([a, b])
+    edges: list[list[str]] = []
+    for pair in adj_list:
+        a, b = str(pair[0] + 1), str(pair[1] + 1)
+        if a in nodes and b in nodes:
+            edges.append([a, b])
 
-        if nodes:
-            lookup[str(item.get("name", ""))] = {"nodes": nodes, "edges": edges}
+    boundary = sample.get("boundary", [])
+    corners = []
+    for pt in boundary:
+        x, y = float(pt[0]), float(pt[1])
+        corners.append({"X": x, "Y": y, "Z": 0, "Mag": math.hypot(x, y)})
 
-    logger.info(f"Loaded {len(lookup)} access graphs from {access_file.name}")
-    return lookup
+    return {
+        "accessgraph": {"nodes": nodes, "edges": edges},
+        "room_polygons": room_polygons,
+        "bounds": json.dumps({"corners": corners}),
+    }
+
+
+def export_eval_access(args) -> int:
+    """Export per-sample .txt eval files from a dataset_access JSON."""
+    input_file = Path(args.input_file)
+    output_dir = Path(args.output_dir or "dataset/rplan/eval_test")
+
+    logger.info("=" * 80)
+    logger.info("Export Eval-Format .txt Files  (data-format: access)")
+    logger.info("=" * 80)
+    logger.info(f"Input file:       {input_file}")
+    logger.info(f"Output directory:  {output_dir}")
+    logger.info("=" * 80)
+
+    if not input_file.exists():
+        logger.error(f"Input file not found: {input_file}")
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(input_file, "r") as f:
+        raw_data = json.load(f)
+
+    successful = 0
+    skipped = 0
+
+    for i, sample in enumerate(raw_data):
+        sample_name = str(sample.get("name", f"item_{i}"))
+        try:
+            entry = access_sample_to_eval_entry(sample)
+            if entry is None:
+                logger.warning(f"Skipping {sample_name}: invalid rooms or access")
+                skipped += 1
+                continue
+
+            with open(output_dir / f"{sample_name}.txt", "w") as f:
+                json.dump(entry, f, indent=2)
+
+            successful += 1
+
+            if (i + 1) % 500 == 0:
+                logger.info(f"  Processed {i + 1}/{len(raw_data)} samples...")
+
+        except Exception as e:
+            logger.warning(f"Error processing {sample_name}: {e}")
+            skipped += 1
+
+    logger.info(f"\nDone! {successful} files written, {skipped} skipped.")
+    logger.info(f"Output directory: {output_dir}")
+    return 0
 
 
 # ===================================================================
@@ -339,19 +411,25 @@ def aggregate_accessgraph(ag: dict, hg_obj: "Hypergraph", bounds: dict,
 # ===================================================================
 
 def export_eval_format(args) -> int:
-    """Export per-sample .txt eval files from a JSON split."""
+    """Dispatch eval export by ``--data-format``."""
+    data_format = getattr(args, "data_format", "hypergraph")
+
+    if data_format == "access":
+        return export_eval_access(args)
+    return _export_eval_hypergraph(args)
+
+
+def _export_eval_hypergraph(args) -> int:
+    """Export per-sample .txt eval files from a hypergraph JSON split."""
     input_file = Path(args.input_file)
     output_dir = Path(args.output_dir or "dataset/hypergraph/test")
     aggregate = getattr(args, "aggregate", False)
-    access_file = getattr(args, "access_file", None)
 
     logger.info("=" * 80)
-    logger.info("Export Eval-Format .txt Files")
+    logger.info("Export Eval-Format .txt Files  (data-format: hypergraph)")
     logger.info("=" * 80)
     logger.info(f"Input file:       {input_file}")
     logger.info(f"Output directory:  {output_dir}")
-    if access_file:
-        logger.info(f"Access file:       {access_file}")
     if aggregate:
         logger.info("Aggregation:       ON (merge same-type adjacent connected rooms)")
     logger.info("=" * 80)
@@ -362,13 +440,6 @@ def export_eval_format(args) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    access_lookup: dict[str, dict] = {}
-    if access_file:
-        access_lookup = load_access_lookup(access_file)
-        if not access_lookup:
-            logger.error("Access lookup is empty; check --access-file path")
-            return 1
-
     with open(input_file, "r") as f:
         raw_data = json.load(f)
 
@@ -376,7 +447,6 @@ def export_eval_format(args) -> int:
     skipped = 0
     total_nodes_before = 0
     total_nodes_after = 0
-    access_hits = 0
 
     for i, item in enumerate(raw_data):
         try:
@@ -395,16 +465,7 @@ def export_eval_format(args) -> int:
             )
 
             hg_obj = Hypergraph(hypergraph)
-
-            if access_lookup:
-                accessgraph = access_lookup.get(str(item_id))
-                if accessgraph is None:
-                    logger.warning(f"Skipping {item_id}: not found in access file")
-                    skipped += 1
-                    continue
-                access_hits += 1
-            else:
-                accessgraph = hg_obj.access_graph
+            accessgraph = hg_obj.access_graph
 
             if not accessgraph or not accessgraph.get("nodes"):
                 logger.warning(f"Skipping {item_id}: empty access graph")
@@ -446,8 +507,6 @@ def export_eval_format(args) -> int:
             skipped += 1
 
     logger.info(f"\nDone! {successful} files written, {skipped} skipped.")
-    if access_lookup:
-        logger.info(f"Access-file matches: {access_hits}/{successful + skipped}")
     if aggregate and total_nodes_before > 0:
         logger.info(
             f"Aggregation: {total_nodes_before} nodes -> {total_nodes_after} nodes "
@@ -554,10 +613,18 @@ def cli():
 
     # eval mode
     parser.add_argument(
+        "--data-format",
+        type=str,
+        choices=["access", "hypergraph"],
+        default=None,
+        help="(eval mode) Input data format: 'access' reads dataset_access JSON "
+             "(room polygons + door adjacencies); 'hypergraph' reads BSP hypergraph JSON",
+    )
+    parser.add_argument(
         "--input-file",
         type=str,
         default="dataset/hypergraph/test.json",
-        help="Path to JSON file to export (eval mode)",
+        help="Path to JSON file to export (eval / room-lists mode)",
     )
     parser.add_argument(
         "--output-dir",
@@ -568,16 +635,18 @@ def cli():
     parser.add_argument(
         "--aggregate",
         action="store_true",
-        help="(eval mode) Merge same-type, spatially adjacent, access-connected rooms",
-    )
-    parser.add_argument(
-        "--access-file",
-        type=str,
-        default=None,
-        help="(eval mode) dataset_access JSON to use as access-graph source",
+        help="(eval mode, hypergraph only) Merge same-type, spatially adjacent, "
+             "access-connected rooms",
     )
 
     args = parser.parse_args()
+
+    if args.mode == "eval":
+        if args.data_format is None:
+            parser.error("--data-format is required for --mode eval")
+        if args.aggregate and args.data_format != "hypergraph":
+            parser.error("--aggregate is only supported with --data-format hypergraph")
+
     return MODE_MAP[args.mode](args)
 
 

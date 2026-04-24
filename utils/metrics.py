@@ -17,6 +17,17 @@ from .hypergraph import Hypergraph
 ROOM_ORDER = ['kitchen', 'living', 'dining', 'bathroom', 'bed', 'foyer', 'storage', 'extra']
 
 
+def _room_sort_key(room_tuple):
+    """Sort key for room tuples whose first element is a room-type string."""
+    roomname = room_tuple[0].lower()
+    if 'bath' in roomname:
+        roomname = 'bathroom'
+    try:
+        return ROOM_ORDER.index(roomname)
+    except ValueError:
+        return len(ROOM_ORDER)
+
+
 def produce_room_list(generated_mesh):
     """Extract a sorted list of ``(room_name, perimeter, square_perimeter)``
     tuples from an RGL mesh, ordered by :data:`ROOM_ORDER`.
@@ -29,16 +40,7 @@ def produce_room_list(generated_mesh):
         square_perimeter = 4 * math.sqrt(face.Area)
         room_data.append((face.merge_id, face.Perimeter, square_perimeter))
 
-    def _sort_key(room_tuple):
-        roomname = room_tuple[0].lower()
-        if 'bath' in roomname:
-            roomname = 'bathroom'
-        try:
-            return ROOM_ORDER.index(roomname)
-        except ValueError:
-            return len(ROOM_ORDER)
-
-    return sorted(room_data, key=_sort_key)
+    return sorted(room_data, key=_room_sort_key)
 
 
 def produce_room_area_list(generated_mesh):
@@ -52,16 +54,52 @@ def produce_room_area_list(generated_mesh):
         face = generated_mesh.faceList[i]
         room_data.append((face.merge_id, face.Area))
 
-    def _sort_key(room_tuple):
-        roomname = room_tuple[0].lower()
-        if 'bath' in roomname:
-            roomname = 'bathroom'
-        try:
-            return ROOM_ORDER.index(roomname)
-        except ValueError:
-            return len(ROOM_ORDER)
+    return sorted(room_data, key=_room_sort_key)
 
-    return sorted(room_data, key=_sort_key)
+
+def produce_room_list_from_polygons(room_polygons):
+    """Like :func:`produce_room_list` but from pre-computed polygon dicts.
+
+    Each item in *room_polygons* must have ``mergeid`` (str) and ``coords``
+    (list of ``[x, y]`` points) -- the format written by
+    ``data_preparation.py --data-format access``.
+    """
+    from shapely.geometry import Polygon
+
+    room_data = []
+    for rp in room_polygons:
+        coords = rp.get("coords", [])
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_empty or poly.area < 1e-6:
+            continue
+        area = poly.area
+        perimeter = poly.length
+        square_perimeter = 4 * math.sqrt(area)
+        room_data.append((rp["mergeid"], perimeter, square_perimeter))
+
+    return sorted(room_data, key=_room_sort_key)
+
+
+def produce_room_area_list_from_polygons(room_polygons):
+    """Like :func:`produce_room_area_list` but from pre-computed polygon dicts.
+
+    See :func:`produce_room_list_from_polygons` for the expected input format.
+    """
+    from shapely.geometry import Polygon
+
+    room_data = []
+    for rp in room_polygons:
+        coords = rp.get("coords", [])
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_empty or poly.area < 1e-6:
+            continue
+        room_data.append((rp["mergeid"], poly.area))
+
+    return sorted(room_data, key=_room_sort_key)
 
 
 def _canonical_room_type_key(merge_id) -> str:
