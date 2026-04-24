@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Post-process exported hypergraphs: canonical BSP names, then fix disconnected access graphs.
+Fix disconnected access graphs in RPLAN-derived hypergraph datasets.
 
-Input JSON files under ``--dataset-dir`` are read only; output is written to
-``--output-dir``. Each sample copy is first passed through
-``repair_bsp_tree_names`` so duplicate leaf ``name`` strings (which break
-``access_graph`` and mesh face mapping) become unique path-based ids.
+This script is a post-processing step in the RPLAN-to-hypergraph conversion
+pipeline (see ``rplan/rplan_to_hypergraph.py``).  The BSP conversion can
+produce hypergraphs whose access graphs have multiple disconnected components
+— rooms that are spatially adjacent but lack an explicit ``connected`` edge.
+This step detects those cases and adds the minimum edges needed to make the
+access graph connected, using mesh-based polygon adjacency.
 
-For each sample with a disconnected access graph, the script then attempts to
-reconnect components by adding edges to the leaf ``connected`` lists:
+Reconnection strategy (applied iteratively until the graph is connected):
 
   1. **Living-Living bridge**: If two components each contain a living
      room and those rooms share a polygon edge, connect them.
@@ -28,7 +29,7 @@ leaves 1-to-1; samples where this fails are skipped.
 Writes repaired splits to new JSON files in an output directory.
 
 Usage:
-    python rplan/postprocess_hypergraphs.py \\
+    python rplan/fix_rplan_accessgraph_connectivity.py \\
         --dataset-dir dataset/rplan/dataset_hypergraph \\
         --output-dir  dataset/rplan/dataset_hypergraph_fixed \\
         -j 64
@@ -46,7 +47,7 @@ from pathlib import Path
 from shapely.affinity import scale as _scale
 from shapely.geometry import Polygon
 
-from utils.hypergraph import Hypergraph, repair_bsp_tree_names
+from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
@@ -255,17 +256,10 @@ def _fix_worker(work_item):
         return idx, item, "skip"
 
     hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
-    try:
-        repaired = repair_bsp_tree_names(hg_dict)
-    except Exception:
-        return idx, item, "repair_error"
-
-    hg = Hypergraph(repaired)
+    hg = Hypergraph(hg_dict)
 
     if hg.is_access_graph_connected():
-        patched = dict(item)
-        patched["split"] = json.dumps(repaired)
-        return idx, patched, "connected"
+        return idx, item, "connected"
 
     bounds_str = item.get("bounds", "")
     bounds = (
@@ -275,16 +269,12 @@ def _fix_worker(work_item):
     )
 
     if not bounds or not isinstance(bounds, dict):
-        patched = dict(item)
-        patched["split"] = json.dumps(repaired)
-        return idx, patched, "no_bounds"
+        return idx, item, "no_bounds"
 
     try:
-        fixed_dict, n_added = fix_access_graph(repaired, bounds)
+        fixed_dict, n_added = fix_access_graph(hg_dict, bounds)
     except Exception:
-        patched = dict(item)
-        patched["split"] = json.dumps(repaired)
-        return idx, patched, "error"
+        return idx, item, "error"
 
     hg_after = Hypergraph(fixed_dict)
     now_connected = hg_after.is_access_graph_connected()
@@ -323,7 +313,7 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="Post-process hypergraphs: canonical BSP names, fix disconnected access graphs.",
+        description="Post-process hypergraphs: fix disconnected access graphs.",
     )
     parser.add_argument(
         "--dataset-dir", type=str, default="dataset/rplan/dataset_hypergraph",
@@ -391,8 +381,6 @@ def main():
             elif status == "no_bounds":
                 disconnected += 1
             elif status == "error":
-                disconnected += 1
-            elif status == "repair_error":
                 disconnected += 1
 
         save_split(items, output_dir, split)
