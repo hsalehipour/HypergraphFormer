@@ -78,7 +78,7 @@ import torch
 from tqdm import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from utils.hypergraph import Hypergraph
+from utils.hypergraph import Hypergraph, repair_bsp_tree_names
 from scripts.generators import GPTGenerator, QwenGenerator, VLLM_AVAILABLE, VllmQwenGenerator
 
 logger = logging.getLogger(__name__)
@@ -1105,14 +1105,22 @@ class FewShotQwenEvaluator(Evaluator):
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_qwen_response(response)
+        hg = Hypergraph.from_qwen_response(response)
+        if hg is not None:
+            hg = Hypergraph(repair_bsp_tree_names(hg.data))
+        return hg
 
     def score_result(self, result, hg, sample):
         result.pop("_ged_info", None)
         result["json_extracted"] = True
+        from utils import compute_ged_from_hypergraph
+        bounds = sample.get("bounds") or {}
         try:
-            from utils import compute_ged_from_hypergraph
-            ged, _ = compute_ged_from_hypergraph(sample["accessgraph"], hg.data, sample["filename"])
+            ged, _ = compute_ged_from_hypergraph(
+                sample["accessgraph"], hg.data, sample["filename"],
+                correct_accessgraph=bool(bounds.get("corners")),
+                bounds=bounds,
+            )
             if ged is not None:
                 result["ged"] = ged
                 result["ged_computed"] = True
@@ -1186,14 +1194,22 @@ class FewShotGPTEvaluator(Evaluator):
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_gpt_response(response)
+        hg = Hypergraph.from_gpt_response(response)
+        if hg is not None:
+            hg = Hypergraph(repair_bsp_tree_names(hg.data))
+        return hg
 
     def score_result(self, result, hg, sample):
         result.pop("_ged_info", None)
         result["json_extracted"] = True
         from utils import compute_ged_from_hypergraph
+        bounds = sample.get("bounds") or {}
         try:
-            ged, _ = compute_ged_from_hypergraph(sample["accessgraph"], hg.data, sample["filename"])
+            ged, _ = compute_ged_from_hypergraph(
+                sample["accessgraph"], hg.data, sample["filename"],
+                correct_accessgraph=bool(bounds.get("corners")),
+                bounds=bounds,
+            )
             if ged is not None:
                 result["ged"] = ged
                 result["ged_computed"] = True
