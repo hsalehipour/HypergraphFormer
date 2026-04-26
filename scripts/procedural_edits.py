@@ -211,6 +211,83 @@ def _normalize_cardinal_angle(rad: float) -> float:
     return k * (math.pi / 2)
 
 
+def parse_reflect_mode_to_code(reflect_mode: str) -> str | None:
+    """
+    Map CLI-style reflect labels (same as :func:`rotate_boundary`) to ``None`` / ``"x"`` / ``"y"``.
+    ``None`` means no mirror; ``"x"`` and ``"y"`` are flips in the centroid frame used by
+    :func:`transform_bounds_polygon`.
+    """
+    mode = (reflect_mode or "normal").strip().lower()
+    if mode in ("normal", "none", "no_flip", "no-mirror", "nomirror"):
+        return None
+    if mode in ("mirrored", "mirror", "mirrored_x", "flip_x", "x"):
+        return "x"
+    if mode in ("mirrored_y", "flip_y", "y"):
+        return "y"
+    raise ValueError(
+        f"Unknown reflect mode {reflect_mode!r}; use 'normal' / 'no_flip', "
+        "'x' / 'flip_x', or 'y' / 'flip_y'"
+    )
+
+
+def _apply_bsp_rotation_inplace(node: dict, delta_rad: float) -> None:
+    if "angle" in node:
+        node["angle"] = _normalize_cardinal_angle(float(node["angle"]) + delta_rad)
+    for c in node.get("children", []):
+        _apply_bsp_rotation_inplace(c, delta_rad)
+
+
+def _apply_bsp_reflect_x_inplace(node: dict) -> None:
+    if not node.get("final", False):
+        ch = node.get("children") or []
+        if len(ch) == 2:
+            ch[0], ch[1] = ch[1], ch[0]
+    if "angle" in node:
+        a = float(node.get("angle", 0.0))
+        node["angle"] = _normalize_cardinal_angle(math.pi - a)
+    for c in node.get("children", []):
+        _apply_bsp_reflect_x_inplace(c)
+
+
+def _apply_bsp_reflect_y_inplace(node: dict) -> None:
+    if not node.get("final", False):
+        ch = node.get("children") or []
+        if len(ch) == 2:
+            ch[0], ch[1] = ch[1], ch[0]
+    if "angle" in node:
+        a = float(node.get("angle", 0.0))
+        node["angle"] = _normalize_cardinal_angle(-a)
+    for c in node.get("children", []):
+        _apply_bsp_reflect_y_inplace(c)
+
+
+def _apply_bsp_orientation_inplace(root: dict, degrees_ccw: float, reflect: str | None) -> None:
+    """Reflect (optional) about x or y, then CCW rotation for all internal split *angle* s."""
+    if reflect == "x":
+        _apply_bsp_reflect_x_inplace(root)
+    elif reflect == "y":
+        _apply_bsp_reflect_y_inplace(root)
+    _apply_bsp_rotation_inplace(root, math.radians(float(degrees_ccw)))
+
+
+def reorient_hypergraph_bsp(hypergraph: dict, deg_ccw: float, reflect_mode: str) -> dict:
+    """
+    Apply a **rigid** orientation of the **BSP** (child swaps + split *angle* updates) in the
+    same *reflect-then-rotate* order as :func:`transform_bounds_polygon` uses for the
+    footprint polygon. This is the complement to bounds-only ``transform_bounds_polygon`` in
+    :func:`rotate_boundary` (where the tree is left unchanged). Returns a **deep copy**; *hypergraph*
+    is not modified.
+
+    *reflect_mode* uses the same spellings as :func:`parse_reflect_mode_to_code` (e.g. ``normal``,
+    ``x``, ``flip_x``, ``y``). *deg_ccw* is the same CCW angle in degrees (typically ``0, 90, 180, 270``).
+    """
+    out = copy.deepcopy(hypergraph)
+    code = parse_reflect_mode_to_code(reflect_mode)
+    _apply_bsp_orientation_inplace(out, float(deg_ccw), code)
+    recompute_areas(out)
+    return out
+
+
 def swap_l_r_letters_in_string(s: str) -> str:
     """
     Map every ``L`` to ``R`` and every ``R`` to ``L`` in the string (ASCII, uppercase
@@ -328,18 +405,10 @@ def rotate_boundary(
     if not (isinstance(bounds, dict) and bounds.get("corners")):
         raise ValueError("rotate_boundary: bounds with non-empty 'corners' is required for meshing")
 
-    mode = (reflect_mode or "normal").strip().lower()
-    if mode in ("normal", "none", "no_flip"):
-        reflect_code: str | None = None
-    elif mode in ("mirrored", "mirror", "mirrored_x", "flip_x", "x"):
-        reflect_code = "x"
-    elif mode in ("mirrored_y", "flip_y", "y"):
-        reflect_code = "y"
-    else:
-        raise ValueError(
-            f"rotate_boundary: unknown reflect_mode {reflect_mode!r}; use "
-            "'normal' or 'mirrored' (x), or 'mirrored_y' / 'y'"
-        )
+    try:
+        reflect_code = parse_reflect_mode_to_code(reflect_mode)
+    except ValueError as e:
+        raise ValueError("rotate_boundary: " + str(e)) from e
 
     bounds_t = transform_bounds_polygon(bounds, reflect_code, float(angle_deg))
     return Hypergraph(copy.deepcopy(hypergraph)).to_mesh(bounds=bounds_t)
@@ -761,10 +830,26 @@ def apply_command(
         )
         return edited, summary
 
+    reorient_match = re.fullmatch(
+        r"reorient\s+([+-]?\d+(?:\.\d+)?)\s+([a-zA-Z0-9_ -]+)\s*",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if reorient_match:
+        deg = float(reorient_match.group(1).strip())
+        mode = reorient_match.group(2).strip()
+        try:
+            edited = reorient_hypergraph_bsp(hypergraph, deg, mode)
+        except ValueError as e:
+            raise ValueError(f"reorient: {e}") from e
+        summary = f"Reoriented BSP: CCW {deg}°, reflect mode {mode!r} (reflect, then rotate; same order as bounds transform_bounds_polygon)"
+        return edited, summary
+
     raise ValueError(
         f"Unsupported command {command!r}. Currently supported: "
         f"'increase <room>', 'reduce <room>', 'delete <room>', 'add <room2> by <room1>', "
-        f"and 'swap <room1> and <room2>'"
+        f"'swap <room1> and <room2>', "
+        f"and 'reorient <deg_ccw> <reflect_mode>' (e.g. reorient 90 normal, reorient 0 flip_x)"
     )
 
 

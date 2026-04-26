@@ -39,6 +39,17 @@ scoring aligns with eval access-graph spelling (e.g. ``bed`` vs ``bedroom``). Wr
 dict ``sample_id -> hypergraph`` — no images or extra folders. Procedural edits are
 **CPU-heavy** (RGL meshing via .NET); use ``--workers N`` to process samples in parallel
 (``spawn`` processes; default ``N=16``).
+
+**Modes** (``--pp-mode``; default: ``parametric`` — behavior above).
+
+* ``orientation`` — For each id, a **bsp** 3×4 search (mirrors × CCW°) as in
+  ``explore_rotation --mode bsp``; the best cell is the lowest room-shape **δ** (not APE
+  in this short path). Output JSON matches ``--results-hypergraphs`` shape: each id maps to
+  a **hypergraph object only** (no ``mesh_bounds`` / ``orientation`` wrappers).
+
+* ``optimization`` — Runs :func:`scripts.run_parametric.optimize_hypergraph` per id with
+  **vanilla GD** and :class:`utils_parametric.OptimConfig` defaults (objective **delta**).
+  See ``--output-optimization*`` and ``--no-optimization-meta``.
 """
 from __future__ import annotations
 
@@ -46,6 +57,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import multiprocessing
 import sys
 from collections import Counter
@@ -800,6 +812,298 @@ def process_sample(
     return row
 
 
+# --- Optional batch modes: orientation (bsp) & parametric optimization (GD) ---
+
+_REFLECT_MODES_OR: tuple[tuple[str | None, str], ...] = (
+    (None, "no_flip"),
+    ("x", "flip_x"),
+    ("y", "flip_y"),
+)
+_ROT_DEGS_OR: tuple[int, ...] = (0, 90, 180, 270)
+_REFLECT_CODE_TO_REORIENT_MODE_OR: dict[str | None, str] = {
+    None: "normal",
+    "x": "x",
+    "y": "y",
+}
+
+
+def orient_one_sample(
+    sid: str,
+    base_hg: dict,
+    bounds: dict,
+    gt_hg: dict,
+) -> dict[str, Any]:
+    """
+    ``explore_rotation`` **bsp** only: reorient the pred BSP, canonical ``bounds``, pick
+    the (mirror,°) with lowest room-shape **δ** vs GT. Returns ``hypergraph``, ``mesh_bounds``, etc.
+    """
+    from scripts.procedural_edits import reorient_hypergraph_bsp
+    from utils.metrics import compute_room_similarity_score, produce_room_list
+
+    if not (bounds and isinstance(bounds, dict) and bounds.get("corners")):
+        return {
+            "error": "missing bounds.corners",
+            "hypergraph": copy.deepcopy(repair_bsp_tree_names(base_hg)),
+        }
+    if not (gt_hg and isinstance(gt_hg, dict) and gt_hg.get("name")):
+        return {
+            "error": "missing gt hypergraph",
+            "hypergraph": copy.deepcopy(repair_bsp_tree_names(base_hg)),
+        }
+
+    base = repair_bsp_tree_names(copy.deepcopy(base_hg))
+    rows: list[dict[str, Any]] = []
+    for reflect_code, reflect_label in _REFLECT_MODES_OR:
+        for deg in _ROT_DEGS_OR:
+            try:
+                pred = reorient_hypergraph_bsp(
+                    base,
+                    float(deg),
+                    _REFLECT_CODE_TO_REORIENT_MODE_OR[reflect_code],
+                )
+                mesh_bounds = bounds
+                pred_mesh = Hypergraph(pred).to_mesh(bounds=mesh_bounds)
+                gt_mesh_v = Hypergraph(gt_hg).to_mesh(bounds=mesh_bounds)
+            except Exception as exc:  # noqa: BLE001
+                rows.append(
+                    {
+                        "reflect": reflect_code,
+                        "reflect_label": reflect_label,
+                        "deg": deg,
+                        "delta": None,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            pred_room = produce_room_list(pred_mesh)
+            gt_room_v = produce_room_list(gt_mesh_v)
+            dlt = float(compute_room_similarity_score(pred_room, gt_room_v))
+            row: dict[str, Any] = {
+                "reflect": reflect_code,
+                "reflect_label": reflect_label,
+                "deg": deg,
+                "delta": dlt,
+                "out_hypergraph": copy.deepcopy(pred),
+                "mesh_bounds": copy.deepcopy(mesh_bounds),
+            }
+            rows.append(row)
+
+    valid = [
+        r
+        for r in rows
+        if "error" not in r
+        and r.get("delta") is not None
+        and math.isfinite(float(r["delta"]))
+    ]
+    if not valid:
+        return {
+            "error": "no valid orientation cells",
+            "hypergraph": copy.deepcopy(base),
+            "meta": {"style": "bsp", "rows": rows, "n_tried": len(rows)},
+        }
+
+    best = min(valid, key=lambda r: float(r["delta"]))
+
+    return {
+        "hypergraph": copy.deepcopy(best["out_hypergraph"]),
+        "mesh_bounds": copy.deepcopy(best.get("mesh_bounds") or {}),
+        "dataset_bounds": copy.deepcopy(bounds),
+        "meta": {
+            "style": "bsp",
+            "metric": "delta",
+            "reflect": best.get("reflect"),
+            "reflect_label": best.get("reflect_label"),
+            "deg": int(best.get("deg", 0)),
+            "delta": best.get("delta"),
+            "n_variants_tried": len(rows),
+        },
+    }
+
+
+def _orientation_pack(
+    p: tuple[str, dict, dict, dict],
+) -> tuple[str, dict[str, Any]]:
+    sid, base_hg, b2, gth = p
+    return sid, orient_one_sample(sid, base_hg, b2, gth)
+
+
+def _hypergraph_from_results_value(v: Any) -> dict[str, Any]:
+    """``results[id]`` may be a root tree or ``{\"hypergraph\": <tree>, ...}``."""
+    if not isinstance(v, dict):
+        return {}
+    if "hypergraph" in v and isinstance(v["hypergraph"], dict) and v["hypergraph"]:
+        return v["hypergraph"]
+    return v
+
+
+def run_orientation_mode(
+    results: dict[str, dict],
+    test_dir: Path,
+    *,
+    out_path: Path,
+    max_samples: int | None,
+    workers: int,
+    show_progress: bool,
+) -> None:
+    from scripts.visualize_procedural_edited import load_eval_access_gt
+
+    ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
+    if max_samples is not None:
+        ids = ids[: int(max_samples)]
+    n_out = len(ids)
+    out: dict[str, Any] = {}
+
+    def _record(sid: str, rec: dict[str, Any]) -> None:
+        if rec.get("error"):
+            logger.warning("Orientation %s: %s", sid, rec["error"])
+        hg = rec.get("hypergraph")
+        if not isinstance(hg, dict) or not hg:
+            base = _hypergraph_from_results_value(results.get(sid, {}))
+            hg = copy.deepcopy(repair_bsp_tree_names(base))
+        else:
+            hg = copy.deepcopy(hg)
+        out[sid] = hg
+
+    if workers <= 1:
+        it = ids
+        if show_progress:
+            it = tqdm(ids, desc="Orientation", total=n_out, unit="sample")
+        for sid in it:
+            b2, gth, _ag = load_eval_access_gt(test_dir, sid)
+            rec = orient_one_sample(sid, _hypergraph_from_results_value(results[sid]), b2, gth)
+            _record(sid, rec)
+    else:
+        packs: list[tuple[str, dict, dict, dict]] = []
+        for sid in ids:
+            b2, gth, _ag = load_eval_access_gt(test_dir, sid)
+            packs.append((sid, _hypergraph_from_results_value(results[sid]), b2, gth))
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            futs = [pool.submit(_orientation_pack, p) for p in packs]
+            it = as_completed(futs)
+            if show_progress:
+                it = tqdm(it, total=n_out, desc="Orientation", unit="sample")
+            for fut in it:
+                sid, rec = fut.result()
+                _record(sid, rec)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    logger.info("Wrote hypergraphs only (%d ids, same format as --results-hypergraphs) to %s", len(out), out_path)
+
+
+def _optim_worker_pack(
+    t: tuple[str, str, str, str, str],
+) -> tuple[str, dict, dict[str, Any] | None, str | None]:
+    import json
+    from pathlib import Path
+
+    from scripts.run_parametric import optimize_hypergraph
+    from utils_parametric import OptimConfig
+
+    sid, grpo_path_s, cfg_json, art_base_s, _td = t
+    grpo = Path(grpo_path_s)
+    with open(grpo, encoding="utf-8") as f:
+        allh: dict = json.load(f)
+    if sid not in allh:
+        return sid, repair_bsp_tree_names({}), None, f"missing id {sid}"
+    cfg = OptimConfig(**json.loads(cfg_json))
+    art = Path(art_base_s) / sid
+    try:
+        best_hg, _bm, _om, _gt, mo, mp, _bg, _ec, _ag = optimize_hypergraph(
+            sid,
+            cfg,
+            grpo_file_path=grpo,
+            artifacts_dir=art,
+        )
+        msummary = {"metrics_original": mo, "metrics_optimized": mp}
+        return sid, best_hg, msummary, None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Optimization failed for %s: %s", sid, exc)
+        return sid, repair_bsp_tree_names(allh[sid]), None, f"{type(exc).__name__}: {exc}"
+
+
+def run_optimization_mode(
+    results: dict[str, dict],
+    test_dir: Path,
+    grpo: Path,
+    *,
+    out_hg: Path,
+    out_meta: Path | None,
+    max_samples: int | None,
+    workers: int,
+    show_progress: bool,
+) -> None:
+    import json
+    from dataclasses import asdict
+
+    from utils_parametric import OptimConfig
+
+    try:
+        td_rel = str(test_dir.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        td_rel = str(test_dir)
+    wcfg = asdict(OptimConfig(optimizer="gd"))
+    wcfg["test_dir"] = td_rel
+    wcfg["grpo_file"] = str(grpo.resolve())
+    wcfg["artifacts_dir"] = None
+    for k, v in list(wcfg.items()):
+        if v is not None and isinstance(v, Path):
+            wcfg[k] = str(v)
+    cfg_json = json.dumps(wcfg, default=str)
+
+    ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
+    if max_samples is not None:
+        ids = ids[: int(max_samples)]
+    n_out = len(ids)
+    art_base = (grpo.parent / "postprocessing_optimization_artifacts").resolve()
+    out_h: dict[str, dict] = {}
+    meta: dict[str, Any] = {}
+
+    if workers <= 1:
+        it = ids
+        if show_progress:
+            it = tqdm(ids, desc="Optimization", total=n_out, unit="sample")
+        for sid in it:
+            sid, hg, m, err = _optim_worker_pack(
+                (sid, str(grpo.resolve()), cfg_json, str(art_base), td_rel)
+            )
+            out_h[sid] = hg
+            if m:
+                meta[sid] = m
+            if err:
+                meta[sid] = {**(meta.get(sid) or {}), "error": err}
+    else:
+        packs = [
+            (sid, str(grpo.resolve()), cfg_json, str(art_base), td_rel) for sid in ids
+        ]
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            futs = [pool.submit(_optim_worker_pack, p) for p in packs]
+            with tqdm(
+                total=n_out, desc="Optimization", unit="sample", disable=not show_progress
+            ) as pbar:
+                for fut in as_completed(futs):
+                    sid, hg, m, err = fut.result()
+                    out_h[sid] = hg
+                    if m:
+                        meta[sid] = m
+                    if err:
+                        meta[sid] = {**(meta.get(sid) or {}), "error": err}
+                    pbar.update(1)
+
+    out_hg.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_hg, "w", encoding="utf-8") as f:
+        json.dump(out_h, f, indent=2, sort_keys=True)
+    logger.info("Wrote optimized hypergraphs (%d ids) to %s", len(out_h), out_hg)
+    if out_meta is not None:
+        out_meta.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_meta, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+        logger.info("Wrote optimization meta to %s", out_meta)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -873,9 +1177,43 @@ def main() -> int:
         type=int,
         default=16,
         metavar="N",
-        help="With --apply-procedural-step1, run procedural edits over samples in "
-        "N parallel processes (spawn). Default %(default)s. RGL mesh work is CPU-bound; "
-        "memory grows with N. Use 1 for sequential.",
+        help="Procedural, orientation, or optimization: parallel processes (spawn). "
+        "Default %(default)s. RGL is CPU-bound; use 1 for sequential.",
+    )
+    parser.add_argument(
+        "--pp-mode",
+        type=str,
+        default="parametric",
+        choices=("parametric", "orientation", "optimization"),
+        help="parametric: multiset commands + optional procedural (default). "
+        "orientation: bsp 3×4 search, min δ. "
+        "optimization: gradient descent with OptimConfig defaults (objective delta).",
+    )
+    ogrp = parser.add_argument_group("orientation mode (--pp-mode orientation)")
+    ogrp.add_argument(
+        "--output-orientation",
+        type=Path,
+        default=None,
+        help="Default: results_hypergraphs_orientation.json beside --results-hypergraphs. "
+        "Each id -> hypergraph tree only (same format as the input file).",
+    )
+    popt = parser.add_argument_group("optimization mode (--pp-mode optimization)")
+    popt.add_argument(
+        "--output-optimization",
+        type=Path,
+        default=None,
+        help="Default: results_hypergraphs_optimized.json beside --results-hypergraphs.",
+    )
+    popt.add_argument(
+        "--output-optimization-meta",
+        type=Path,
+        default=None,
+        help="Per-id metrics and errors. Default: <output-optimization base>_meta.json. Pass a path; omit = default.",
+    )
+    popt.add_argument(
+        "--no-optimization-meta",
+        action="store_true",
+        help="With optimization mode, do not write the metrics sidecar JSON.",
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="Warnings/errors only",
@@ -886,6 +1224,51 @@ def main() -> int:
         level=logging.WARNING if args.quiet else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
+    with open(args.results_hypergraphs, encoding="utf-8") as f:
+        results: dict[str, dict] = json.load(f)
+
+    if args.pp_mode == "orientation":
+        if args.workers < 1:
+            logger.error("--workers must be >= 1")
+            return 2
+        out_o = args.output_orientation or (
+            args.results_hypergraphs.parent / "results_hypergraphs_orientation.json"
+        )
+        run_orientation_mode(
+            results,
+            args.test_dir,
+            out_path=out_o,
+            max_samples=args.max_samples,
+            workers=int(args.workers),
+            show_progress=not args.quiet,
+        )
+        return 0
+
+    if args.pp_mode == "optimization":
+        if args.workers < 1:
+            logger.error("--workers must be >= 1")
+            return 2
+        out_hg = args.output_optimization or (
+            args.results_hypergraphs.parent / "results_hypergraphs_optimized.json"
+        )
+        if args.no_optimization_meta:
+            meta_path = None
+        else:
+            meta_path = args.output_optimization_meta
+            if meta_path is None and out_hg is not None:
+                meta_path = out_hg.parent / f"{out_hg.stem}_meta.json"
+        run_optimization_mode(
+            results,
+            args.test_dir,
+            args.results_hypergraphs,
+            out_hg=out_hg,
+            out_meta=meta_path,
+            max_samples=args.max_samples,
+            workers=int(args.workers),
+            show_progress=not args.quiet,
+        )
+        return 0
 
     two_step = not args.no_two_step
     if args.apply_procedural_step1 and args.procedural_steps >= 2 and not two_step:
@@ -899,9 +1282,6 @@ def main() -> int:
         logger.error("--workers must be >= 1")
         return 2
     out_path = args.output_json or (args.results_hypergraphs.parent / "parametric_commands.json")
-
-    with open(args.results_hypergraphs) as f:
-        results: dict[str, dict] = json.load(f)
 
     ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
     if args.max_samples is not None:

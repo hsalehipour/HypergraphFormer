@@ -6,20 +6,27 @@ for each reflect mode × {0,90,180,270}. The **hypergraph** is **not** reoriente
 the boundary passed to ``to_mesh`` changes—so the floor appears in a different
 on-page orientation in each panel.
 
-**GT** for metrics uses the same transformed boundary, so APE/δ are comparable in
-that frame. The first column is **GT in the original** (dataset) frame. The
+**Modes** (``--mode``): **bounds** = rotate/reflect the footprint, prediction BSP
+unchanged. **bsp** = reorient the prediction BSP per panel, **canonical** footprint.
+**bounds2** = the **full 3×4 grid of BSP reorients** (same as **bsp**: pred
+``reorient_hypergraph_bsp`` per (mirror,°)), but the footprint is **one fixed** extra
+rotation: ``transform_bounds_polygon`` with the **same** CCW **+90°** (and no extra flip) for
+**every** cell, so the floor outline is always at +90° from the dataset while pred varies.
+**GT** in each cell uses that same +90° bounds. The first column is still **GT in the original**
+(dataset) frame. The
 prediction grid is **3 rows × 4 columns**: rows are mirror mode (no mirror, x flip,
 y flip) and columns are CCW rotation (0°, 90°, 180°, 270°).
 
-**Why APE is often *identical* across the 3×4 ``bvar`` grid:** all variants use
-rigid transforms of the same footprint, so its area is unchanged. ``to_mesh`` uses
-BSP area *ratios* and the boundary (:meth:`~utils.hypergraph.Hypergraph.to_mesh` →
-``subdivideWithMeshRatio``), so per-room *absolute* areas (and APE) typically do
-**not** depend on rotation/reflection/translation of ``bounds.corners``. Use *δ* or
-plotted geometry for layout/orientation, not APE, across ``bvar``.
+In ``--mode bounds``, APE/δ compare the prediction meshed in each **rotated** footprint
+to the GT mesh in the **original** bounds (same convention as ``score_results``; the
+left column GT is already drawn in the original frame). In ``bsp`` / ``bounds2``,
+``to_mesh`` for both branches uses the same per-cell ``mesh_bounds``.
 
 Metrics match ``scripts/score_results.py`` (area proportion error + room-shape
-delta). The **lowest** APE is highlighted in green on all pred panels.
+delta). The **lowest** δ (room similarity) is highlighted in green on pred panels.
+
+Use ``--mode bounds`` | ``bsp`` | ``bounds2`` (default: bounds). Legacy ``--bsp-reorient`` is
+the same as ``--mode bsp``.
 
 Requires RGL / meshing and ``bounds.corners`` in the test ``.txt`` file.
 
@@ -29,6 +36,7 @@ Default output (no ``--output``)::
 
 Example:
   /path/to/.venv/bin/python scripts/explore_rotation.py \\
+    --mode bounds \\
     --sample-id b-0120 \\
     --results-hypergraphs inference_8700/.../results_hypergraphs.json \\
     --test-dir dataset/wmr24/test
@@ -53,7 +61,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 
-from scripts.procedural_edits import transform_bounds_polygon
+from scripts.procedural_edits import reorient_hypergraph_bsp, transform_bounds_polygon
 from scripts.visualize_procedural_edited import load_eval_access_gt
 from utils.hypergraph import Hypergraph, HypergraphPlotter, repair_bsp_tree_names
 from utils.metrics import (
@@ -77,6 +85,16 @@ _REFLECT_MODES: tuple[tuple[str | None, str], ...] = (
     ("y", "flip_y"),
 )
 _ROT_DEGS = (0, 90, 180, 270)
+
+# ``transform_bounds_polygon`` reflect code -> :func:`reorient_hypergraph_bsp` *reflect_mode* string
+_REFLECT_CODE_TO_REORIENT_MODE: dict[str | None, str] = {
+    None: "normal",
+    "x": "x",
+    "y": "y",
+}
+
+# bounds2: fixed extra CCW rotation on the footprint (same for all 12 panels; no mirror)
+_BOUNDS2_FOOTPRINT_EXTRA_DEG = 90.0
 
 # Row label for the 3×4 pred grid (left annotation)
 _REFLECT_ROW_TITLE: dict[str, str] = {
@@ -152,7 +170,25 @@ def run() -> int:
         action="store_true",
         help="Log warnings/errors only",
     )
+    p.add_argument(
+        "--mode",
+        type=str,
+        choices=("bounds", "bsp", "bounds2"),
+        default="bounds",
+        help=(
+            "bounds: transform footprint per (reflect,°); same pred BSP. "
+            "bsp: reorient pred with reorient_hypergraph_bsp; canonical footprint. "
+            "bounds2: full bsp 3×4 reorients, but all panels use the same +90° footprint (fixed)."
+        ),
+    )
+    p.add_argument(
+        "--bsp-reorient",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     a = p.parse_args()
+    if a.bsp_reorient:
+        a.mode = "bsp"
     if a.output is None:
         a.output = _DEFAULT_EXPLORE_ROTATION_DIR / f"{a.sample_id}_explore_rotation.png"
 
@@ -184,14 +220,39 @@ def run() -> int:
         return 2
 
     reflect_modes = _REFLECT_MODES
+    # bounds2: one footprint for every cell (90° CCW, no reflect)
+    if a.mode == "bounds2":
+        _bounds2_mesh_bounds = transform_bounds_polygon(
+            bounds, None, _BOUNDS2_FOOTPRINT_EXTRA_DEG
+        )
     rows: list[dict] = []
     for reflect_code, reflect_label in reflect_modes:
         for deg in _ROT_DEGS:
             try:
                 bvar = transform_bounds_polygon(bounds, reflect_code, float(deg))
-                pred = base
-                pred_mesh = Hypergraph(pred).to_mesh(bounds=bvar)
-                gt_mesh_v = Hypergraph(gt_hg).to_mesh(bounds=bvar)
+                if a.mode == "bsp":
+                    pred = reorient_hypergraph_bsp(
+                        base,
+                        float(deg),
+                        _REFLECT_CODE_TO_REORIENT_MODE[reflect_code],
+                    )
+                    mesh_bounds = bounds
+                elif a.mode == "bounds2":
+                    pred = reorient_hypergraph_bsp(
+                        base,
+                        float(deg),
+                        _REFLECT_CODE_TO_REORIENT_MODE[reflect_code],
+                    )
+                    mesh_bounds = _bounds2_mesh_bounds
+                else:
+                    pred = base
+                    mesh_bounds = bvar
+                pred_mesh = Hypergraph(pred).to_mesh(bounds=mesh_bounds)
+                # In bounds mode, GT ref for APE/δ uses canonical (dataset) bounds only;
+                # the pred panel still uses the rotated footprint (mesh_bounds / bvar).
+                gt_mesh_v = Hypergraph(gt_hg).to_mesh(
+                    bounds=bounds if a.mode == "bounds" else mesh_bounds
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "variant failed %s %s°: %s",
@@ -204,6 +265,7 @@ def run() -> int:
                         "reflect": reflect_code,
                         "reflect_label": reflect_label,
                         "deg": deg,
+                        "mode": a.mode,
                         "area_proportion_error": None,
                         "delta": None,
                         "error": str(exc),
@@ -216,7 +278,7 @@ def run() -> int:
             gt_room_v = produce_room_list(gt_mesh_v)
             print(
                 f"[explore_rotation] {a.sample_id} {reflect_label} {deg}°\n"
-                f"  pred_area={pred_area!r}\n  gt_area_v={gt_area_v!r}\n  list_equal: {pred_area == gt_area_v}",
+                f"  pred_room={pred_room!r}\n  gt_room_v={gt_room_v!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -230,9 +292,10 @@ def run() -> int:
                     "reflect": reflect_code,
                     "reflect_label": reflect_label,
                     "deg": deg,
+                    "mode": a.mode,
                     "area_proportion_error": ape,
                     "delta": dlt,
-                    "bounds_variant": bvar,
+                    "bounds_variant": mesh_bounds,
                 }
             )
 
@@ -244,17 +307,27 @@ def run() -> int:
             r["ape_minus_best_ape"] = float(v) - float(best_ape)
         else:
             r["ape_minus_best_ape"] = None
+    # Green border: best (lowest) δ, not APE; lower is better (shape deviation)
+    finite_deltas = [
+        r["delta"]
+        for r in rows
+        if r.get("delta") is not None and math.isfinite(r["delta"])
+    ]
+    best_delta: float | None = min(finite_deltas) if finite_deltas else None
     best_key: set[tuple[str, int]] = set()
-    if best_ape is not None:
+    if best_delta is not None:
         for r in rows:
-            v = r.get("area_proportion_error")
-            if v is not None and math.isfinite(v) and abs(v - best_ape) < 1e-12:
-                best_key.add(
-                    (
-                        str(r["reflect_label"]),
-                        int(r["deg"]),
+            v = r.get("delta")
+            if v is not None and isinstance(v, (int, float)) and math.isfinite(v):
+                if math.isclose(
+                    float(v), float(best_delta), rel_tol=0.0, abs_tol=1e-6
+                ):
+                    best_key.add(
+                        (
+                            str(r["reflect_label"]),
+                            int(r["deg"]),
+                        )
                     )
-                )
 
     by_reflect_deg: dict[tuple[str, int], dict] = {
         (str(r["reflect_label"]), int(r["deg"])): r for r in rows
@@ -270,9 +343,19 @@ def run() -> int:
         width_ratios=(0.75, 1, 1, 1, 1),
     )
     n_pred = len([r for r in rows if not r.get("error")]) or len(rows)
+    bsp_mode = {
+        "bsp": "mode=bsp (reorient pred BSP, canonical bounds)",
+        "bounds2": f"mode=bounds2 (BSP 3×4 + fixed footprint +{_BOUNDS2_FOOTPRINT_EXTRA_DEG:.0f}° all cells)",
+        "bounds": "mode=bounds (rotating footprint, pred tree fixed)",
+    }[a.mode]
+    if best_delta is not None:
+        st_extra = f"lowest δ = {best_delta:.6f} (green border); lowest APE = {best_ape:.6f}" if best_ape is not None else f"lowest δ = {best_delta:.6f} (green border)"
+    elif best_ape is not None:
+        st_extra = f"lowest APE = {best_ape:.10f} (no valid δ; no border)"
+    else:
+        st_extra = "no valid APE or δ"
     fig.suptitle(
-        f"{a.sample_id}  |  rows: mirror  ·  columns: rotation  |  {n_pred} pred panels  |  "
-        f"lowest APE = {best_ape:.10f} (green border)" if best_ape is not None else f"{a.sample_id}  |  no valid APE",
+        f"{a.sample_id}  |  {bsp_mode}  |  {n_pred} pred panels  |  {st_extra}",
         fontsize=12,
     )
 
@@ -320,6 +403,12 @@ def run() -> int:
                 or (isinstance(r.get("delta"), float) and not math.isfinite(r["delta"]))
                 else f"{r['delta']:.4f}"
             )
+            if r and r.get("delta") is not None and isinstance(
+                r["delta"], (int, float)
+            ) and math.isfinite(r["delta"]) and best_delta is not None:
+                dlt_v = float(r["delta"])
+                if dlt_v > best_delta + 1e-9:
+                    dlt_s = f"{dlt_s} (Δ+{dlt_v - best_delta:.2e} vs min δ)"
             row_name = _REFLECT_ROW_TITLE.get(str(lab), str(lab))
             title = f"{ape_lines}\nδ={dlt_s}"
             if r.get("error"):
@@ -334,7 +423,15 @@ def run() -> int:
                     ax.text(0.5, 0.5, "missing bounds", transform=ax.transAxes)
                     ax.axis("off")
                 else:
-                    hg_p = base
+                    if a.mode in ("bsp", "bounds2"):
+                        rc = r.get("reflect")
+                        hg_p = reorient_hypergraph_bsp(
+                            base,
+                            float(r.get("deg", 0)),
+                            _REFLECT_CODE_TO_REORIENT_MODE[rc],  # type: ignore[index]
+                        )
+                    else:
+                        hg_p = base
                     _plot_mesh(ax, plotter, hg_p, bvar, title, a.sample_id)
             else:
                 ax.text(0.5, 0.5, "missing variant", transform=ax.transAxes)
@@ -344,12 +441,18 @@ def run() -> int:
                     spine.set_edgecolor("green")
                     spine.set_linewidth(4)
 
-    fig.tight_layout(rect=(0.12, 0.05, 0.99, 0.91))
+    fig.tight_layout(rect=(0.12, 0.05, 0.99, 0.88))
+    # One y for all four labels so they line up, well above 1st-row APE/δ ax titles
+    if first_row_axes:
+        _top_y1 = max(ax.get_position().y1 for ax in first_row_axes)
+        _deg_label_y = min(0.99, _top_y1 + 0.07)
+    else:
+        _deg_label_y = 0.95
     for ax, deg in zip(first_row_axes, _ROT_DEGS):
         pos = ax.get_position()
         fig.text(
             pos.x0 + 0.5 * pos.width,
-            min(0.98, pos.y1 + 0.015),
+            _deg_label_y,
             f"{deg}°",
             ha="center",
             va="bottom",
@@ -372,8 +475,10 @@ def run() -> int:
         )
 
     leg = [
-        "Pred uses the same hypergraph for every panel; only bounds.corners is transformed.",
-        "Same bvar for pred and GT. APE often flat across bvar (rigid transform); δ may move more.",
+        "mode=bsp: reorient pred BSP; canonical bounds.",
+        "mode=bounds: pred in rotated bvar; GT for APE/δ = canonical bounds (plot pred still uses bvar).",
+        f"mode=bounds2: same 12 BSP reorients as bsp; all cells share footprint +{_BOUNDS2_FOOTPRINT_EXTRA_DEG:.0f}° only.",
+        "Switch: --mode bounds | bsp | bounds2  (legacy --bsp-reorient = bsp).",
     ]
     fig.text(0.5, 0.02, "\n".join(leg), ha="center", fontsize=9, style="italic")
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -397,7 +502,9 @@ def run() -> int:
         json.dumps(
             {
                 "sample_id": a.sample_id,
+                "mode": a.mode,
                 "best_area_proportion_error": _json_num(best_ape) if best_ape is not None else None,
+                "best_delta": _json_num(best_delta) if best_delta is not None else None,
                 "best_variants": [
                     {
                         "reflect_label": lab,
