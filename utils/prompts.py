@@ -328,48 +328,6 @@ Generate ONLY the hypergraph JSON structure, no additional text or explanation:"
     return prompt
 
 
-def create_simple_prompt_footprint(target_accessgraph, bounds):
-    """
-    Create a prompt with BSP rules, access graph, and apartment footprint.
-    Used by evaluator.py (--mode trained --footprint).
-    """
-    prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
-
-Your task is to generate a hypergraph from an access graph and an apartment footprint.
-
-An access graph is a simple representation of room connectivity:
-- `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
-- `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
-
-An apartment footprint is a representation of the apartment boundaries that the hypergraph must partition.
-
-{_SIMPLE_BSP_RULES_TEXT}
-
-{_SIMPLE_CONNECTIVITY_RULES}
-
-{_ANGLE_RULES}
-
-# YOUR TASK:
-
-Generate a hypergraph (BSP tree) for the following access graph and apartment footprint.
-
-### Access Graph:
-```json
-{json.dumps(target_accessgraph, indent=2)}
-```
-
-### Apartment Footprint:
-```json
-{json.dumps(bounds, indent=2)}
-```
-
-{_SIMPLE_REQUIREMENTS.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
-
-Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
-
-    return prompt
-
-
 def create_simple_prompt_rooms_only(target_accessgraph):
     """
     Create a prompt using only room types (no connectivity edges).
@@ -447,24 +405,19 @@ Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES
     return prompt
 
 
-def create_training_sample(accessgraph, hypergraph, bounds=None):
+def create_training_sample(accessgraph, hypergraph):
     """
     Create a single training sample in chat format for fine-tuning.
 
     Args:
         accessgraph: Access graph dictionary
         hypergraph: Ground truth hypergraph dictionary
-        bounds: Optional apartment footprint/boundary dictionary. When provided,
-                the user prompt matches the footprint evaluation prompt.
 
     Returns:
         dict: Training sample with 'messages' field in chat format
     """
-    if bounds is not None:
-        user_content = create_simple_prompt_footprint(accessgraph, bounds)
-    else:
-        instruction = create_instruction_prompt()
-        user_content = f"""{instruction}
+    instruction = create_instruction_prompt()
+    user_content = f"""{instruction}
 
 ### Access Graph:
 ```json
