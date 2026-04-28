@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 
@@ -119,8 +118,18 @@ def access_sample_to_eval_entry(sample: dict) -> dict | None:
     """Convert one dataset_access item into an eval ``.txt`` dict.
 
     Returns ``None`` when the sample has no valid rooms or access adjacencies.
+
+    The ``bounds`` field is built by reusing the same helpers that
+    :mod:`rplan.rplan_to_hypergraph` uses for hypergraph-mode exports
+    (``compute_boundary`` -> ``_boundary_to_bounds_json``), so the JSON
+    string is byte-identical to what hypergraph mode would emit for the
+    same RPLAN sample.
     """
-    from rplan.rplan_to_hypergraph import sample_to_rooms
+    from rplan.rplan_to_hypergraph import (
+        _boundary_to_bounds_json,
+        compute_boundary,
+        sample_to_rooms,
+    )
 
     rooms_raw = sample.get("rooms", [])
     adj_list = sample.get("access_adjacencies")
@@ -159,16 +168,15 @@ def access_sample_to_eval_entry(sample: dict) -> dict | None:
         if a in nodes and b in nodes:
             edges.append([a, b])
 
-    boundary = sample.get("boundary", [])
-    corners = []
-    for pt in boundary:
-        x, y = float(pt[0]), float(pt[1])
-        corners.append({"X": x, "Y": y, "Z": 0, "Mag": math.hypot(x, y)})
+    boundary_poly = compute_boundary(valid_rooms)
+    if boundary_poly is None or boundary_poly.is_empty:
+        return None
+    bounds_json = _boundary_to_bounds_json(boundary_poly)
 
     return {
         "accessgraph": {"nodes": nodes, "edges": edges},
         "room_polygons": room_polygons,
-        "bounds": json.dumps({"corners": corners}),
+        "bounds": bounds_json,
     }
 
 
