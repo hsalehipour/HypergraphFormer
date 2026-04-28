@@ -696,8 +696,11 @@ class Evaluator(ABC):
         with open(fpath) as f:
             data = json.load(f)
         ag = data.get("accessgraph", {})
-        hg_str = data.get("hypergraph", "")
-        hg = json.loads(hg_str) if isinstance(hg_str, str) else hg_str
+        h = data.get("hypergraph")
+        if h is None or (isinstance(h, str) and not h.strip()):
+            hg = None
+        else:
+            hg = json.loads(h) if isinstance(h, str) else h
         bounds_str = data.get("bounds", "{}")
         bounds = json.loads(bounds_str) if isinstance(bounds_str, str) else bounds_str
         return {
