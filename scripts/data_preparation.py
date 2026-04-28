@@ -5,17 +5,11 @@ Data preparation for hypergraph model training and evaluation.
 Modes:
     train        -- Convert pre-split hypergraph JSON to instruction JSONL
     eval         -- Export per-sample .txt eval files from a JSON split
-    room-lists   -- Convert hypergraph JSON splits to pre-computed room-list
-                    JSON files (requires RGL)
 
 Usage:
     # Convert to instruction JSONL (SFT)
     python scripts/data_preparation.py --mode train \\
         --dataset-dir dataset/hypergraph
-
-    # Convert to instruction JSONL (RL with footprint)
-    python scripts/data_preparation.py --mode train \\
-        --dataset-dir dataset/hypergraph --footprint
 
     # Export eval .txt from dataset_access (room polygons + door adjacencies)
     python scripts/data_preparation.py --mode eval --data-format access \\
@@ -32,16 +26,10 @@ Usage:
         --aggregate \\
         --input-file dataset/hypergraph/test.json \\
         --output-dir dataset/hypergraph/test_aggregated
-
-    # Generate room-list JSONs from a hypergraph JSON file
-    python scripts/data_preparation.py --mode room-lists \\
-        --input-file dataset/hypergraph/train.json \\
-        --output-dir dataset/hypergraph/rl/train_room_lists
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import math
@@ -57,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Shared helper
 # ===================================================================
 
-def load_json_split(file_path, *, footprint=False):
+def load_json_split(file_path):
     """Load a hypergraph dataset split from a JSON file.
 
     Each item is expected to have a ``split`` field containing the
@@ -67,10 +55,6 @@ def load_json_split(file_path, *, footprint=False):
     Returns a list of tuples::
 
         (item_id, accessgraph, hypergraph)
-
-    or, when *footprint* is True::
-
-        (item_id, accessgraph, hypergraph, bounds)
     """
     file_path = Path(file_path)
     if not file_path.exists():
@@ -105,17 +89,7 @@ def load_json_split(file_path, *, footprint=False):
                 continue
 
             item_id = item.get("id", f"item_{i}")
-
-            if footprint:
-                bounds_str = item.get("bounds", "{}")
-                bounds = (
-                    json.loads(bounds_str)
-                    if isinstance(bounds_str, str)
-                    else bounds_str
-                )
-                samples.append((item_id, accessgraph, hypergraph, bounds))
-            else:
-                samples.append((item_id, accessgraph, hypergraph))
+            samples.append((item_id, accessgraph, hypergraph))
 
         except Exception as e:
             logger.warning(f"Skipping item {i}: {e}")
@@ -257,16 +231,13 @@ def convert_to_jsonl(args) -> int:
     from utils.data_loading import save_training_data
 
     dataset_dir = Path(args.dataset_dir)
-    footprint = getattr(args, "footprint", False)
-    output_dir = dataset_dir / ("rl" if footprint else "sft")
+    output_dir = dataset_dir / "sft"
 
     logger.info("=" * 80)
     logger.info("Hypergraph JSON -> Instruction JSONL")
     logger.info("=" * 80)
     logger.info(f"Dataset directory: {dataset_dir}")
     logger.info(f"Output directory:  {output_dir}")
-    if footprint:
-        logger.info("Footprint mode:    ON (includes bounds in prompts)")
     logger.info("=" * 80)
 
     splits = ["train", "validation", "test"]
@@ -274,9 +245,7 @@ def convert_to_jsonl(args) -> int:
 
     for split in splits:
         logger.info(f"\nProcessing {split} split...")
-        samples = load_json_split(
-            dataset_dir / f"{split}.json", footprint=footprint
-        )
+        samples = load_json_split(dataset_dir / f"{split}.json")
 
         if not samples:
             logger.warning(f"No samples found for {split}")
@@ -517,76 +486,12 @@ def _export_eval_hypergraph(args) -> int:
 
 
 # ===================================================================
-# generate_room_lists  (--mode room-lists)
-# ===================================================================
-
-def generate_room_lists(args) -> int:
-    """Convert a hypergraph JSON file into per-sample room-list JSONs via RGL.
-
-    Formerly the standalone ``delta_metric.py`` CLI.
-    """
-    from utils.metrics import produce_room_list
-
-    input_file = Path(args.input_file)
-    output_dir = Path(args.output_dir or input_file.with_suffix("") / "room_lists")
-
-    logger.info("=" * 80)
-    logger.info("Hypergraph JSON -> Room-List JSONs (via RGL)")
-    logger.info("=" * 80)
-    logger.info(f"Input file:        {input_file}")
-    logger.info(f"Output directory:  {output_dir}")
-    logger.info("=" * 80)
-
-    if not input_file.exists():
-        logger.error(f"Input file not found: {input_file}")
-        return 1
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(input_file) as f:
-        data = json.load(f)
-
-    logger.info(f"Processing {len(data)} entries ...")
-    results = []
-    for idx, entry in enumerate(data):
-        apt_id = entry.get("id", f"idx_{idx}")
-        try:
-            hg_raw = entry.get("split", entry.get("hypergraph", "{}"))
-            hg = json.loads(hg_raw) if isinstance(hg_raw, str) else hg_raw
-            hg = copy.deepcopy(hg)
-
-            bounds_raw = entry.get("bounds", "{}")
-            bounds = json.loads(bounds_raw) if isinstance(bounds_raw, str) else bounds_raw
-            bounds = copy.deepcopy(bounds)
-
-            mesh = Hypergraph(hg).to_mesh(bounds=bounds)
-            room_list = produce_room_list(mesh)
-            output_data = {"id": apt_id, "room_list": room_list}
-        except Exception as e:
-            logger.warning(f"  Error processing {apt_id}: {e}")
-            output_data = {"id": apt_id, "room_list": None, "error": str(e)}
-
-        with open(output_dir / f"{apt_id}.json", "w") as f:
-            json.dump(output_data, f, indent=2)
-        results.append(output_data)
-
-    combined = output_dir / "all_room_lists.json"
-    with open(combined, "w") as f:
-        json.dump(results, f, indent=2)
-
-    ok = sum(1 for r in results if r.get("room_list") is not None)
-    logger.info(f"\nDone! {ok}/{len(results)} succeeded -> {combined}")
-    return 0
-
-
-# ===================================================================
 # CLI
 # ===================================================================
 
 MODE_MAP = {
     "train": convert_to_jsonl,
     "eval": export_eval_format,
-    "room-lists": generate_room_lists,
 }
 
 
@@ -604,13 +509,6 @@ def cli():
     parser.add_argument("--dataset-dir", type=str, default="dataset/hypergraph")
     parser.add_argument("--seed", type=int, default=42)
 
-    # train mode
-    parser.add_argument(
-        "--footprint",
-        action="store_true",
-        help="Include apartment footprint (bounds) in prompts; output to rl/ subdir",
-    )
-
     # eval mode
     parser.add_argument(
         "--data-format",
@@ -624,13 +522,13 @@ def cli():
         "--input-file",
         type=str,
         default="dataset/hypergraph/test.json",
-        help="Path to JSON file to export (eval / room-lists mode)",
+        help="Path to JSON file to export (eval mode)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory (eval: .txt files; room-lists: room-list JSONs)",
+        help="Output directory for eval .txt files",
     )
     parser.add_argument(
         "--aggregate",

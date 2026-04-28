@@ -10,8 +10,7 @@ hierarchical **BSP-tree hypergraphs** that encode spatial relationships and
 connectivity within floor plans.  Unlike rasterized or vectorized methods, the
 hypergraph formulation decouples the apartment footprint from its functional
 and geometric subdivisions, enabling generation of floor plans for arbitrary,
-user-specified boundaries.  Reinforcement learning fine-tuning with GRPO
-further improves structural consistency and semantic accuracy.
+user-specified boundaries.
 
 Evaluated on the **WMR24** dataset (~1,000 architect-designed floor
 plans from Zurich, New York, and Singapore), HypergraphFormer achieves a GED
@@ -80,12 +79,11 @@ HypergraphFormer/
 │
 ├── scripts/                        # ── Pipelines & CLI tools ──────────
 │   │
-│   │  # Data preparation (--mode train | eval | room-lists)
-│   ├── data_preparation.py          JSON → JSONL, eval .txt, or room-list JSONs
+│   │  # Data preparation (--mode train | eval)
+│   ├── data_preparation.py          JSON → JSONL or eval .txt
 │   │
 │   │  # Training
 │   ├── sft_pipeline.py              LoRA fine-tuning of Qwen (SFT)
-│   ├── rlft_pipeline.py             GRPO reinforcement learning fine-tuning (RLFT)
 │   │
 │   │  # Generator classes (library, no CLI)
 │   ├── generators.py                HypergraphGenerator, QwenGenerator, GPTGenerator
@@ -291,44 +289,7 @@ python scripts/sft_pipeline.py \
 Checkpoints are written to
 `checkpoints/qwen_hypergraph_filtered/epochs{N}_lora_r{R}_alpha{A}/`.
 
-### 3. Train with RL (GRPO fine-tuning)
-
-Prepare RL training JSONL (footprint prompt) into `dataset/hypergraph/rl/`:
-
-```bash
-python scripts/data_preparation.py --mode train \
-    --dataset-dir dataset/hypergraph --footprint
-```
-
-Reduce RL training set by assistant token length (writes `*_reduced.jsonl`):
-
-```bash
-python scripts/rlft_pipeline.py --reduce-tokens --max-tokens 2000
-```
-
-Export room lists (used by the RL reward):
-
-```bash
-python scripts/data_preparation.py --mode room-lists \
-    --input-file dataset/hypergraph/train.json \
-    --output-dir dataset/hypergraph/rl/train_reduced_room_lists
-
-python scripts/data_preparation.py --mode room-lists \
-    --input-file dataset/hypergraph/validation.json \
-    --output-dir dataset/hypergraph/rl/validation_reduced_room_lists
-```
-
-Run GRPO fine-tuning:
-
-```bash
-# Single GPU
-python scripts/rlft_pipeline.py --gpu 0
-
-# Multi-GPU
-accelerate launch --num_processes=8 scripts/rlft_pipeline.py --multi-gpu
-```
-
-### 4. Evaluate the fine-tuned model
+### 3. Evaluate the fine-tuned model
 
 Prepare the eval-format directory (one `{id}.txt` per sample):
 
@@ -350,21 +311,21 @@ python scripts/data_preparation.py --mode eval --aggregate \
 Run evaluation (generates hypergraphs + inline scoring):
 
 ```bash
-# Single GPU (use --footprint if model was trained with footprint prompts)
+# Single GPU
 python scripts/evaluator.py --mode trained \
-    --model checkpoints/grpo_hypergraph/checkpoint-500 \
+    --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
     --dataset-dir dataset/hypergraph/test \
-    --footprint --noged --shuffle \
+    --noged --shuffle \
     --output results_eval.json
 
 # Multi-GPU
 accelerate launch --num_processes=8 scripts/evaluator.py --mode trained \
-    --model checkpoints/grpo_hypergraph/checkpoint-500 \
+    --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
     --dataset-dir dataset/hypergraph/test \
-    --footprint --noged --shuffle
+    --noged --shuffle
 ```
 
-### 5. Evaluate the base model (few-shot, no fine-tuning)
+### 4. Evaluate the base model (few-shot, no fine-tuning)
 
 ```bash
 # Qwen few-shot (single GPU)
@@ -377,7 +338,7 @@ python scripts/evaluator.py --mode fewshot-gpt \
     --model gpt-4-turbo --dataset-dir eval_format/test
 ```
 
-### 6. Score saved results (post-inference)
+### 5. Score saved results (post-inference)
 
 Compute any combination of GED, accuracy, delta, and area proportion error
 metrics on saved `*_hypergraphs.json` files:
@@ -406,12 +367,12 @@ python scripts/score_results.py \
     --correct-accessgraph
 ```
 
-### 7. Benchmark against baselines (HouseGAN++, House-Diffusion)
+### 6. Benchmark against baselines (HouseGAN++, House-Diffusion)
 
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++ and House-Diffusion baselines on the WMR24 dataset.
 
-### 8. Evaluate a single hypergraph (quick test)
+### 7. Evaluate a single hypergraph (quick test)
 
 ```bash
 # Few-shot Qwen on one sample
@@ -423,7 +384,7 @@ python scripts/evaluator.py --mode fewshot-gpt \
     --dataset-dir eval_format/train --max-samples 1
 ```
 
-### 9. Run batch few-shot experiments
+### 8. Run batch few-shot experiments
 
 `run_fewshot_experiments.sh` automates running `evaluator.py` across
 multiple shot counts and rounds, with optional post-run scoring:
@@ -459,7 +420,6 @@ bash run_fewshot_experiments.sh --score-only \
 | **Geometric Compactness Deviation (\(\delta\))** | Per-room shape deviation measuring how much a generated room polygon departs from the compactness of its ground-truth counterpart. |
 | **Area Proportion Error** | Mean absolute difference between room-area proportions of paired predicted and ground-truth rooms, averaged per sample. |
 | **LoRA** | Low-Rank Adaptation — parameter-efficient fine-tuning; default configuration: rank 64, alpha 128. |
-| **GRPO** | Group Relative Policy Optimization — RL algorithm used in the second training stage to optimize metric-based rewards (accuracy, GED, compactness). |
 
 ---
 
