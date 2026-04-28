@@ -464,11 +464,9 @@ class Evaluator(ABC):
             logger.info(f"Distributed evaluation with {accelerator.num_processes} GPUs")
 
         include_gt = not isinstance(self, RoomsOnlyEvaluator)
-        include_bounds = getattr(args, "footprint", False)
         dataset = HypergraphDataset(
             files_to_process,
             include_ground_truth=include_gt,
-            include_bounds=include_bounds,
         )
         pb = max(1, int(getattr(args, "vllm_prompt_batch_size", 1)))
         use_vllm = not getattr(args, "no_vllm", False) and VLLM_AVAILABLE
@@ -518,7 +516,7 @@ class Evaluator(ABC):
                 file=sys.stdout,
             )
         ):
-            samples = self._collated_batch_to_samples(batch, include_gt, include_bounds)
+            samples = self._collated_batch_to_samples(batch, include_gt)
             if use_prompt_batch and len(samples) > 1:
                 local_results.extend(self._evaluate_samples_vllm_batch(samples))
             else:
@@ -713,7 +711,7 @@ class Evaluator(ABC):
         }
 
     @staticmethod
-    def _collated_batch_to_samples(batch, include_gt, include_bounds) -> list[dict]:
+    def _collated_batch_to_samples(batch, include_gt) -> list[dict]:
         n = len(batch["filename"])
         samples: list[dict] = []
         for i in range(n):
@@ -725,15 +723,12 @@ class Evaluator(ABC):
             }
             if include_gt:
                 sample["ground_truth"] = batch["ground_truth"][i]
-            if include_bounds and "bounds" in batch:
-                b = batch["bounds"]
-                sample["bounds"] = b[i] if i < len(b) else {}
             samples.append(sample)
         return samples
 
     @staticmethod
-    def _batch_to_sample(batch, include_gt, include_bounds):
-        return Evaluator._collated_batch_to_samples(batch, include_gt, include_bounds)[0]
+    def _batch_to_sample(batch, include_gt):
+        return Evaluator._collated_batch_to_samples(batch, include_gt)[0]
 
     def _log_slow(self, sample, res):
         from utils.data_loading import log_slow_generation
@@ -885,18 +880,11 @@ class TrainedModelEvaluator(Evaluator):
         self.generator._model = prepared_model
 
     def create_prompt(self, sample):
-        from utils.prompts import create_simple_prompt, create_simple_prompt_footprint
-        ag = sample["accessgraph"]
-        if getattr(self.args, "footprint", False):
-            bounds = sample.get("bounds", {}) or {}
-            return create_simple_prompt_footprint(ag, bounds)
-        return create_simple_prompt(ag)
+        from utils.prompts import create_simple_prompt
+        return create_simple_prompt(sample["accessgraph"])
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_qwen_response(
-            response,
-            allow_raw_json_fallback=getattr(self.args, "footprint", False),
-        )
+        return Hypergraph.from_qwen_response(response)
 
     def score_result(self, result, hg, sample):
         result["generated_hypergraph"] = hg.data
@@ -1290,7 +1278,6 @@ def cli():
     # Trained / rooms-only
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--noged", action="store_true")
-    parser.add_argument("--footprint", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
     parser.add_argument("--timeout", type=int, default=300)
@@ -1312,8 +1299,7 @@ def cli():
         default=0.85,
         help=(
             "vLLM gpu_memory_utilization (default: 0.85 for inference-only). "
-            "Values like 0.2–0.3 match rlft_pipeline GRPO colocate (GPU shared with training) "
-            "and usually leave no room for KV cache during standalone eval — raise toward 0.9 if needed."
+            "Lower values leave more headroom for the KV cache; raise toward 0.9 if needed."
         ),
     )
     vllm.add_argument(

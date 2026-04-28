@@ -9,7 +9,6 @@ transformers
 accelerate              # Multi-GPU distributed training & evaluation
 peft                    # LoRA fine-tuning
 datasets                # HuggingFace dataset loading (JSONL)
-trl                     # GRPO reinforcement-learning fine-tuning
 tqdm
 tensorboard
 

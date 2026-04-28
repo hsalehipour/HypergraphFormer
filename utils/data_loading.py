@@ -129,8 +129,7 @@ def save_training_data(samples, output_path, dataset_type="train"):
     Each line is a JSON object with 'messages' field.
 
     Args:
-        samples: List of (identifier, accessgraph, hypergraph) tuples, or
-                 (identifier, accessgraph, hypergraph, bounds) tuples.
+        samples: List of (identifier, accessgraph, hypergraph) tuples.
                  The first element (identifier) can be a filename or item id;
                  it is not written to the output.
         output_path: Path to output .jsonl file
@@ -141,15 +140,10 @@ def save_training_data(samples, output_path, dataset_type="train"):
 
     with open(output_path, 'w') as f:
         for sample in samples:
-            if len(sample) == 3:
-                _identifier, accessgraph, hypergraph = sample
-                bounds = None
-            elif len(sample) == 4:
-                _identifier, accessgraph, hypergraph, bounds = sample
-            else:
+            if len(sample) != 3:
                 raise ValueError(f"Unexpected sample tuple length: {len(sample)}")
-
-            training_sample = create_training_sample(accessgraph, hypergraph, bounds=bounds)
+            _identifier, accessgraph, hypergraph = sample
+            training_sample = create_training_sample(accessgraph, hypergraph)
             f.write(json.dumps(training_sample) + '\n')
 
     logger.info(f"Saved {len(samples)} {dataset_type} samples to {output_path}")
@@ -169,10 +163,9 @@ class HypergraphDataset(Dataset):
                         file's 'bounds' field (apartment footprint).
     """
 
-    def __init__(self, file_paths, include_ground_truth=True, *, include_bounds=False):
+    def __init__(self, file_paths, include_ground_truth=True):
         self.file_paths = file_paths
         self.include_ground_truth = include_ground_truth
-        self.include_bounds = include_bounds
 
     def __len__(self):
         return len(self.file_paths)
@@ -191,10 +184,6 @@ class HypergraphDataset(Dataset):
             'num_nodes': len(accessgraph.get('nodes', {})),
             'num_edges': len(accessgraph.get('edges', [])),
         }
-
-        if self.include_bounds:
-            bounds_str = data.get('bounds', '{}')
-            item['bounds'] = json.loads(bounds_str) if isinstance(bounds_str, str) else bounds_str
 
         if self.include_ground_truth:
             h = data.get("hypergraph")

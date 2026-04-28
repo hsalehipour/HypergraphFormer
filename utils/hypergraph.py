@@ -468,7 +468,7 @@ class Hypergraph:
 
     @staticmethod
     def _validate_quick(node, _depth=0):
-        """Fast recursive structural validation for hot loops (RL training)."""
+        """Fast recursive structural validation for hot loops."""
         if not isinstance(node, dict):
             return False, [], [f"Node at depth {_depth} is {type(node).__name__}, not dict"], None
 

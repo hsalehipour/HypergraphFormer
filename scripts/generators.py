@@ -29,7 +29,7 @@ from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
-# vLLM (optional; used for fast local inference — see rlft_pipeline GRPOConfig / evaluate_rl_model.py)
+# vLLM (optional; used for fast local inference)
 VLLM_AVAILABLE = False
 try:
     from vllm import LLM as _VLLM_LLM
@@ -232,7 +232,7 @@ def _wrap_vllm_completion_for_qwen_parse(generated_text: str) -> str:
 
 
 class VllmQwenGenerator(HypergraphGenerator):
-    """Local Qwen via vLLM (faster batched inference; aligns with rlft_pipeline / evaluate_rl_model)."""
+    """Local Qwen via vLLM (faster batched inference)."""
 
     def __init__(
         self,
