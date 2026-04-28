@@ -195,10 +195,14 @@ def load_ground_truth_txt(
 # }
 
 
+# Mean polygon area (coordinate²) per mergeid from dataset/rplan/eval_test, by bedroom tier.
+# Tier = count of bed/bedroom nodes in GT accessgraph: 0→studio, 1→one_bed, 2→two_bed, ≥3→three_plus.
+# eval_test has no studio (0-bed) layouts; studio row uses full-split pooled means as fallback.
 AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = {
-    "studio": {},
+    "studio": {"bath": 886.32, "bed": 2598.41, "kitchen": 1252.55, "living": 7031.81, "balcony": 1028.42, "storage": 635.81},
     "one_bed": {"bath": 1145.5417, "bed": 3762.2961, "kitchen": 1626.7943, "living": 6273.9704, "balcony": 1463.5588, "storage": 1200.5263},
-    "two_plus": {"bath": 882.8436, "bed": 2591.3825, "kitchen": 1246.7811, "living": 7044.4455, "balcony": 1021.3723, "storage": 611.3082},
+    "two_bed": {"bath": 908.3813, "bed": 2777.7372, "kitchen": 1280.6732, "living": 6707.4839, "balcony": 1016.8996, "storage": 632.6655},
+    "three_plus": {"bath": 862.0652, "bed": 2465.9748, "kitchen": 1211.5630, "living": 7391.3475, "balcony": 1026.7083, "storage": 574.2000},
 }
 
 
@@ -521,6 +525,7 @@ def _canon_room_type(s: str) -> str:
 
 
 def _bedroom_group_from_accessgraph(accessgraph: dict | None) -> str:
+    """Bedroom program from GT access graph: count nodes labeled bed/bedroom."""
     nodes = (accessgraph or {}).get("nodes", {}) or {}
     n_bed = 0
     for _k, v in nodes.items():
@@ -531,7 +536,9 @@ def _bedroom_group_from_accessgraph(accessgraph: dict | None) -> str:
         return "studio"
     if n_bed == 1:
         return "one_bed"
-    return "two_plus"
+    if n_bed == 2:
+        return "two_bed"
+    return "three_plus"
 
 
 def _leaf_type_counts_from_hypergraph(hg: dict) -> dict[str, int]:

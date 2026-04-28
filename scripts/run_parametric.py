@@ -382,6 +382,11 @@ def optimize_hypergraph(
     x_history: list[np.ndarray] = []
     metric_trace: list[float] = []
     best_trace: list[float] = []
+    # Baseline objective after annotate + initial split vector (after optional init search);
+    # if final opt objective is worse, we restore this hypergraph.
+    revert_baseline_f: float | None = None
+    hg_at_annotate: dict | None = None
+    splits_at_annotate: np.ndarray | None = None
 
     if len(split_vals) == 0:
         splits_new = []
@@ -389,6 +394,8 @@ def optimize_hypergraph(
         last_stats = validate_leaf_area_floor(best_hg, min_leaf_frac=config.min_leaf_frac)[1]
     else:
         x0 = np.asarray(split_vals, dtype=float)
+        hg_at_annotate = copy.deepcopy(original_hg)
+        splits_at_annotate = x0.copy()
         bounds_box = [(float(config.min_split), float(config.max_split))] * len(split_vals)
         x_history.append(x0.copy())
         scipy_eps = config.scipy_eps
@@ -438,6 +445,7 @@ def optimize_hypergraph(
             return float(f)
 
         f0, _, leaf0 = _eval_metric_for_splits(x0)
+        revert_baseline_f = float(f0)
         best_seen = {"f": float(f0), "x": np.asarray(x0, dtype=float).copy(), "leaf": leaf0}
         metric_trace.append(float(f0))
         best_trace.append(float(f0))
@@ -524,18 +532,8 @@ def optimize_hypergraph(
     if last_stats:
         print(f"Leaf-area floor: min_observed={last_stats.get('min_observed_leaf_frac', 0):.4f}")
 
-    print_area_split_list(original_hg, best_hg, min_split=config.min_split, max_split=config.max_split)
-    _print_room_areas(best_hg, "Optimized")
-
     best_mesh = hypergraph_bounds_to_mesh(copy.deepcopy(best_hg), bounds, RGL=RGL, Collections=Collections)
     best_room_list = produce_room_list(best_mesh)
-
-    print("\nOptimized mesh room areas (from mesh faces):")
-    for i in range(best_mesh.faceList.Count):
-        face = best_mesh.faceList[i]
-        room_name = getattr(face, "merge_id", "unknown")
-        marker = "🚽" if "bath" in str(room_name).lower() else ""
-        print(f"  {marker} {room_name}: area={face.Area:.6f}")
 
     best_room_names = set(room[0] for room in best_room_list)
     ag_report = {
@@ -588,6 +586,105 @@ def optimize_hypergraph(
     original_area_gt = float(_area_gt_metric(original_mesh))
     best_area_gt = float(_area_gt_metric(best_mesh))
 
+    if objective == "delta":
+        cand_metric = float(best_delta_sq)
+    elif objective == "area":
+        cand_metric = float(best_area_ref)
+    elif objective == "area_delta":
+        cand_metric = 0.5 * (float(delta_scale) * float(best_delta_sq)) + 0.5 * float(best_area_ref)
+    elif objective == "delta_epsilon":
+        cand_metric = 0.5 * (float(delta_scale) * float(best_delta_sq)) + 0.5 * float(best_epsilon_ref)
+    elif objective == "epsilon":
+        cand_metric = float(best_epsilon_ref)
+    else:
+        cand_metric = float(best_delta_gt)
+
+    if (
+        len(split_vals) > 0
+        and hg_at_annotate is not None
+        and splits_at_annotate is not None
+        and objective in ("delta", "area", "area_delta", "delta_epsilon", "epsilon")
+    ):
+        hg_ent = copy.deepcopy(hg_at_annotate)
+        apply_area_splits(
+            hg_ent,
+            np.asarray(splits_at_annotate, dtype=float).tolist(),
+            min_split=config.min_split,
+            max_split=config.max_split,
+        )
+        entry_mesh = hypergraph_bounds_to_mesh(copy.deepcopy(hg_ent), bounds, RGL=RGL, Collections=Collections)
+        ent_room_list = produce_room_list(entry_mesh)
+        if set(room[0] for room in ent_room_list) == gt_room_names:
+            ent_delta_gt = float(
+                compute_delta_metric_soft_from_room_lists(ent_room_list, gt_room_list, area_sorting=True)
+            )
+            ent_delta_sq = float(_delta_metric_square_from_room_list(ent_room_list))
+            ent_epsilon_ref = float(
+                compute_epsilon_metric_vs_ref(
+                    entry_mesh,
+                    group=bedroom_group,
+                    expected_counts=expected_counts,
+                    targets_by_group=AREA_REF_TARGETS_ABS,
+                )
+            )
+            if gt_mesh is not None:
+                ent_epsilon_gt = float(compute_epsilon_metric_vs_gt(entry_mesh, gt_mesh))
+            else:
+                _epa = produce_room_area_list(entry_mesh)
+                _ega = produce_room_area_list_from_polygons(room_polygons)
+                _eape = compute_room_area_proportion_error(_epa, _ega, aggregate=False)
+                ent_epsilon_gt = float(_eape.get("area_proportion_error", float("nan")))
+            ent_area_ref = float(
+                _area_ref_metric(
+                    entry_mesh,
+                    group=bedroom_group,
+                    targets_by_group=AREA_REF_TARGETS_ABS,
+                    expected_counts=expected_counts,
+                )
+            )
+            ent_area_gt = float(_area_gt_metric(entry_mesh))
+            if objective == "delta":
+                cand_entry = float(ent_delta_sq)
+            elif objective == "area":
+                cand_entry = float(ent_area_ref)
+            elif objective == "area_delta":
+                cand_entry = 0.5 * (float(delta_scale) * float(ent_delta_sq)) + 0.5 * float(ent_area_ref)
+            elif objective == "delta_epsilon":
+                cand_entry = 0.5 * (float(delta_scale) * float(ent_delta_sq)) + 0.5 * float(ent_epsilon_ref)
+            else:
+                cand_entry = float(ent_epsilon_ref)
+            if (
+                math.isfinite(cand_metric)
+                and math.isfinite(cand_entry)
+                and float(cand_metric) > float(cand_entry) + 1e-9
+            ):
+                print(
+                    f"Reverting to entry splits: objective {float(cand_metric):.6f} "
+                    f"> entry-split baseline {float(cand_entry):.6f} (same scaling as --objective).",
+                    flush=True,
+                )
+                best_hg = hg_ent
+                splits_new = np.asarray(splits_at_annotate, dtype=float).tolist()
+                last_stats = validate_leaf_area_floor(best_hg, min_leaf_frac=config.min_leaf_frac)[1]
+                best_delta_gt = ent_delta_gt
+                best_delta_sq = ent_delta_sq
+                best_epsilon_ref = ent_epsilon_ref
+                best_epsilon_gt = ent_epsilon_gt
+                best_epsilon_gt = ent_epsilon_gt
+                best_area_ref = ent_area_ref
+                best_area_gt = ent_area_gt
+                cand_metric = float(cand_entry)
+
+    presentation_mesh = hypergraph_bounds_to_mesh(copy.deepcopy(best_hg), bounds, RGL=RGL, Collections=Collections)
+    print_area_split_list(original_hg, best_hg, min_split=config.min_split, max_split=config.max_split)
+    _print_room_areas(best_hg, "Optimized")
+    print("\nOptimized mesh room areas (from mesh faces):")
+    for i in range(presentation_mesh.faceList.Count):
+        face = presentation_mesh.faceList[i]
+        room_name = getattr(face, "merge_id", "unknown")
+        marker = "🚽" if "bath" in str(room_name).lower() else ""
+        print(f"  {marker} {room_name}: area={face.Area:.6f}")
+
     metrics_original = {
         "delta_metric": float(original_delta_gt),
         "delta_metric_square": float(original_delta_sq),
@@ -622,20 +719,7 @@ def optimize_hypergraph(
             f"Δ={_sig2(metrics_optimized[k] - metrics_original[k])}"
         )
 
-    if objective == "delta":
-        best_metric = float(best_delta_sq)
-    elif objective == "area":
-        best_metric = float(best_area_ref)
-    elif objective == "area_delta":
-        best_metric = 0.5 * (float(delta_scale) * float(best_delta_sq)) + 0.5 * float(best_area_ref)
-    elif objective == "delta_epsilon":
-        best_metric = 0.5 * (float(delta_scale) * float(best_delta_sq)) + 0.5 * float(
-            best_epsilon_ref
-        )
-    elif objective == "epsilon":
-        best_metric = float(best_epsilon_ref)
-    else:
-        best_metric = float(metrics_optimized["delta_metric"])
+    best_metric = float(cand_metric)
     _om = float(original_metric)
     print(f"\nObjective {objective}: best={best_metric:.6f}  (Δ vs start {best_metric - _om:+.6f})")
 
