@@ -27,8 +27,11 @@ in either order at the multiset level). Fields ``command_step2`` and
 
 **Procedural edits** (optional, ``--apply-procedural-step1``): maps multiset **plans**
 (``add`` / ``remove``) to ``scripts.procedural_edits.apply_command`` (``remove`` → ``delete``;
-``add X`` → ``add X by <anchor>``).  With ``--procedural-steps N`` (1–4), plans and applies up
-to **N** greedy multiset steps (see ``multiset_commands`` / ``detail.multiset_command_chain``).
+``add X`` → ``add X by <anchor>``).  With ``--procedural-steps N``, plans and (with
+``--apply-procedural-step1``) applies multiset steps. **N=0** (default): keep planning/applying
+greedy add/remove until the multiset would need no further op (or ``NOTHING``), bounded by an
+internal safety cap. **N>=1**: at most **N** steps. (See ``multiset_commands`` /
+``detail.multiset_command_chain``).
 The anchor
 room type is the **first** in sorted order among GT-neighbor types of *X* that also appear in
 the prediction.  If that fails, falls back to splitting the
@@ -43,13 +46,19 @@ dict ``sample_id -> hypergraph`` — no images or extra folders. Procedural edit
 **Modes** (``--pp-mode``; default: ``parametric`` — behavior above).
 
 * ``orientation`` — For each id, a **bsp** 3×4 search (mirrors × CCW°) as in
-  ``explore_rotation --mode bsp``; the best cell is the lowest room-shape **δ** (not APE
-  in this short path). Output JSON matches ``--results-hypergraphs`` shape: each id maps to
-  a **hypergraph object only** (no ``mesh_bounds`` / ``orientation`` wrappers).
+  ``explore_rotation --mode bsp``; the best cell is the lowest **δ_sq** (mean
+  |1 − (L*² / L)| per room vs a **square** of the same area), same as
+  ``_delta_metric_square_from_room_list`` in ``scripts.utils_parametric`` (``--objective
+  delta`` in parametric). Candidates where the **variant mesh** does not satisfy every edge
+  of the input's ``correct_accessgraph`` (same ``check_accessgraph_edges_against_mesh`` rule
+  as parametric optimization) are excluded. Only **``bounds.corners``**
+  is read from the test ``.txt``; no ground-truth hypergraph is required. Output JSON matches ``--results-hypergraphs``
+  shape: each id maps to a **hypergraph object only** (no ``mesh_bounds`` / ``orientation`` wrappers).
 
 * ``optimization`` — Runs :func:`scripts.run_parametric.optimize_hypergraph` per id with
-  **vanilla GD** and :class:`utils_parametric.OptimConfig` defaults (objective **delta**).
-  See ``--output-optimization*`` and ``--no-optimization-meta``.
+  **vanilla GD** and :class:`utils_parametric.OptimConfig` defaults (use
+  ``--optimization-objective`` for ``delta``, ``delta_epsilon``, etc.).
+  See ``--output-optimization*``, ``--optimization-artifacts-dir``, and ``--no-optimization-meta``.
 """
 from __future__ import annotations
 
@@ -74,6 +83,9 @@ if str(REPO_ROOT) not in sys.path:
 from utils.hypergraph import Hypergraph, repair_bsp_tree_names  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# Greedy multiset planning/apply: max iterations to avoid infinite loops if logic regresses.
+SAFETY_MAX_MULTISET_STEPS = 512
 
 _SKIP_NODE_TYPES = frozenset({"outside"})
 
@@ -222,12 +234,15 @@ def plan_multiset_command_chain(
     remove_only: bool = False,
 ) -> list[str]:
     """
-    Greedy multiset plan: repeat ``multiset_command`` + simulate until match or *max_steps* (cap 4).
+    Greedy multiset plan: repeat ``multiset_command`` + simulate until ``NOTHING`` or safety cap.
+
+    If *max_steps* <= 0: repeat until ``NOTHING`` (up to :data:`SAFETY_MAX_MULTISET_STEPS`).
+    If *max_steps* > 0: at most that many commands (also capped by the same safety limit).
+
     If *add_only* is true, use only ``add`` steps; if *remove_only*, only ``remove`` steps.
     """
-    cap = max(0, min(int(max_steps), 4))
-    if cap == 0:
-        return []
+    ms = int(max_steps)
+    max_iter = SAFETY_MAX_MULTISET_STEPS if ms <= 0 else min(ms, SAFETY_MAX_MULTISET_STEPS)
     chain: list[str] = []
     cnt = copy.copy(cnt_corr)
     if add_only and remove_only:
@@ -238,7 +253,7 @@ def plan_multiset_command_chain(
         mcmd = multiset_command_remove_only
     else:
         mcmd = multiset_command
-    for _ in range(cap):
+    for _ in range(max_iter):
         cmd, _st = mcmd(cnt, cnt_gt)
         if cmd == "NOTHING":
             break
@@ -253,12 +268,12 @@ def compare_accessgraphs(
     gt_accessgraph: dict,
     *,
     two_step: bool = True,
-    max_plan_steps: int = 2,
+    max_plan_steps: int = 0,
     add_only: bool = False,
     remove_only: bool = False,
 ) -> tuple[str, dict[str, Any], str | None, dict[str, Any]]:
     """
-    Compare room-type multisets; plan up to *max_plan_steps* greedy add/remove commands (cap 4).
+    Compare room-type multisets; plan greedy add/remove commands (see :func:`plan_multiset_command_chain`).
 
     Returns:
         ``command_step1, detail, command_step2, two_step_info``
@@ -291,7 +306,7 @@ def compare_accessgraphs(
     extra1 = Counter(step1["extra"])
     detail["step1_both_add_and_remove_needed"] = bool(missing1 and extra1)
 
-    cap = max(1, min(int(max_plan_steps), 4))
+    cap = int(max_plan_steps)
     chain = plan_multiset_command_chain(
         cnt_corr, cnt_gt, cap, add_only=add_only, remove_only=remove_only
     )
@@ -431,35 +446,132 @@ def complete_add_command_for_procedural(
     return f"add {new_room} by {anchor_mergeid}", "fallback_largest_leaf"
 
 
+def _access_graph_room_mergeid_counter(ag: dict | None) -> Counter[str]:
+    """Multiset of room-type labels (accessgraph ``nodes`` values), lowercased."""
+    c: Counter[str] = Counter()
+    for t in (ag or {}).get("nodes", {}).values():
+        c[str(t).strip().lower()] += 1
+    return c
+
+
+def _access_graph_canonical_room_multiset(
+    ag: dict | None,
+) -> Counter[str]:
+    """Like :func:`room_type_multiset` — mergeids normalized via ``canonical_room_name``."""
+    from scripts.procedural_edits import canonical_room_name
+
+    c: Counter[str] = Counter()
+    nodes = (ag or {}).get("nodes") or {}
+    if not isinstance(nodes, dict):
+        return c
+    for v in nodes.values():
+        lab = canonical_room_name(str(v).strip())
+        if not lab or lab in _SKIP_NODE_TYPES:
+            continue
+        c[lab] += 1
+    return c
+
+
+def _access_graph_canonical_adjacency_counter(
+    ag: dict | None,
+) -> Counter[tuple[str, str]]:
+    """Undirected multiset of canonical room-type pairs for each corrected edge."""
+    from scripts.procedural_edits import canonical_room_name
+
+    c: Counter[tuple[str, str]] = Counter()
+    nodes_raw = (ag or {}).get("nodes") or {}
+    if not isinstance(nodes_raw, dict):
+        return c
+    id_to_lab = {str(k): canonical_room_name(str(v).strip()) for k, v in nodes_raw.items()}
+    for e in (ag or {}).get("edges") or []:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            continue
+        u, v = str(e[0]), str(e[1])
+        a, b = id_to_lab.get(u, ""), id_to_lab.get(v, "")
+        if not a or not b:
+            continue
+        if a in _SKIP_NODE_TYPES or b in _SKIP_NODE_TYPES:
+            continue
+        if a > b:
+            a, b = b, a
+        c[(a, b)] += 1
+    return c
+
+
+def _access_graph_room_adjacency_counter(
+    ag: dict | None,
+) -> Counter[tuple[str, str]]:
+    """Multiset of edges as unordered ``(mergeid_i, mergeid_j)`` with ``i <= j`` lexically."""
+    c: Counter[tuple[str, str]] = Counter()
+    nodes = {k: str(v).strip().lower() for k, v in (ag or {}).get("nodes", {}).items()}
+    for e in (ag or {}).get("edges") or []:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            continue
+        u, v = str(e[0]), str(e[1])
+        a, b = nodes.get(u, ""), nodes.get(v, "")
+        if not a or not b:
+            continue
+        if a > b:
+            a, b = b, a
+        c[(a, b)] += 1
+    return c
+
+
+def corrected_accessgraphs_equivalent_orientation(
+    hg_ref: dict[str, Any],
+    ag_ref: dict[str, Any] | None,
+    hg_pred: dict[str, Any],
+    ag_pred: dict[str, Any] | None,
+) -> bool:
+    """
+    Same corrected plan in **canonical room-name** sense: multiset of room types
+    (``canonical_room_name`` on each node, same as parametric multiset) and multiset of
+    undirected edges as pairs of canonical types. Ignores access-graph numeric ids and
+    normalizes mergeid spellings (e.g. ``bed`` / ``bedroom``). The ``hg_*`` arguments are unused
+    (kept so callers always pass hypergraphs symmetrically).
+
+    **Orientation** mode no longer uses this function; it uses
+    :func:`orientation_variant_passes_ref_accessgraph` (mesh vs input ``correct_accessgraph`` edges).
+    """
+    if ag_ref is None or ag_pred is None:
+        return False
+    _ = (hg_ref, hg_pred)
+    return (
+        _access_graph_canonical_room_multiset(ag_ref)
+        == _access_graph_canonical_room_multiset(ag_pred)
+        and _access_graph_canonical_adjacency_counter(ag_ref)
+        == _access_graph_canonical_adjacency_counter(ag_pred)
+    )
+
+
+def corrected_accessgraphs_equivalent_by_room_names(
+    ag_a: dict[str, Any] | None,
+    ag_b: dict[str, Any] | None,
+) -> bool:
+    """
+    **Typed** equality (mergeid multisets + ``(mergeid, mergeid)`` edge multisets), as in
+    ``access_graph_light_distance``. Orientation filtering uses
+    :func:`orientation_variant_passes_ref_accessgraph` instead (parametric-style mesh edges).
+    """
+    return (
+        _access_graph_room_mergeid_counter(ag_a) == _access_graph_room_mergeid_counter(ag_b)
+        and _access_graph_room_adjacency_counter(ag_a)
+        == _access_graph_room_adjacency_counter(ag_b)
+    )
+
+
 def access_graph_light_distance(ag_pred: dict, ag_gt: dict) -> int:
     """
     Fast surrogate for GED: L1 on room-type node multisets plus L1 on the multiset
     of undirected ``(type_i, type_j)`` pairs (``i <= j`` lexicographically) for edges.
     O(|nodes| + |edges|). Lower is better.
     """
-    from collections import Counter
-
-    def _node_counter(ag: dict) -> Counter:
-        c: Counter = Counter()
-        for t in (ag or {}).get("nodes", {}).values():
-            c[str(t).strip().lower()] += 1
-        return c
-
-    def _edge_type_counter(ag: dict) -> Counter:
-        c: Counter = Counter()
-        nodes = {k: str(v).strip().lower() for k, v in (ag or {}).get("nodes", {}).items()}
-        for e in (ag or {}).get("edges") or []:
-            if not isinstance(e, (list, tuple)) or len(e) < 2:
-                continue
-            u, v = str(e[0]), str(e[1])
-            a, b = nodes.get(u, ""), nodes.get(v, "")
-            if a > b:
-                a, b = b, a
-            c[(a, b)] += 1
-        return c
-
-    np, ng = _node_counter(ag_pred), _node_counter(ag_gt)
-    ep, eg = _edge_type_counter(ag_pred), _edge_type_counter(ag_gt)
+    np, ng = _access_graph_room_mergeid_counter(ag_pred), _access_graph_room_mergeid_counter(
+        ag_gt
+    )
+    ep, eg = _access_graph_room_adjacency_counter(ag_pred), _access_graph_room_adjacency_counter(
+        ag_gt
+    )
     keys_n = set(np) | set(ng)
     keys_e = set(ep) | set(eg)
     node_loss = sum(abs(np.get(k, 0) - ng.get(k, 0)) for k in keys_n)
@@ -516,6 +628,11 @@ def _multiset_commands_from_row(row: dict[str, Any]) -> list[str]:
     return out
 
 
+def _procedural_field_suffix(step_i: int) -> str:
+    """``""`` for step 1; for step *N* > 1, ``_stepN`` (e.g. ``_step2``)."""
+    return "" if step_i <= 1 else f"_step{step_i}"
+
+
 def _apply_procedural_chain_for_sample(
     sid: str,
     multiset_commands: list[str],
@@ -529,11 +646,13 @@ def _apply_procedural_chain_for_sample(
     """
     Run procedural add/delete chain for one sample. Returns ``(hypergraph, row_updates)``.
     *row_updates* are keys to merge into the parametric row (procedural_* fields only).
+
+    *max_procedural_steps* <= 0: apply the full ``multiset_commands`` list (as produced by
+    planning). > 0: apply at most that many leading commands.
     """
     from scripts.procedural_edits import apply_command
 
     base = copy.deepcopy(base_hg)
-    cap = max(1, min(int(max_procedural_steps), 4))
     meta: dict[str, Any] = {
         "procedural_step1_applied": False,
         "procedural_step2_applied": False,
@@ -544,7 +663,12 @@ def _apply_procedural_chain_for_sample(
     if row_error:
         return base, meta
 
-    cmds = [c for c in multiset_commands if c][:cap]
+    raw = [c for c in multiset_commands if c]
+    mps = int(max_procedural_steps)
+    if mps <= 0:
+        cmds = raw
+    else:
+        cmds = raw[: min(len(raw), mps)]
     if not cmds:
         return base, meta
 
@@ -553,7 +677,6 @@ def _apply_procedural_chain_for_sample(
     )
     current = base
     attempted_step = 0
-    err_suffix = ("", "_step2", "_step3", "_step4")
 
     def _record_step(
         step_i: int,
@@ -563,6 +686,7 @@ def _apply_procedural_chain_for_sample(
         new_room_mergeid: str | None,
     ) -> None:
         meta[f"procedural_step{step_i}_applied"] = True
+        suf = _procedural_field_suffix(step_i)
         if step_i == 1:
             meta["procedural_command"] = pcmd
             meta["procedural_apply_summary"] = summary
@@ -571,7 +695,6 @@ def _apply_procedural_chain_for_sample(
             if new_room_mergeid is not None:
                 meta["procedural_add_mergeid_from_gt"] = new_room_mergeid
         else:
-            suf = err_suffix[step_i - 1]
             meta[f"procedural_command{suf}"] = pcmd
             meta[f"procedural_apply_summary{suf}"] = summary
             if proc_extra.get("add_anchor_source"):
@@ -603,16 +726,14 @@ def _apply_procedural_chain_for_sample(
             current = edited
             _record_step(step_i, pcmd, summary, proc_extra, new_room_mergeid)
 
+        meta["procedural_num_steps_applied"] = len(cmds)
         return current, meta
     except Exception as exc:
         logger.warning(
             "Procedural failed for %s (chain step %s): %s", sid, attempted_step, exc
         )
-        err_key = (
-            "procedural_apply_error"
-            if attempted_step <= 1
-            else f"procedural_apply_error{err_suffix[attempted_step - 1]}"
-        )
+        suf = _procedural_field_suffix(attempted_step)
+        err_key = f"procedural_apply_error{suf}" if suf else "procedural_apply_error"
         out_meta = {
             "procedural_step1_applied": False,
             "procedural_step2_applied": False,
@@ -666,13 +787,15 @@ def apply_procedural_step1_to_hypergraphs(
     bounds_by_id: dict[str, dict],
     *,
     increase_factor: float,
-    procedural_steps: int = 1,
+    procedural_steps: int = 0,
     workers: int = 16,
     show_progress: bool = True,
 ) -> dict[str, dict]:
     """
-    For each sample, run up to *procedural_steps* (1–4) ``procedural_edits.apply_command``
-    calls from ``row[\"multiset_commands\"]`` (greedy multiset plan in ``detail``).
+    For each sample, run ``procedural_edits.apply_command`` for each entry in
+    ``row[\"multiset_commands\"]`` (greedy multiset plan in ``detail``), or up to
+    *procedural_steps* entries when *procedural_steps* > 0. *procedural_steps* <= 0 means
+    apply the full chain.
 
     *bounds_by_id* is passed to ``apply_command`` for ``add`` when corners exist (for mesh
     adjacency in procedural splits).
@@ -687,13 +810,9 @@ def apply_procedural_step1_to_hypergraphs(
     hyper_out: dict[str, dict] = {}
 
     def _merge_row(sid: str, row: dict[str, Any], hg: dict, meta: dict[str, Any]) -> None:
-        for k in (
-            "procedural_apply_error",
-            "procedural_apply_error_step2",
-            "procedural_apply_error_step3",
-            "procedural_apply_error_step4",
-        ):
-            row.pop(k, None)
+        for k in list(row.keys()):
+            if k == "procedural_apply_error" or k.startswith("procedural_apply_error_step"):
+                row.pop(k, None)
         row.update(meta)
         hyper_out[sid] = hg
 
@@ -760,7 +879,7 @@ def process_sample(
     *,
     include_accessgraphs: bool,
     two_step: bool,
-    multiset_plan_max: int = 2,
+    multiset_plan_max: int = 0,
     add_only: bool = False,
     remove_only: bool = False,
 ) -> dict[str, Any]:
@@ -814,6 +933,33 @@ def process_sample(
 
 # --- Optional batch modes: orientation (bsp) & parametric optimization (GD) ---
 
+
+def orientation_variant_passes_ref_accessgraph(
+    mesh: Any,
+    ref_ag: dict[str, Any] | None,
+) -> bool:
+    """
+    Whether *mesh* complies with **ref_ag**, the unrepaired hypergraph's
+    ``correct_accessgraph(bounds)``: each edge *(u,v)* in **ref_ag** must appear as adjacent
+    room faces in the geometry, keyed by leaf ``mergeid`` types—the same semantics as
+    :func:`scripts.utils_parametric.check_accessgraph_edges_against_mesh` used in parametric δ/ε runs.
+
+    If **ref_ag** is missing or has no edges (or no checks are returned), passes ``True``, matching the
+    optimization ``accessgraph_penalty`` logic.
+
+    Called with the **variant mesh** (reoriented BSP, canonical bounds); **does not**
+    recompute ``correct_accessgraph`` on the variant.
+    """
+    from scripts.utils_parametric import check_accessgraph_edges_against_mesh
+
+    if not isinstance(ref_ag, dict) or not ref_ag.get("edges"):
+        return True
+    checks = check_accessgraph_edges_against_mesh(mesh, ref_ag)
+    if not checks:
+        return True
+    return all(bool(c.get("ok")) for c in checks)
+
+
 _REFLECT_MODES_OR: tuple[tuple[str | None, str], ...] = (
     (None, "no_flip"),
     ("x", "flip_x"),
@@ -831,27 +977,37 @@ def orient_one_sample(
     sid: str,
     base_hg: dict,
     bounds: dict,
-    gt_hg: dict,
 ) -> dict[str, Any]:
     """
-    ``explore_rotation`` **bsp** only: reorient the pred BSP, canonical ``bounds``, pick
-    the (mirror,°) with lowest room-shape **δ** vs GT. Returns ``hypergraph``, ``mesh_bounds``, etc.
+    ``explore_rotation`` **bsp**-style search: reorient the pred BSP with canonical
+    ``bounds``, pick the (mirror,°) with lowest **δ_sq** (room compactness vs a square
+    of equal area; same as ``--objective delta`` in ``run_parametric`` / ``utils_parametric``).
+    Does **not** use a ground-truth hypergraph. Requires ``bounds.corners`` for meshing.
+
+    Variants excluded from the argmin unless the variant **mesh** satisfies every edge of
+    the reference ``correct_accessgraph`` for the unreoriented repaired input (**ref_ag**),
+    using :func:`~scripts.postprocessing.orientation_variant_passes_ref_accessgraph` (same edge
+    check as ``run_parametric`` / ``check_accessgraph_edges_against_mesh`` — no recomputation of
+    ``correct_accessgraph`` on the rotated BSP).
+    If the reference ``correct_accessgraph`` itself fails (**ref_ag** is None), no such filter applies.
     """
     from scripts.procedural_edits import reorient_hypergraph_bsp
-    from utils.metrics import compute_room_similarity_score, produce_room_list
+    from scripts.utils_parametric import _delta_metric_square_from_room_list
+    from utils.metrics import produce_room_list
 
     if not (bounds and isinstance(bounds, dict) and bounds.get("corners")):
         return {
             "error": "missing bounds.corners",
             "hypergraph": copy.deepcopy(repair_bsp_tree_names(base_hg)),
         }
-    if not (gt_hg and isinstance(gt_hg, dict) and gt_hg.get("name")):
-        return {
-            "error": "missing gt hypergraph",
-            "hypergraph": copy.deepcopy(repair_bsp_tree_names(base_hg)),
-        }
 
     base = repair_bsp_tree_names(copy.deepcopy(base_hg))
+    ref_ag: dict[str, Any] | None = None
+    try:
+        ref_ag = Hypergraph(copy.deepcopy(base)).correct_accessgraph(bounds)
+    except Exception:
+        ref_ag = None
+
     rows: list[dict[str, Any]] = []
     for reflect_code, reflect_label in _REFLECT_MODES_OR:
         for deg in _ROT_DEGS_OR:
@@ -862,8 +1018,7 @@ def orient_one_sample(
                     _REFLECT_CODE_TO_REORIENT_MODE_OR[reflect_code],
                 )
                 mesh_bounds = bounds
-                pred_mesh = Hypergraph(pred).to_mesh(bounds=mesh_bounds)
-                gt_mesh_v = Hypergraph(gt_hg).to_mesh(bounds=mesh_bounds)
+                pred_mesh = Hypergraph(copy.deepcopy(pred)).to_mesh(bounds=mesh_bounds)
             except Exception as exc:  # noqa: BLE001
                 rows.append(
                     {
@@ -871,21 +1026,29 @@ def orient_one_sample(
                         "reflect_label": reflect_label,
                         "deg": deg,
                         "delta": None,
+                        "delta_sq": None,
                         "error": str(exc),
                     }
                 )
                 continue
+            accessgraph_mismatch = False
+            if ref_ag is not None and not orientation_variant_passes_ref_accessgraph(
+                pred_mesh, ref_ag
+            ):
+                accessgraph_mismatch = True
             pred_room = produce_room_list(pred_mesh)
-            gt_room_v = produce_room_list(gt_mesh_v)
-            dlt = float(compute_room_similarity_score(pred_room, gt_room_v))
+            dlt = float(_delta_metric_square_from_room_list(pred_room))
             row: dict[str, Any] = {
                 "reflect": reflect_code,
                 "reflect_label": reflect_label,
                 "deg": deg,
                 "delta": dlt,
+                "delta_sq": dlt,
                 "out_hypergraph": copy.deepcopy(pred),
                 "mesh_bounds": copy.deepcopy(mesh_bounds),
             }
+            if accessgraph_mismatch:
+                row["accessgraph_mismatch"] = True
             rows.append(row)
 
     valid = [
@@ -894,12 +1057,19 @@ def orient_one_sample(
         if "error" not in r
         and r.get("delta") is not None
         and math.isfinite(float(r["delta"]))
+        and not r.get("accessgraph_mismatch")
     ]
     if not valid:
         return {
             "error": "no valid orientation cells",
             "hypergraph": copy.deepcopy(base),
-            "meta": {"style": "bsp", "rows": rows, "n_tried": len(rows)},
+            "meta": {
+                "style": "bsp",
+                "metric": "delta_sq",
+                "rows": rows,
+                "n_tried": len(rows),
+                "accessgraph_reference_ok": ref_ag is not None,
+            },
         }
 
     best = min(valid, key=lambda r: float(r["delta"]))
@@ -910,21 +1080,23 @@ def orient_one_sample(
         "dataset_bounds": copy.deepcopy(bounds),
         "meta": {
             "style": "bsp",
-            "metric": "delta",
+            "metric": "delta_sq",
             "reflect": best.get("reflect"),
             "reflect_label": best.get("reflect_label"),
             "deg": int(best.get("deg", 0)),
+            "delta_sq": best.get("delta"),
             "delta": best.get("delta"),
             "n_variants_tried": len(rows),
+            "accessgraph_reference_ok": ref_ag is not None,
         },
     }
 
 
 def _orientation_pack(
-    p: tuple[str, dict, dict, dict],
+    p: tuple[str, dict, dict],
 ) -> tuple[str, dict[str, Any]]:
-    sid, base_hg, b2, gth = p
-    return sid, orient_one_sample(sid, base_hg, b2, gth)
+    sid, base_hg, b2 = p
+    return sid, orient_one_sample(sid, base_hg, b2)
 
 
 def _hypergraph_from_results_value(v: Any) -> dict[str, Any]:
@@ -969,14 +1141,14 @@ def run_orientation_mode(
         if show_progress:
             it = tqdm(ids, desc="Orientation", total=n_out, unit="sample")
         for sid in it:
-            b2, gth, _ag = load_eval_access_gt(test_dir, sid)
-            rec = orient_one_sample(sid, _hypergraph_from_results_value(results[sid]), b2, gth)
+            b2, _gth, _ag = load_eval_access_gt(test_dir, sid)
+            rec = orient_one_sample(sid, _hypergraph_from_results_value(results[sid]), b2)
             _record(sid, rec)
     else:
-        packs: list[tuple[str, dict, dict, dict]] = []
+        packs: list[tuple[str, dict, dict]] = []
         for sid in ids:
-            b2, gth, _ag = load_eval_access_gt(test_dir, sid)
-            packs.append((sid, _hypergraph_from_results_value(results[sid]), b2, gth))
+            b2, _gth, _ag = load_eval_access_gt(test_dir, sid)
+            packs.append((sid, _hypergraph_from_results_value(results[sid]), b2))
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
             futs = [pool.submit(_orientation_pack, p) for p in packs]
@@ -1034,6 +1206,8 @@ def run_optimization_mode(
     max_samples: int | None,
     workers: int,
     show_progress: bool,
+    objective: str = "delta",
+    artifacts_base: Path | None = None,
 ) -> None:
     import json
     from dataclasses import asdict
@@ -1044,7 +1218,7 @@ def run_optimization_mode(
         td_rel = str(test_dir.resolve().relative_to(REPO_ROOT))
     except ValueError:
         td_rel = str(test_dir)
-    wcfg = asdict(OptimConfig(optimizer="gd"))
+    wcfg = asdict(OptimConfig(optimizer="gd", objective=objective))
     wcfg["test_dir"] = td_rel
     wcfg["grpo_file"] = str(grpo.resolve())
     wcfg["artifacts_dir"] = None
@@ -1057,7 +1231,10 @@ def run_optimization_mode(
     if max_samples is not None:
         ids = ids[: int(max_samples)]
     n_out = len(ids)
-    art_base = (grpo.parent / "postprocessing_optimization_artifacts").resolve()
+    if artifacts_base is not None:
+        art_base = artifacts_base.resolve()
+    else:
+        art_base = (grpo.parent / "postprocessing_optimization_artifacts").resolve()
     out_h: dict[str, dict] = {}
     meta: dict[str, Any] = {}
 
@@ -1154,11 +1331,13 @@ def main() -> int:
     parser.add_argument(
         "--procedural-steps",
         type=int,
-        default=1,
-        choices=(1, 2, 3, 4),
-        help="Multiset plan depth and max procedural add/delete edits to apply (1–4). "
-        "Uses detail['multiset_command_chain']. Steps 3–4 need two-step parametric mode "
-        "for command_step2 fields in logs; avoid --no-two-step when using 3–4.",
+        default=0,
+        metavar="N",
+        help="Multiset plan depth and max procedural add/delete edits to apply. "
+        "N=0 (default): plan/apply until multiset needs no further add/remove (internal cap %d). "
+        "N>=1: at most N steps. Uses detail['multiset_command_chain']. For N>=2, keep two-step mode "
+        "(omit --no-two-step) so command_step2 is populated for the first two planned steps."
+        % (SAFETY_MAX_MULTISET_STEPS,),
     )
     parser.add_argument(
         "--output-step1-hypergraphs",
@@ -1186,7 +1365,7 @@ def main() -> int:
         default="parametric",
         choices=("parametric", "orientation", "optimization"),
         help="parametric: multiset commands + optional procedural (default). "
-        "orientation: bsp 3×4 search, min δ. "
+        "orientation: bsp 3×4 search, min δ_sq (vs square; no GT hypergraph). "
         "optimization: gradient descent with OptimConfig defaults (objective delta).",
     )
     ogrp = parser.add_argument_group("orientation mode (--pp-mode orientation)")
@@ -1195,7 +1374,9 @@ def main() -> int:
         type=Path,
         default=None,
         help="Default: results_hypergraphs_orientation.json beside --results-hypergraphs. "
-        "Each id -> hypergraph tree only (same format as the input file).",
+        "Each id -> hypergraph tree only (same format as the input file). "
+        "Picks (mirror,°) with min δ_sq vs a square (parametric --objective delta); "
+        "only bounds.corners from test .txt is required (no GT hypergraph).",
     )
     popt = parser.add_argument_group("optimization mode (--pp-mode optimization)")
     popt.add_argument(
@@ -1215,10 +1396,30 @@ def main() -> int:
         action="store_true",
         help="With optimization mode, do not write the metrics sidecar JSON.",
     )
+    popt.add_argument(
+        "--optimization-objective",
+        type=str,
+        default="delta",
+        choices=("delta", "area", "area_delta", "delta_epsilon", "epsilon"),
+        help="Parametric objective (default: delta = δ_sq vs square; delta_epsilon = 50/50 δ_sq+ε).",
+    )
+    popt.add_argument(
+        "--optimization-artifacts-dir",
+        type=Path,
+        default=None,
+        help="Per-sample optimization artifacts (plots, etc.). Default: "
+        "<parent of --results-hypergraphs>/postprocessing_optimization_artifacts",
+    )
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="Warnings/errors only",
     )
     args = parser.parse_args()
+
+    if not (0 <= args.procedural_steps <= SAFETY_MAX_MULTISET_STEPS):
+        parser.error(
+            f"--procedural-steps must be between 0 and {SAFETY_MAX_MULTISET_STEPS} "
+            "(0 = until multiset converged)."
+        )
 
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
@@ -1267,11 +1468,18 @@ def main() -> int:
             max_samples=args.max_samples,
             workers=int(args.workers),
             show_progress=not args.quiet,
+            objective=str(args.optimization_objective),
+            artifacts_base=args.optimization_artifacts_dir,
         )
         return 0
 
     two_step = not args.no_two_step
-    if args.apply_procedural_step1 and args.procedural_steps >= 2 and not two_step:
+    if (
+        args.apply_procedural_step1
+        and args.procedural_steps >= 2
+        and args.procedural_steps != 0
+        and not two_step
+    ):
         logger.warning(
             "--procedural-steps %d with --no-two-step: multiset chain is still planned up "
             "to that depth in detail, but command_step2 is omitted; legacy consumers may "
@@ -1290,7 +1498,10 @@ def main() -> int:
     if args.apply_procedural_step1:
         multiset_plan_max = args.procedural_steps
     else:
-        multiset_plan_max = max(args.procedural_steps, 2 if two_step else 1)
+        if args.procedural_steps <= 0:
+            multiset_plan_max = 0
+        else:
+            multiset_plan_max = max(args.procedural_steps, 2 if two_step else 1)
 
     output: dict[str, Any] = {}
     gt_accessgraph_by_id: dict[str, dict] = {}
@@ -1359,15 +1570,20 @@ def main() -> int:
         n_applied2 = sum(1 for r in output.values() if r.get("procedural_step2_applied"))
         n_applied3 = sum(1 for r in output.values() if r.get("procedural_step3_applied"))
         n_applied4 = sum(1 for r in output.values() if r.get("procedural_step4_applied"))
+        n_applied5p = sum(
+            1 for r in output.values() if (r.get("procedural_num_steps_applied") or 0) >= 5
+        )
         logger.info(
             "Wrote procedural hypergraphs for %d ids to %s "
-            "(procedural steps applied: %d / %d / %d / %d)",
+            "(procedural steps applied at least 1/2/3/4 times: %d / %d / %d / %d; "
+            "samples with >=5 steps: %d)",
             len(hyper_step1),
             hg_path,
             n_applied,
             n_applied2,
             n_applied3,
             n_applied4,
+            n_applied5p,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

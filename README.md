@@ -58,7 +58,10 @@ cd benchmark && ./setup_houseganpp.sh && cd ..
 
 ### Download the base model (one-time)
 
-The training script runs in offline mode.  Cache the model first:
+The training script runs in offline mode.  Cache the model first.
+
+`transformers` 5.x requires **PyTorch ≥ 2.4**; if you use CUDA 12.1 wheels (e.g. driver max **CUDA 12.2**), install PyTorch before the snippet:  
+`pip install "torch>=2.4" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
 
 ```bash
 python -c "

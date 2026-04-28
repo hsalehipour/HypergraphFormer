@@ -43,6 +43,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from utils.hypergraph import repair_bsp_tree_names
+from utils.metrics import (
+    compute_room_area_proportion_error,
+    produce_room_area_list,
+    produce_room_area_list_from_polygons,
+    produce_room_list_from_polygons,
+)
 
 from utils_parametric import (
     AREA_REF_TARGETS_ABS,
@@ -63,6 +69,8 @@ from utils_parametric import (
     compute_delta_metric_soft_from_room_lists,
     compute_epsilon_metric_vs_gt,
     compute_epsilon_metric_vs_ref,
+    _area_metric_gt_from_type_maps,
+    _mesh_areas_by_type_from_polygons,
     hypergraph_bounds_to_mesh,
     init_rgl,
     load_ground_truth_txt,
@@ -159,7 +167,7 @@ def optimize_hypergraph(
         original_hg = repair_bsp_tree_names(copy.deepcopy(grpo_results[apt_id]))
 
     test_dir = _resolve_under_repo(root, str(getattr(config, "test_dir", "dataset/wmr24/test")))
-    bounds, gt_hg, accessgraph = load_ground_truth_txt(test_dir, apt_id)
+    bounds, gt_hg, accessgraph, room_polygons = load_ground_truth_txt(test_dir, apt_id)
     gt_hg = copy.deepcopy(gt_hg)
 
     # corrected→raw→file(GT) for *edge compliance*; objective scores never use soft δ/ε vs GT.
@@ -182,8 +190,23 @@ def optimize_hypergraph(
 
     RGL, Collections = init_rgl()
 
-    gt_mesh = hypergraph_bounds_to_mesh(copy.deepcopy(gt_hg), bounds, RGL=RGL, Collections=Collections)
-    gt_room_list = produce_room_list(gt_mesh)
+    # GT reference: WMR24-style .txt has a BSP ``hypergraph``; RPLAN eval_test has
+    # ``room_polygons`` only (no tree). The latter cannot go through RGL until meshed
+    # from a tree — use polygon lists for GT room geometry instead.
+    gt_mesh = None
+    if gt_hg and isinstance(gt_hg, dict) and gt_hg.get("name"):
+        gt_mesh = hypergraph_bounds_to_mesh(
+            copy.deepcopy(gt_hg), bounds, RGL=RGL, Collections=Collections
+        )
+        gt_room_list = produce_room_list(gt_mesh)
+    elif room_polygons:
+        gt_room_list = produce_room_list_from_polygons(room_polygons)
+    else:
+        raise ValueError(
+            f"{apt_id}: {test_dir}/{apt_id}.txt has no GT 'hypergraph' tree and no "
+            "'room_polygons'. run_parametric needs at least one (use eval_test with "
+            "polygons, or a split that includes hypergraph in each .txt)."
+        )
     gt_room_names = set(room[0] for room in gt_room_list)
 
     if float(config.area_weight) < 0.0:
@@ -202,7 +225,22 @@ def optimize_hypergraph(
             targets_by_group=targets_by_group,
         )
     )
-    original_epsilon_gt = float(compute_epsilon_metric_vs_gt(original_mesh, gt_mesh))
+    if gt_mesh is not None:
+        original_epsilon_gt = float(compute_epsilon_metric_vs_gt(original_mesh, gt_mesh))
+    else:
+        _pred_a = produce_room_area_list(original_mesh)
+        _gt_a = produce_room_area_list_from_polygons(room_polygons)
+        _ape = compute_room_area_proportion_error(_pred_a, _gt_a, aggregate=False)
+        original_epsilon_gt = float(_ape.get("area_proportion_error", float("nan")))
+
+    def _area_gt_metric(gen_m):
+        if gt_mesh is not None:
+            return float(_area_metric_gt(gen_m, gt_mesh))
+        return float(
+            _area_metric_gt_from_type_maps(
+                gen_m, _mesh_areas_by_type_from_polygons(room_polygons)
+            )
+        )
     print(
         f"Original  soft_δ={original_delta_gt:.6f}  δ_sq={original_delta_sq:.6f}  "
         f"ε(ref targets)={original_epsilon_ref:.6f}  ε(GT)={original_epsilon_gt:.6f}"
@@ -520,7 +558,7 @@ def optimize_hypergraph(
                     expected_counts=expected_counts,
                 )
             ),
-            "area_metric_gt": float(_area_metric_gt(original_mesh, gt_mesh)),
+            "area_metric_gt": float(_area_gt_metric(original_mesh)),
             "epsilon_metric": float(original_epsilon_gt),
             "epsilon_metric_ref": float(original_epsilon_ref),
         }
@@ -538,11 +576,17 @@ def optimize_hypergraph(
             targets_by_group=AREA_REF_TARGETS_ABS,
         )
     )
-    best_epsilon_gt = float(compute_epsilon_metric_vs_gt(best_mesh, gt_mesh))
+    if gt_mesh is not None:
+        best_epsilon_gt = float(compute_epsilon_metric_vs_gt(best_mesh, gt_mesh))
+    else:
+        _bpa = produce_room_area_list(best_mesh)
+        _bga = produce_room_area_list_from_polygons(room_polygons)
+        _bape = compute_room_area_proportion_error(_bpa, _bga, aggregate=False)
+        best_epsilon_gt = float(_bape.get("area_proportion_error", float("nan")))
     original_area_ref = float(_area_ref_metric(original_mesh, group=bedroom_group, targets_by_group=AREA_REF_TARGETS_ABS, expected_counts=expected_counts))
     best_area_ref = float(_area_ref_metric(best_mesh, group=bedroom_group, targets_by_group=AREA_REF_TARGETS_ABS, expected_counts=expected_counts))
-    original_area_gt = float(_area_metric_gt(original_mesh, gt_mesh))
-    best_area_gt = float(_area_metric_gt(best_mesh, gt_mesh))
+    original_area_gt = float(_area_gt_metric(original_mesh))
+    best_area_gt = float(_area_gt_metric(best_mesh))
 
     metrics_original = {
         "delta_metric": float(original_delta_gt),
@@ -660,13 +704,20 @@ def _run_one_batch_apt(
     try:
         original_hg0 = repair_bsp_tree_names(copy.deepcopy(preloaded_hg))
         test_path0 = _resolve_under_repo(repo_root, str(config.test_dir))
-        bounds0, gt_hg0, _ag0 = load_ground_truth_txt(test_path0, _id)
+        bounds0, gt_hg0, _ag0, rp0 = load_ground_truth_txt(test_path0, _id)
         if rgl_b is not None:
             try:
                 mesh_gen0 = hypergraph_bounds_to_mesh(copy.deepcopy(original_hg0), bounds0, RGL=rgl_b, Collections=col_b)
-                mesh_gt0 = hypergraph_bounds_to_mesh(copy.deepcopy(gt_hg0), bounds0, RGL=rgl_b, Collections=col_b)
                 rl_gen0 = produce_room_list(mesh_gen0)
-                rl_gt0 = produce_room_list(mesh_gt0)
+                if gt_hg0 and isinstance(gt_hg0, dict) and gt_hg0.get("name"):
+                    mesh_gt0 = hypergraph_bounds_to_mesh(
+                        copy.deepcopy(gt_hg0), bounds0, RGL=rgl_b, Collections=col_b
+                    )
+                    rl_gt0 = produce_room_list(mesh_gt0)
+                elif rp0:
+                    rl_gt0 = produce_room_list_from_polygons(rp0)
+                else:
+                    raise ValueError("no GT hypergraph or room_polygons")
                 row["delta_metric_orig"] = float(compute_delta_metric_soft_from_room_lists(rl_gen0, rl_gt0, area_sorting=True))
                 row["delta_metric_square_orig"] = float(_delta_metric_square_from_room_list(rl_gen0))
             except Exception:
@@ -691,7 +742,7 @@ def _run_one_batch_apt(
         )
         output_dir = batch_root / _id
         test_path = _resolve_under_repo(repo_root, str(config.test_dir))
-        bounds, _gt_unused, accessgraph0 = load_ground_truth_txt(test_path, _id)
+        bounds, _gt_unused, accessgraph0, _rp_unused = load_ground_truth_txt(test_path, _id)
         save_single_apt_artifacts(
             output_dir,
             original_hg0,
@@ -785,14 +836,17 @@ def main():
 
     if run_all:
         # Batch runs go under a single objective-scoped folder, e.g.:
-        #   output_parametric/grpo_delta/<id>/
-        # This keeps different objectives/runs separated and easier to manage.
-        batch_root = (
-            REPO_ROOT
-            / "parametric_optimization"
-            / "output_parametric"
-            / f"wmr24_{str(config.objective).strip().lower()}"
-        )
+        #   parametric_optimization/output_parametric/wmr24_epsilon/<id>/
+        # Override with --batch-output-dir.
+        if getattr(config, "batch_output_dir", None):
+            batch_root = Path(str(config.batch_output_dir)).expanduser().resolve()
+        else:
+            batch_root = (
+                REPO_ROOT
+                / "parametric_optimization"
+                / "output_parametric"
+                / f"wmr24_{str(config.objective).strip().lower()}"
+            )
         batch_root.mkdir(parents=True, exist_ok=True)
         batch_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}.csv"
         batch_ag_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}_accessgraph_penalties.csv"
@@ -923,7 +977,7 @@ def main():
         grpo_results = json.load(f)
     original_hg = repair_bsp_tree_names(copy.deepcopy(grpo_results[apt_id]))
     test_path = _resolve_under_repo(REPO_ROOT, str(config.test_dir))
-    bounds, _, _ = load_ground_truth_txt(test_path, apt_id)
+    bounds, _, _, _ = load_ground_truth_txt(test_path, apt_id)
     save_single_apt_artifacts(
         output_dir,
         original_hg,

@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Procedural BSP edits: add/delete/resize/swap, ``reorient``, and ``change_entrance``.
+
+``change_entrance <left|right|top|bottom>`` finds the leaf connected to ``outside`` (entrance),
+checks via the mesh that it touches the footprint exterior, classifies the **axis-aligned**
+AABB side it sits on, then applies the minimal ``0/90/180/270``° CCW BSP rotation so that
+entrance is on the requested side. Requires **bounds.corners** (same as ``add`` / meshing).
+"""
 from __future__ import annotations
 
 import argparse
@@ -21,9 +29,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.zero_shot_edits import load_bounds, load_hypergraph, render_comparison
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.ops import unary_union
+
 from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
+
+# CCW in world X/Y (Y up) around footprint center: +X=right, +Y=top, -X=left, -Y=bottom
+_ENTRANCE_SIDES: tuple[str, ...] = ("right", "top", "left", "bottom")
+_ENTRANCE_SIDE_TO_I: dict[str, int] = {s: i for i, s in enumerate(_ENTRANCE_SIDES)}
 
 ROOM_ALIASES = {
     "bath": "bathroom",
@@ -751,6 +766,200 @@ def swap_rooms(root: dict, room1: str, room2: str) -> tuple[str, str, float, flo
     return leaf1.get("name", ""), leaf2.get("name", ""), new_area1, new_area2, factor1, factor2
 
 
+def find_entrance_leaf(hypergraph: dict) -> dict | None:
+    """
+    Return the **largest-area** final leaf that lists ``outside`` in ``connected``
+    (case-insensitive), or ``None`` if no such leaf exists.
+    """
+    leaves = [n for n in iter_nodes(hypergraph) if n.get("final")]
+    candidates: list[dict] = []
+    for leaf in leaves:
+        for c in leaf.get("connected") or []:
+            if str(c).strip().lower() == "outside":
+                candidates.append(leaf)
+                break
+    if not candidates:
+        return None
+    return max(candidates, key=lambda L: float(L.get("area", 0.0)))
+
+
+def _geom_to_lines(geom) -> list[LineString]:
+    """Flatten to *LineString* parts for length/ops."""
+    if geom is None or geom.is_empty:
+        return []
+    gt = geom.geom_type
+    if gt == "LineString":
+        return [geom]
+    if gt == "MultiLineString":
+        return list(geom.geoms)
+    if gt == "GeometryCollection":
+        out: list[LineString] = []
+        for g in geom.geoms:
+            out.extend(_geom_to_lines(g))
+        return out
+    return []
+
+
+def _room_polygon_from_mesh(mesh, leaf_name: str) -> Polygon:
+    """Merge all mesh faces whose ``unique_id`` matches *leaf_name* (BSP leaf name)."""
+    n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+    polys: list[Polygon] = []
+    for i in range(n_faces):
+        face = mesh.faceList[i]
+        uid = getattr(face, "unique_id", "") or ""
+        if uid != leaf_name:
+            continue
+        pts = face.getPoints()
+        npt = int(getattr(pts, "Count", 0) or 0)
+        corners = [(float(pts[j].X), float(pts[j].Y)) for j in range(npt)]
+        if len(corners) >= 3:
+            polys.append(Polygon(corners))
+    if not polys:
+        return Polygon()
+    u = unary_union(polys)
+    if isinstance(u, Polygon):
+        return u
+    if u.geom_type == "MultiPolygon":
+        return max(u.geoms, key=lambda p: p.area)
+    return Polygon()
+
+
+def _footprint_polygon(bounds: dict) -> Polygon:
+    corners = bounds.get("corners") or []
+    pts = [(float(c["X"]), float(c["Y"])) for c in corners]
+    if len(pts) < 3:
+        return Polygon()
+    poly = Polygon(pts)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    return poly
+
+
+def _primary_entry_side_aabb(footprint: Polygon, room_poly: Polygon) -> str:
+    """
+    Classify which **axis-aligned** side of ``footprint.bounds`` the entry room
+    primarily meets the exterior on, using overlap length along each AABB side segment.
+    """
+    if room_poly.is_empty or footprint.is_empty:
+        return "right"
+    common = room_poly.boundary.intersection(footprint.exterior)
+    if common.is_empty:
+        common = room_poly.exterior.intersection(footprint.exterior)
+    minx, miny, maxx, maxy = footprint.bounds
+    lines = {
+        "left": LineString([(minx, miny), (minx, maxy)]),
+        "right": LineString([(maxx, miny), (maxx, maxy)]),
+        "bottom": LineString([(minx, miny), (maxx, miny)]),
+        "top": LineString([(minx, maxy), (maxx, maxy)]),
+    }
+    buf = 1e-4
+    lengths: dict[str, float] = {}
+    for name, line in lines.items():
+        hit = common.intersection(line.buffer(buf))
+        ln = 0.0
+        for seg in _geom_to_lines(hit):
+            ln += float(seg.length)
+        lengths[name] = ln
+    best = max(lengths, key=lengths.get)
+    if lengths[best] >= 1e-3:
+        return best
+    # Corner or tiny overlap: project a point on the boundary (or room centroid) to nearest AABB side
+    try:
+        if common.is_empty:
+            raise ValueError
+        pt = common.representative_point()
+        if isinstance(pt, Point) and not pt.is_empty:
+            x, y = float(pt.x), float(pt.y)
+        else:
+            raise ValueError
+    except Exception:
+        cen = room_poly.centroid
+        x, y = float(cen.x), float(cen.y)
+    dl, dr, db, dt = x - minx, maxx - x, y - miny, maxy - y
+    m = min(dl, dr, db, dt)
+    if m == dl:
+        return "left"
+    if m == dr:
+        return "right"
+    if m == db:
+        return "bottom"
+    return "top"
+
+
+def change_entrance(
+    hypergraph: dict,
+    desired_side: str,
+    bounds: dict,
+) -> tuple[dict, str]:
+    """
+    Rotate the BSP so the **entrance** leaf (room connected to ``outside``) sits against
+    the desired **axis-aligned** side of the footprint AABB: *left* / *right* / *top* / *bottom*
+    in world *X* / *Y* (Y upward in mesh coordinates).
+
+    Requires *bounds* with ``corners`` for meshing. Uses the same
+    *reflect-then-rotate* BSP path as :func:`reorient_hypergraph_bsp` with
+    *reflect_mode* ``normal``; angle is one of ``0, 90, 180, 270``.
+
+    Returns:
+        ``(edited_hypergraph, summary)`` or raises *ValueError* with a user-facing message.
+    """
+    side = (desired_side or "").strip().lower()
+    if side not in _ENTRANCE_SIDE_TO_I:
+        raise ValueError(
+            f"change_entrance: unknown side {desired_side!r}; use one of: "
+            + ", ".join(_ENTRANCE_SIDES)
+        )
+    if not (isinstance(bounds, dict) and bounds.get("corners")):
+        raise ValueError(
+            "change_entrance: bounds with non-empty 'corners' is required to mesh the plan"
+        )
+
+    ent = find_entrance_leaf(hypergraph)
+    if ent is None:
+        raise ValueError("No room connected to outside")
+
+    foot = _footprint_polygon(bounds)
+    if foot.is_empty:
+        raise ValueError("change_entrance: invalid footprint from bounds.corners")
+
+    leaf_name = str(ent.get("name", ""))
+    if not leaf_name:
+        raise ValueError("Entrance leaf has no BSP name")
+
+    hg_model = Hypergraph(copy.deepcopy(hypergraph))
+    mesh = hg_model.to_mesh(bounds=bounds)
+    room_poly = _room_polygon_from_mesh(mesh, leaf_name)
+    if room_poly.is_empty or room_poly.area <= 0.0:
+        raise ValueError("Could not recover entry room from mesh (empty geometry)")
+
+    d_wall = float(room_poly.boundary.distance(foot.exterior))
+    # Mesh vs footprint can have a small mm-scale gap; keep strict but not brittle.
+    if d_wall > 0.15:
+        raise ValueError("Entry room does not touch the boundary")
+
+    current = _primary_entry_side_aabb(foot, room_poly)
+    desired = side
+    if current == desired:
+        out = copy.deepcopy(hypergraph)
+        return (
+            out,
+            f"Entrance (leaf {leaf_name}) already on the {desired} (footprint AABB); no rotation",
+        )
+
+    ci = _ENTRANCE_SIDE_TO_I[current]
+    di = _ENTRANCE_SIDE_TO_I[desired]
+    # Step count for reorient: use (current - desired) so the mesh/BSP line up with
+    # ``reorient <k*90>`` under the same convention as explore_rotation (was inverted vs AABB).
+    k = (ci - di) % 4
+    deg = float(k * 90.0)
+    out = reorient_hypergraph_bsp(hypergraph, deg, "normal")
+    summary = (
+        f"change_entrance: entry leaf {leaf_name!r} was on the {current} of the footprint; "
+        f"rotated BSP {deg:.0f}° CCW to target {desired} (reorient, reflect=normal)"
+    )
+    return out, summary
+
+
 def apply_command(
     hypergraph: dict,
     command: str,
@@ -845,18 +1054,75 @@ def apply_command(
         summary = f"Reoriented BSP: CCW {deg}°, reflect mode {mode!r} (reflect, then rotate; same order as bounds transform_bounds_polygon)"
         return edited, summary
 
+    ce_match = re.fullmatch(
+        r"change_entrance\s+(left|right|top|bottom)\s*",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if ce_match:
+        if bounds is None:
+            raise ValueError(
+                "change_entrance requires dataset bounds with corners (pass bounds= to apply_command)"
+            )
+        want = ce_match.group(1).strip().lower()
+        edited, summary = change_entrance(hypergraph, want, bounds)
+        return edited, summary
+
     raise ValueError(
         f"Unsupported command {command!r}. Currently supported: "
         f"'increase <room>', 'reduce <room>', 'delete <room>', 'add <room2> by <room1>', "
         f"'swap <room1> and <room2>', "
-        f"and 'reorient <deg_ccw> <reflect_mode>' (e.g. reorient 90 normal, reorient 0 flip_x)"
+        f"'reorient <deg_ccw> <reflect_mode>' (e.g. reorient 90 normal, reorient 0 flip_x), "
+        f"and 'change_entrance <left|right|top|bottom>' (requires bounds with corners)"
     )
 
 
+def _run_one_cli(
+    sample_id: str,
+    input_hg: dict,
+    bounds: dict,
+    command: str,
+    increase_factor: float,
+    tag: str,
+    output_dir: Path,
+) -> tuple[Path, Path, Path]:
+    output_hg, summary = apply_command(
+        input_hg, command, increase_factor, bounds=bounds
+    )
+    is_valid, _, failed, _ = Hypergraph(output_hg).validate(quick=True)
+    if not is_valid:
+        raise ValueError("Edited hypergraph failed validation: " + "; ".join(failed))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_slug = slugify_command(command)
+    stem = f"{sample_id}_{command_slug}_{tag}"
+    json_path = output_dir / f"{stem}.json"
+    png_path = output_dir / f"{stem}.png"
+    summary_path = output_dir / f"{stem}_summary.txt"
+    with open(json_path, "w") as f:
+        json.dump(output_hg, f, indent=2)
+    render_comparison(sample_id, command, bounds, input_hg, output_hg, png_path)
+    summary_path.write_text(summary + "\n")
+    return json_path, png_path, summary_path
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a single procedural command on one or all samples. "
+            "Use 'change_entrance <left|right|top|bottom>' with dataset bounds (test .txt)."
+        )
+    )
     parser.add_argument("--hypergraphs-file", type=Path, required=True)
-    parser.add_argument("--sample-id", required=True)
+    parser.add_argument(
+        "--sample-id",
+        default=None,
+        help="One id from the hypergraphs JSON (omit if --all-samples).",
+    )
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="Run --command for every key in --hypergraphs-file; write outputs per id under --output-dir.",
+    )
     parser.add_argument(
         "--test-dir",
         type=Path,
@@ -868,26 +1134,58 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".procedural_edit_outputs")
     args = parser.parse_args()
 
+    if args.all_samples:
+        with open(args.hypergraphs_file, encoding="utf-8") as f:
+            all_hg: dict = json.load(f)
+        ids = sorted(all_hg.keys(), key=lambda x: (len(str(x)), str(x)))
+        n_ok = 0
+        n_err = 0
+        err_path = args.output_dir / f"_batch_errors_{slugify_command(args.command)}_{args.tag}.txt"
+        lines: list[str] = []
+        for sid in ids:
+            sid_s = str(sid)
+            try:
+                input_hg = all_hg[sid]
+                if not isinstance(input_hg, dict):
+                    raise TypeError("hypergraph must be a dict")
+                bounds = load_bounds(args.test_dir, sid_s)
+                jp, pp, sp = _run_one_cli(
+                    sid_s,
+                    input_hg,
+                    bounds,
+                    args.command,
+                    args.increase_factor,
+                    args.tag,
+                    args.output_dir,
+                )
+                n_ok += 1
+                print(jp)
+                print(pp)
+                print(sp)
+            except Exception as exc:  # noqa: BLE001
+                n_err += 1
+                lines.append(f"{sid_s}\t{exc}\n")
+                logger.warning("Sample %s failed: %s", sid_s, exc)
+        if lines:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            err_path.write_text("".join(lines), encoding="utf-8")
+        logger.info("Batch done: %d ok, %d errors (see %s)", n_ok, n_err, err_path if lines else "—")
+        return 0 if n_err == 0 else 1
+
+    if not args.sample_id:
+        parser.error("Provide --sample-id or use --all-samples")
+
     input_hg = load_hypergraph(args.hypergraphs_file, args.sample_id)
     bounds = load_bounds(args.test_dir, args.sample_id)
-    output_hg, summary = apply_command(input_hg, args.command, args.increase_factor, bounds=bounds)
-
-    is_valid, _, failed, _ = Hypergraph(output_hg).validate(quick=True)
-    if not is_valid:
-        raise ValueError("Edited hypergraph failed validation: " + "; ".join(failed))
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    command_slug = slugify_command(args.command)
-    stem = f"{args.sample_id}_{command_slug}_{args.tag}"
-    json_path = args.output_dir / f"{stem}.json"
-    png_path = args.output_dir / f"{stem}.png"
-    summary_path = args.output_dir / f"{stem}_summary.txt"
-
-    with open(json_path, "w") as f:
-        json.dump(output_hg, f, indent=2)
-    render_comparison(args.sample_id, args.command, bounds, input_hg, output_hg, png_path)
-    summary_path.write_text(summary + "\n")
-
+    json_path, png_path, summary_path = _run_one_cli(
+        args.sample_id,
+        input_hg,
+        bounds,
+        args.command,
+        args.increase_factor,
+        args.tag,
+        args.output_dir,
+    )
     print(json_path)
     print(png_path)
     print(summary_path)

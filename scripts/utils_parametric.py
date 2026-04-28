@@ -162,9 +162,10 @@ def _parse_jsonish(val) -> object:
 
 def load_ground_truth_txt(
     test_dir: Path, sample_id: str
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, list | None]:
     """
-    Load ``<test_dir>/<id>.txt``: ``bounds``, ``hypergraph``, ``accessgraph`` (RPLAN/WMR24 style).
+    Load ``<test_dir>/<id>.txt``: ``bounds``, ``hypergraph``, ``accessgraph`` (RPLAN/WMR24 style),
+    and optional ``room_polygons`` (RPLAN eval_test: polygons only, no BSP tree).
     """
     path = test_dir / f"{sample_id}.txt"
     with open(path, encoding="utf-8") as f:
@@ -182,12 +183,22 @@ def load_ground_truth_txt(
         ag = json.loads(ag) if ag else {}
     if not isinstance(ag, dict):
         ag = {}
-    return bounds, hg, ag
+    rp = raw.get("room_polygons")
+    if not isinstance(rp, list):
+        rp = None
+    return bounds, hg, ag, rp
+
+# AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = {
+#     "studio": {"bath": 4.5, "kitchen": 7.5, "living": 24.0},
+#     "one_bed": {"bath": 5.0, "bed": 13.0, "kitchen": 9.0, "living": 18.0},
+#     "two_plus": {"bath": 5.5, "bed": 14.0, "kitchen": 12.0, "living": 22.0},
+# }
+
 
 AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = {
-    "studio": {"bath": 4.5, "kitchen": 7.5, "living": 24.0},
-    "one_bed": {"bath": 5.0, "bed": 13.0, "kitchen": 9.0, "living": 18.0},
-    "two_plus": {"bath": 5.5, "bed": 14.0, "kitchen": 12.0, "living": 22.0},
+    "studio": {},
+    "one_bed": {"bath": 1145.5417, "bed": 3762.2961, "kitchen": 1626.7943, "living": 6273.9704, "balcony": 1463.5588, "storage": 1200.5263},
+    "two_plus": {"bath": 882.8436, "bed": 2591.3825, "kitchen": 1246.7811, "living": 7044.4455, "balcony": 1021.3723, "storage": 611.3082},
 }
 
 
@@ -221,6 +232,8 @@ class OptimConfig:
     gd_lr: float | None = None  # if None, 0.1 * (max_split - min_split)
     # ProcessPool workers for --all (1 = current sequential loop).
     batch_workers: int = 1
+    # If set, --all writes per-id dirs and batch CSV/JSON under this path (else default wmr24_<objective>).
+    batch_output_dir: str | None = None
 
     @classmethod
     def from_args(cls, args: list[str] | None = None) -> tuple["OptimConfig", str | None, bool]:
@@ -308,6 +321,13 @@ class OptimConfig:
             default=1,
             help="--all only: run N processes in parallel (1 = sequential). Set OMP/BLAS to 1 thread per process.",
         )
+        p.add_argument(
+            "--batch-output-dir",
+            type=str,
+            default=None,
+            help="--all only: root directory for per-id subfolders, batch CSV, and merged *_optimized.json "
+            "(default: parametric_optimization/output_parametric/wmr24_<objective> under repo root).",
+        )
         parsed = p.parse_args(args)
         obj = parsed.objective
         if parsed.area:
@@ -347,6 +367,7 @@ class OptimConfig:
             optimizer=str(parsed.optimizer).lower(),
             gd_lr=parsed.gd_lr,
             batch_workers=w,
+            batch_output_dir=parsed.batch_output_dir,
         )
         apt_id = getattr(parsed, "apt_id", None) if not parsed.all else None
         if apt_id:
@@ -552,6 +573,29 @@ def _mesh_areas_by_type_abs(mesh) -> dict[str, list[float]]:
     return out
 
 
+def _mesh_areas_by_type_from_polygons(room_polygons: list | None) -> dict[str, list[float]]:
+    """Same keying as :func:`_mesh_areas_by_type_abs` for GT from RPLAN ``room_polygons``."""
+    from shapely.geometry import Polygon
+
+    out: dict[str, list[float]] = {}
+    for rp in room_polygons or []:
+        if not isinstance(rp, dict):
+            continue
+        coords = rp.get("coords", [])
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_empty or poly.area < 1e-6:
+            continue
+        k = _canon_room_type(str(rp.get("mergeid", "unknown")))
+        out.setdefault(k, []).append(float(poly.area))
+    for k in list(out):
+        out[k] = sorted(
+            [float(x) for x in out[k] if math.isfinite(float(x))], reverse=True
+        )
+    return out
+
+
 def _delta_metric_square_from_room_list(room_list: list[tuple[str, float, float]]) -> float:
     vals: list[float] = []
     for _name, L, L_sq in room_list:
@@ -567,11 +611,11 @@ def _delta_metric_square_from_room_list(room_list: list[tuple[str, float, float]
     return float(sum(vals) / len(vals))
 
 
-def _area_metric_gt(gen_mesh, gt_mesh) -> float:
+def _area_metric_gt_from_type_maps(
+    gen_mesh, gt_by: dict[str, list[float]]
+) -> float:
+    """Pair per-type room areas (gen mesh vs pre-built GT area lists, e.g. from polygons)."""
     gen_by = _mesh_areas_by_type_abs(gen_mesh)
-    gt_by = _mesh_areas_by_type_abs(gt_mesh)
-    # Only compare room types that exist in BOTH meshes.
-    # If a room type is missing from either side, it should not contribute.
     keys = set(gen_by) & set(gt_by)
     total = 0.0
     n = 0
@@ -586,16 +630,17 @@ def _area_metric_gt(gen_mesh, gt_mesh) -> float:
             a_gt = float(t[i])
             denom = abs(a_gt)
             if not math.isfinite(denom) or denom <= 0.0:
-                # No eps: treat zero/invalid denom as a failure case and skip this metric.
                 return float("nan")
             rel = abs(a_gen - a_gt) / denom
-            # If the relative error for any room is extreme, treat as a failure case
-            # and skip this metric for this sample.
             if rel > 10.0:
                 return float("nan")
             total += float(rel)
             n += 1
     return float(total / max(1, n))
+
+
+def _area_metric_gt(gen_mesh, gt_mesh) -> float:
+    return _area_metric_gt_from_type_maps(gen_mesh, _mesh_areas_by_type_abs(gt_mesh))
 
 
 def _area_ref_metric(
