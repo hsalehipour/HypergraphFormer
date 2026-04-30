@@ -1181,7 +1181,7 @@ def _optim_worker_pack(
     if sid not in allh:
         return sid, repair_bsp_tree_names({}), None, f"missing id {sid}"
     cfg = OptimConfig(**json.loads(cfg_json))
-    art = Path(art_base_s) / sid
+    art = Path(art_base_s) / "outputs" / sid
     try:
         best_hg, _bm, _om, _gt, mo, mp, _bg, _ec, _ag = optimize_hypergraph(
             sid,
@@ -1212,13 +1212,14 @@ def run_optimization_mode(
     import json
     from dataclasses import asdict
 
-    from utils_parametric import OptimConfig
+    from utils_parametric import OptimConfig, infer_dataset_from_test_dir
 
     try:
         td_rel = str(test_dir.resolve().relative_to(REPO_ROOT))
     except ValueError:
         td_rel = str(test_dir)
-    wcfg = asdict(OptimConfig(optimizer="gd", objective=objective))
+    _ds = infer_dataset_from_test_dir(str(test_dir))
+    wcfg = asdict(OptimConfig(optimizer="gd", objective=objective, dataset=_ds))
     wcfg["test_dir"] = td_rel
     wcfg["grpo_file"] = str(grpo.resolve())
     wcfg["artifacts_dir"] = None
@@ -1235,6 +1236,7 @@ def run_optimization_mode(
         art_base = artifacts_base.resolve()
     else:
         art_base = (grpo.parent / "postprocessing_optimization_artifacts").resolve()
+    (art_base / "outputs").mkdir(parents=True, exist_ok=True)
     out_h: dict[str, dict] = {}
     meta: dict[str, Any] = {}
 
@@ -1407,8 +1409,8 @@ def main() -> int:
         "--optimization-artifacts-dir",
         type=Path,
         default=None,
-        help="Per-sample optimization artifacts (plots, etc.). Default: "
-        "<parent of --results-hypergraphs>/postprocessing_optimization_artifacts",
+        help="Root for per-sample optimization artifacts. Each id is written under "
+        "<root>/outputs/<id>/. Default root: <parent of --results-hypergraphs>/postprocessing_optimization_artifacts",
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="Warnings/errors only",

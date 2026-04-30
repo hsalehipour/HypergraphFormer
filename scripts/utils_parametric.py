@@ -75,10 +75,11 @@ def ref_room_area_list_from_targets(
     targets_by_group: dict[str, dict[str, float]] | None = None,
 ) -> list[tuple[str, float]]:
     """
-    Build a synthetic ``(merge_id, area)`` list from :data:`AREA_REF_TARGETS_ABS` and
+    Build a synthetic ``(merge_id, area)`` list from reference targets (see
+    :data:`AREA_REF_TARGETS_WMR24` / :data:`AREA_REF_TARGETS_RPLAN`) and
     per-type counts, for :func:`compute_room_area_proportion_error` (``aggregate=False``).
     """
-    tb = targets_by_group if targets_by_group is not None else AREA_REF_TARGETS_ABS
+    tb = targets_by_group if targets_by_group is not None else AREA_REF_TARGETS_WMR24
     targets = tb.get(str(group).strip().lower())
     if not targets:
         return []
@@ -106,7 +107,7 @@ def compute_epsilon_metric_vs_ref(
     """
     Same structure as :func:`compute_epsilon_metric_vs_gt` (mean |prop_pred - prop_ref|
     per room, ``aggregate=False``), but the reference apartment uses absolute areas from
-    :data:`AREA_REF_TARGETS_ABS` and *expected_counts* (repeated per room instance) instead
+    :data:`AREA_REF_TARGETS_WMR24` / ``rplan`` refs and *expected_counts* (repeated per room instance) instead
     of the GT mesh.
     """
     from utils.metrics import _room_sort_key
@@ -188,22 +189,81 @@ def load_ground_truth_txt(
         rp = None
     return bounds, hg, ag, rp
 
-# AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = {
-#     "studio": {"bath": 4.5, "kitchen": 7.5, "living": 24.0},
-#     "one_bed": {"bath": 5.0, "bed": 13.0, "kitchen": 9.0, "living": 18.0},
-#     "two_plus": {"bath": 5.5, "bed": 14.0, "kitchen": 12.0, "living": 22.0},
-# }
-
-
-# Mean polygon area (coordinate²) per mergeid from dataset/rplan/eval_test, by bedroom tier.
-# Tier = count of bed/bedroom nodes in GT accessgraph: 0→studio, 1→one_bed, 2→two_bed, ≥3→three_plus.
-# eval_test has no studio (0-bed) layouts; studio row uses full-split pooled means as fallback.
-AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = {
-    "studio": {"bath": 886.32, "bed": 2598.41, "kitchen": 1252.55, "living": 7031.81, "balcony": 1028.42, "storage": 635.81},
-    "one_bed": {"bath": 1145.5417, "bed": 3762.2961, "kitchen": 1626.7943, "living": 6273.9704, "balcony": 1463.5588, "storage": 1200.5263},
-    "two_bed": {"bath": 908.3813, "bed": 2777.7372, "kitchen": 1280.6732, "living": 6707.4839, "balcony": 1016.8996, "storage": 632.6655},
-    "three_plus": {"bath": 862.0652, "bed": 2465.9748, "kitchen": 1211.5630, "living": 7391.3475, "balcony": 1026.7083, "storage": 574.2000},
+# --- Reference absolute areas (m²) for ε_vs_ref / area objectives, by bedroom tier ----
+# Tier from :func:`_bedroom_group_from_accessgraph`: ``studio`` | ``one_bed`` | ``two_bed``
+# | ``three_plus``.
+#
+# **WMR24** (canonical m² — same scale as mesh areas in WMR ground truth).
+AREA_REF_TARGETS_WMR24: dict[str, dict[str, float]] = {
+    "studio": {"bath": 4.5, "kitchen": 7.5, "living": 24.0},
+    "one_bed": {"bath": 5.0, "bed": 13.0, "kitchen": 9.0, "living": 18.0},
+    "two_bed": {"bath": 5.5, "bed": 14.0, "kitchen": 12.0, "living": 22.0},
+    # Legacy table had only three rows; three_bed+ layouts reuse two_bed reference mix.
+    "three_plus": {"bath": 5.5, "bed": 14.0, "kitchen": 12.0, "living": 22.0},
 }
+
+# **RPLAN** ``eval_test``: mean polygon area (coordinate²) per merge id, by tier
+# (``dataset/rplan/eval_test`` — same scale as polygon areas in .txt).
+AREA_REF_TARGETS_RPLAN: dict[str, dict[str, float]] = {
+    "studio": {
+        "bath": 886.32,
+        "bed": 2598.41,
+        "kitchen": 1252.55,
+        "living": 7031.81,
+        "balcony": 1028.42,
+        "storage": 635.81,
+    },
+    "one_bed": {
+        "bath": 1145.5417,
+        "bed": 3762.2961,
+        "kitchen": 1626.7943,
+        "living": 6273.9704,
+        "balcony": 1463.5588,
+        "storage": 1200.5263,
+    },
+    "two_bed": {
+        "bath": 908.3813,
+        "bed": 2777.7372,
+        "kitchen": 1280.6732,
+        "living": 6707.4839,
+        "balcony": 1016.8996,
+        "storage": 632.6655,
+    },
+    "three_plus": {
+        "bath": 862.0652,
+        "bed": 2465.9748,
+        "kitchen": 1211.5630,
+        "living": 7391.3475,
+        "balcony": 1026.7083,
+        "storage": 574.2000,
+    },
+}
+
+# Back-compat: default reference table is WMR24.
+AREA_REF_TARGETS_ABS: dict[str, dict[str, float]] = AREA_REF_TARGETS_WMR24
+
+
+def infer_dataset_from_test_dir(test_dir: str) -> str:
+    """Infer ``wmr24`` vs ``rplan`` from a ``--test-dir`` path string."""
+    s = str(test_dir).replace("\\", "/").lower()
+    if "wmr24" in s:
+        return "wmr24"
+    if "rplan" in s or "eval_test" in s:
+        # RPLAN splits often live under dataset/rplan/... or *eval_test* in the path.
+        return "rplan"
+    return "wmr24"
+
+
+def area_ref_targets_for_dataset(dataset_key: str) -> dict[str, dict[str, float]]:
+    """Return reference room areas for ``dataset_key`` (``wmr24`` | ``rplan``)."""
+    dk = (dataset_key or "wmr24").strip().lower()
+    if dk in ("wmr", "wmr24"):
+        return dict(AREA_REF_TARGETS_WMR24)
+    if dk in ("rplan", "rplan_eval", "rplan_eval_test"):
+        return dict(AREA_REF_TARGETS_RPLAN)
+    raise ValueError(
+        f"Unknown --dataset {dataset_key!r}; use wmr24 or rplan (or infer from --test-dir)."
+    )
 
 
 @dataclass
@@ -238,6 +298,10 @@ class OptimConfig:
     batch_workers: int = 1
     # If set, --all writes per-id dirs and batch CSV/JSON under this path (else default wmr24_<objective>).
     batch_output_dir: str | None = None
+    # --all only: optional path for merged optimized hypergraphs JSON (default: batch_output_dir/<input_stem>_optimized.json).
+    merged_hypergraphs_json: str | None = None
+    #: ``wmr24`` vs ``rplan`` — selects :data:`AREA_REF_TARGETS_WMR24` vs :data:`AREA_REF_TARGETS_RPLAN`.
+    dataset: str = "wmr24"
 
     @classmethod
     def from_args(cls, args: list[str] | None = None) -> tuple["OptimConfig", str | None, bool]:
@@ -281,6 +345,17 @@ class OptimConfig:
             default="dataset/wmr24/test",
             help="Ground truth folder with <id>.txt (default: WMR24 test split).",
         )
+        p.add_argument(
+            "--dataset",
+            type=str,
+            default="auto",
+            metavar="MODE",
+            choices=("auto", "wmr24", "rplan"),
+            help="Area-ref targets for ε / area-vs-ref objectives. "
+            "wmr24: m² table (AREA_REF_TARGETS_WMR24). "
+            "rplan: eval_test coordinate² pooled means (AREA_REF_TARGETS_RPLAN). "
+            "auto: choose from --test-dir (wmr24 if path segment contains ``wmr24``, else rplan if ``rplan`` or ``eval_test``).",
+        )
         p.add_argument("--limit", type=int, default=None)
         p.add_argument("--skip-ids-file", type=str, default=None)
         p.add_argument("--area", action="store_true", help="Objective: area")
@@ -288,7 +363,7 @@ class OptimConfig:
         p.add_argument(
             "--epsilon",
             action="store_true",
-            help="Objective: epsilon (area proportion error vs ref: AREA_REF_TARGETS_ABS + counts; not vs GT mesh)",
+            help="Objective: epsilon (area proportion error vs dataset-scaled ref + counts; see --dataset; not vs GT mesh)",
         )
         p.add_argument(
             "--area-delta",
@@ -329,8 +404,19 @@ class OptimConfig:
             "--batch-output-dir",
             type=str,
             default=None,
-            help="--all only: root directory for per-id subfolders, batch CSV, and merged *_optimized.json "
-            "(default: parametric_optimization/output_parametric/wmr24_<objective> under repo root).",
+            help="--all only: root directory for per-id subfolders, batch CSV / summary JSON "
+            "(default: parametric_optimization/output_parametric/wmr24_<objective> under repo root). "
+            "Merged optimized hypergraphs go under this directory unless --merged-hypergraphs-json is set.",
+        )
+        p.add_argument(
+            "--merged-hypergraphs-json",
+            type=str,
+            default=None,
+            dest="merged_hypergraphs_json",
+            metavar="PATH",
+            help="--all only: write merged sample_id→hypergraph JSON to this path (under repo root). "
+            "Default: <batch-output-dir>/<input_json_stem>_optimized.json "
+            "(e.g. next to batch CSVs, not beside --results-hypergraphs).",
         )
         parsed = p.parse_args(args)
         obj = parsed.objective
@@ -347,6 +433,11 @@ class OptimConfig:
         w = int(parsed.batch_workers)
         if w < 1:
             p.error("--batch-workers must be >= 1")
+        ds = str(parsed.dataset or "auto").strip().lower()
+        if ds == "auto":
+            ds = infer_dataset_from_test_dir(str(parsed.test_dir))
+        elif ds not in ("wmr24", "rplan"):
+            ds = "wmr24"
         cfg = cls(
             seed=parsed.seed,
             min_split=parsed.min_split,
@@ -372,6 +463,8 @@ class OptimConfig:
             gd_lr=parsed.gd_lr,
             batch_workers=w,
             batch_output_dir=parsed.batch_output_dir,
+            merged_hypergraphs_json=parsed.merged_hypergraphs_json,
+            dataset=ds,
         )
         apt_id = getattr(parsed, "apt_id", None) if not parsed.all else None
         if apt_id:

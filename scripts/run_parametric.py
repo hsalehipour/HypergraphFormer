@@ -17,8 +17,13 @@ Run from repo root::
 
   python -m scripts.run_parametric --all --limit 5 --objective area
 
-  # Parallel batch (one process per apartment; 128 ≈ 128-way throughput if machine can feed it)
+  # Parallel batch (``--dataset auto`` picks WMR24 vs RPLAN ref tables from ``--test-dir``)
   python -m scripts.run_parametric --all --batch-workers 128
+
+  # Per-run plots / CSV / GIFs: ``<batch-output-dir>/outputs/<id>/`` (batch) or
+  # ``scripts/output_parametric/outputs/<id>/`` (single apt). Summaries and merged JSON stay next to ``--batch-output-dir``.
+
+  # Merged JSON path: default is <batch-output-dir>/<input_stem>_optimized.json; override with --merged-hypergraphs-json
 """
 from __future__ import annotations
 
@@ -51,7 +56,7 @@ from utils.metrics import (
 )
 
 from utils_parametric import (
-    AREA_REF_TARGETS_ABS,
+    area_ref_targets_for_dataset,
     DEFAULT_WMR24_RESULTS,
     OptimConfig,
     _bedroom_group_from_accessgraph,
@@ -212,7 +217,7 @@ def optimize_hypergraph(
     if float(config.area_weight) < 0.0:
         raise ValueError("area_weight must be >= 0")
 
-    targets_by_group = AREA_REF_TARGETS_ABS
+    targets_by_group = area_ref_targets_for_dataset(getattr(config, "dataset", "wmr24"))
     original_mesh = hypergraph_bounds_to_mesh(copy.deepcopy(original_hg), bounds, RGL=RGL, Collections=Collections)
     original_room_list = produce_room_list(original_mesh)
     original_delta_gt = float(compute_delta_metric_soft_from_room_lists(original_room_list, gt_room_list, area_sorting=True))
@@ -305,7 +310,7 @@ def optimize_hypergraph(
         raise ValueError("min_leaf_frac must be in (0, 1)")
 
     rng = np.random.default_rng(config.seed)
-    artifacts_dir = artifacts_dir or (Path(__file__).parent / "output_parametric")
+    artifacts_dir = artifacts_dir or (Path(__file__).parent / "output_parametric" / "outputs")
 
     ag_eval_counter = 0
     ag_fail_count = 0
@@ -552,7 +557,7 @@ def optimize_hypergraph(
                 _area_ref_metric(
                     original_mesh,
                     group=bedroom_group,
-                    targets_by_group=AREA_REF_TARGETS_ABS,
+                    targets_by_group=targets_by_group,
                     expected_counts=expected_counts,
                 )
             ),
@@ -571,7 +576,7 @@ def optimize_hypergraph(
             best_mesh,
             group=bedroom_group,
             expected_counts=expected_counts,
-            targets_by_group=AREA_REF_TARGETS_ABS,
+            targets_by_group=targets_by_group,
         )
     )
     if gt_mesh is not None:
@@ -581,8 +586,8 @@ def optimize_hypergraph(
         _bga = produce_room_area_list_from_polygons(room_polygons)
         _bape = compute_room_area_proportion_error(_bpa, _bga, aggregate=False)
         best_epsilon_gt = float(_bape.get("area_proportion_error", float("nan")))
-    original_area_ref = float(_area_ref_metric(original_mesh, group=bedroom_group, targets_by_group=AREA_REF_TARGETS_ABS, expected_counts=expected_counts))
-    best_area_ref = float(_area_ref_metric(best_mesh, group=bedroom_group, targets_by_group=AREA_REF_TARGETS_ABS, expected_counts=expected_counts))
+    original_area_ref = float(_area_ref_metric(original_mesh, group=bedroom_group, targets_by_group=targets_by_group, expected_counts=expected_counts))
+    best_area_ref = float(_area_ref_metric(best_mesh, group=bedroom_group, targets_by_group=targets_by_group, expected_counts=expected_counts))
     original_area_gt = float(_area_gt_metric(original_mesh))
     best_area_gt = float(_area_gt_metric(best_mesh))
 
@@ -624,7 +629,7 @@ def optimize_hypergraph(
                     entry_mesh,
                     group=bedroom_group,
                     expected_counts=expected_counts,
-                    targets_by_group=AREA_REF_TARGETS_ABS,
+                    targets_by_group=targets_by_group,
                 )
             )
             if gt_mesh is not None:
@@ -638,7 +643,7 @@ def optimize_hypergraph(
                 _area_ref_metric(
                     entry_mesh,
                     group=bedroom_group,
-                    targets_by_group=AREA_REF_TARGETS_ABS,
+                    targets_by_group=targets_by_group,
                     expected_counts=expected_counts,
                 )
             )
@@ -821,10 +826,10 @@ def _run_one_batch_apt(
             _id,
             config,
             grpo_file_path=grpo_file_path,
-            artifacts_dir=batch_root / _id,
+            artifacts_dir=batch_root / "outputs" / _id,
             preloaded_hg=preloaded_hg,
         )
-        output_dir = batch_root / _id
+        output_dir = batch_root / "outputs" / _id
         test_path = _resolve_under_repo(repo_root, str(config.test_dir))
         bounds, _gt_unused, accessgraph0, _rp_unused = load_ground_truth_txt(test_path, _id)
         save_single_apt_artifacts(
@@ -919,9 +924,8 @@ def main():
         grpo_file_path = DEFAULT_WMR24_RESULTS
 
     if run_all:
-        # Batch runs go under a single objective-scoped folder, e.g.:
-        #   parametric_optimization/output_parametric/wmr24_epsilon/<id>/
-        # Override with --batch-output-dir.
+        # Batch runs: summaries under batch_root; per-id artifacts under batch_root/outputs/<id>/
+        # Default batch_root example: parametric_optimization/output_parametric/wmr24_<objective>/
         if getattr(config, "batch_output_dir", None):
             batch_root = Path(str(config.batch_output_dir)).expanduser().resolve()
         else:
@@ -932,6 +936,7 @@ def main():
                 / f"wmr24_{str(config.objective).strip().lower()}"
             )
         batch_root.mkdir(parents=True, exist_ok=True)
+        (batch_root / "outputs").mkdir(parents=True, exist_ok=True)
         batch_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}.csv"
         batch_ag_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}_accessgraph_penalties.csv"
         rows: list[dict] = []
@@ -1030,8 +1035,13 @@ def main():
             save_batch_results(batch_root, batch_csv, batch_ag_csv, rows, ag_rows, config.objective, grpo_file_path, fieldnames=fieldnames)
         except OSError as e:
             print(f"\nCould not write batch CSV: {type(e).__name__}: {e}")
-        mp = grpo_file_path.parent / f"{grpo_file_path.stem}_optimized.json"
+        stem = Path(grpo_file_path).stem
+        if getattr(config, "merged_hypergraphs_json", None):
+            mp = _resolve_under_repo(repo_root, str(config.merged_hypergraphs_json))
+        else:
+            mp = batch_root / f"{stem}_optimized.json"
         try:
+            mp.parent.mkdir(parents=True, exist_ok=True)
             with open(mp, "w", encoding="utf-8") as f:
                 json.dump(_to_jsonable(merged_out), f, indent=2, sort_keys=True)
             print(f"Saved merged hypergraphs ({len(merged_out)} ids) → {mp}")
@@ -1053,10 +1063,10 @@ def main():
         apt_id,
         config,
         grpo_file_path=grpo_file_path,
-        artifacts_dir=Path(__file__).parent / "output_parametric" / apt_id,
+        artifacts_dir=Path(__file__).parent / "output_parametric" / "outputs" / apt_id,
     )
 
-    output_dir = Path(__file__).parent / "output_parametric" / apt_id
+    output_dir = Path(__file__).parent / "output_parametric" / "outputs" / apt_id
     with open(grpo_file_path, encoding="utf-8") as f:
         grpo_results = json.load(f)
     original_hg = repair_bsp_tree_names(copy.deepcopy(grpo_results[apt_id]))
