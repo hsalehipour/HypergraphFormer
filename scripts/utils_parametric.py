@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.mesh_pair_viz import render_input_output_pair
 from utils.hypergraph import Hypergraph, HypergraphPlotter
 from utils.metrics import (
     compute_room_area_proportion_error,
@@ -1195,6 +1196,16 @@ def save_single_apt_artifacts(
         original_hg, optimized_hg, gt_hg, bounds, apt_id,
         metrics_original=metrics_original, metrics_optimized=metrics_optimized, output_dir=output_dir,
     )
+    pair_path = output_dir / f"{apt_id}_input_output.png"
+    try:
+        render_input_output_pair(original_hg, optimized_hg, bounds, pair_path)
+    except OSError as e:
+        print(f"⚠️  Could not save input/output mesh pair to {pair_path}: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"⚠️  Could not render input/output mesh pair: {type(e).__name__}: {e}")
+    else:
+        if pair_path.exists():
+            print(f"Saved input/output mesh pair to: {pair_path}")
 
 
 def save_batch_results(
