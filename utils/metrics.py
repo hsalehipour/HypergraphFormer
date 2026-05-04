@@ -9,6 +9,10 @@ Provides canonical metrics:
 - Room-type accuracy: multiset comparison of room types
 """
 
+# Defer evaluation of ``defaultdict[str, ...]`` annotations etc. so this
+# module can be imported by the iPLAN evaluator under Python 3.8 too.
+from __future__ import annotations
+
 import math
 import warnings
 
