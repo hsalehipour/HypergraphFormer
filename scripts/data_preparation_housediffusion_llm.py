@@ -20,7 +20,7 @@ INPUT
 OUTPUT (under ``--output-dir``, default = ``--hd-dir``)
 -------------------------------------------------------
 ``train.jsonl``           SFT chat data, one JSON object per line.
-``val.jsonl``             SFT chat data, one JSON object per line.
+``validation.jsonl``      SFT chat data, one JSON object per line.
 ``<test-dirname>/<id>.txt``
                           Per-sample eval files containing
                           ``{"accessgraph": ..., "hypergraph": <hd_json_str>}``
@@ -340,7 +340,7 @@ def main() -> int:
         n_bad = 0
 
         if kind == "jsonl":
-            out_path = out_root / ("train.jsonl" if hd_split == "train" else "val.jsonl")
+            out_path = out_root / ("train.jsonl" if hd_split == "train" else "validation.jsonl")
             with out_path.open("w") as fout:
                 for fp in hd_files:
                     try:

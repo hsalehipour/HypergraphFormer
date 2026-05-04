@@ -73,7 +73,7 @@ def format_chat_messages(example, tokenizer):
     tokenized = tokenizer(
         text,
         truncation=True,
-        max_length=6144,  # Covers 99.2% of data (only 8 samples truncated)
+        max_length=8192,  # Covers HD distribution (BSP fit easily under 6144; HD p99 ~7100, max ~7500)
         padding=False,
         return_tensors=None
     )

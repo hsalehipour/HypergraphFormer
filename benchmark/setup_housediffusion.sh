@@ -30,7 +30,7 @@ HOUSEDIFFUSION_REPO="$REPOS_DIR/house_diffusion"
 HOUSEGAN_DATA_READER="$REPOS_DIR/Housegan-data-reader"
 
 # Virtual environment path (in HypergraphFormer root)
-VENV_PATH="$HF_ROOT/.venv"
+VENV_PATH="/raid/home/nikita/HypergraphFormer/.venv-hd"
 
 # RPLAN dataset paths
 RPLAN_PNG_DIR="$HF_ROOT/dataset/rplan/dataset_original/floorplan_dataset"

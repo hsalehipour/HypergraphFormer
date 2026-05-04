@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import os
 
-from scripts.viz import draw_graph, ID_COLOR
+from houseganpp.scripts.viz import draw_graph, ID_COLOR
 
 
 def make_sequence(edges):
