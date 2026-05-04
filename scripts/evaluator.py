@@ -880,11 +880,71 @@ class TrainedModelEvaluator(Evaluator):
         self.generator._model = prepared_model
 
     def create_prompt(self, sample):
+        # Prompt template must match what the model was trained on. HD-trained
+        # models (``data_preparation_housediffusion_llm.py``) get a different
+        # system message + user template than BSP-trained models. Selected via
+        # ``--prompt-format``; the system message is swapped in cli() so the
+        # generator's chat template lines up with training.
+        if getattr(self.args, "prompt_format", "hd") == "hd":
+            from utils.prompts import create_simple_prompt_hd
+            return create_simple_prompt_hd(sample["accessgraph"])
         from utils.prompts import create_simple_prompt
         return create_simple_prompt(sample["accessgraph"])
 
+    @staticmethod
+    def _assistant_span(raw: str) -> str:
+        """Return just the assistant content from a Qwen chat-template string.
+
+        Works for both backends:
+          * HF QwenGenerator decodes the whole sequence including system/user;
+          * VllmQwenGenerator wraps the new tokens with ``<|im_start|>assistant
+            ...<|redacted_im_end|>`` so this finds the same marker.
+        """
+        if not raw:
+            return raw
+        marker = "<|im_start|>assistant"
+        idx = raw.find(marker)
+        s = raw[idx + len(marker):] if idx >= 0 else raw
+        for end in ("<|im_end|>", "<|redacted_im_end|>"):
+            e = s.find(end)
+            if e >= 0:
+                s = s[:e]
+                break
+        return s.strip()
+
     def extract_hypergraph(self, response):
+        # Retained only for the legacy ``--prompt-format bsp`` path; HD mode
+        # never calls this (see ``_apply_generation_to_result`` override).
         return Hypergraph.from_qwen_response(response)
+
+    def _apply_generation_to_result(self, sample, result, res, *, prompt):
+        """HD-aware override: when ``--prompt-format hd``, persist the raw
+        assistant span and skip BSP-specific extraction/validation/scoring.
+        BSP mode falls through to the base implementation untouched.
+        """
+        if getattr(self.args, "prompt_format", "hd") != "hd":
+            return super()._apply_generation_to_result(
+                sample, result, res, prompt=prompt,
+            )
+
+        timeout = getattr(self.args, "timeout", None)
+        result["num_input_tokens"] = res.input_tokens
+        result["generation_time"] = res.generation_time
+
+        if res.timed_out:
+            result["error"] = f"Generation timed out after {timeout}s"
+            result["timed_out"] = True
+            self._log_slow(sample, res)
+            return
+
+        if res.generation_time > getattr(self.args, "slow_gen_threshold", 1e9):
+            self._log_slow(sample, res)
+
+        # No extraction, no validation, no GED. Just persist what came out.
+        # The validation/_ged_info fields stay at their template defaults so
+        # downstream merge code keeps working uniformly.
+        result["response"] = self._assistant_span(res.text)
+        result["success"] = True
 
     def score_result(self, result, hg, sample):
         result["generated_hypergraph"] = hg.data
@@ -1268,7 +1328,26 @@ def cli():
     parser.add_argument("--dataset-dir", type=str, default="training_data/extracted_hypergraph_msd")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--max-tokens", type=int, default=3328)
+    parser.add_argument(
+        "--max-tokens", type=int, default=7168,
+        help=(
+            "Max generation tokens (default: 7168). Sized to fit the HD JSON "
+            "distribution (p99 ~7100, max ~7500 total tokens) within the 8192 "
+            "training context window, leaving room for the prompt."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-format",
+        choices=("hd", "bsp"),
+        default="hd",
+        help=(
+            "Prompt template family. ``hd`` (default) uses the House-Diffusion "
+            "JSON prompt that matches ``data_preparation_housediffusion_llm.py``; "
+            "``bsp`` uses the legacy BSP-tree prompt. Must match what the "
+            "fine-tuned model was trained on. Affects ``--mode trained`` and "
+            "the system message sent through the chat template."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--skip-covered-hypergraphs", type=str, default=None)
@@ -1305,8 +1384,11 @@ def cli():
     vllm.add_argument(
         "--vllm-max-model-len",
         type=int,
-        default=6900,
-        help="vLLM max_model_len (default: 6900)",
+        default=8192,
+        help=(
+            "vLLM max_model_len (default: 8192). Matches the training "
+            "tokenization cap in ``scripts/sft_pipeline.py`` (max_length=8192)."
+        ),
     )
     vllm.add_argument(
         "--tensor-parallel",
@@ -1332,6 +1414,16 @@ def cli():
 
     args = parser.parse_args()
 
+    # Align the generator's chat-template system message with the training
+    # template. Both ``QwenGenerator.generate`` and ``VllmQwenGenerator.generate``
+    # read ``generators.SYSTEM_PROMPT`` at call time, so overriding it here
+    # before any generation runs is sufficient. HD-trained models expect the
+    # HD system message; BSP-trained models keep the default BSP one.
+    if args.prompt_format == "hd":
+        from utils.prompts import HD_SYSTEM_MESSAGE
+        from scripts import generators as _generators
+        _generators.SYSTEM_PROMPT = HD_SYSTEM_MESSAGE
+
     # Defaults
     if args.model is None:
         if args.mode == "fewshot-qwen":
@@ -1344,9 +1436,6 @@ def cli():
     if args.output is None:
         args.output = f"results_{args.mode.replace('-', '_')}_{Path(args.model).name}_{args.seed}.json"
         logger.info(f"Auto-generated output: {args.output}")
-
-    if args.mode.startswith("fewshot"):
-        args.max_tokens = args.max_tokens or 5120
 
     cls = MODE_MAP[args.mode]
     evaluator = cls(args)

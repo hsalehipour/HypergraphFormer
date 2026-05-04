@@ -431,9 +431,144 @@ Generate ONLY the hypergraph JSON structure, no additional text or explanation:"
     assistant_content = json.dumps(hypergraph, indent=2)
 
     messages = [
-        {"role": "system", "content": "You are an expert at generating structured hierarchical BSP tree data for floor plans in JSON format."},
+        {"role": "system", "content": BSP_SYSTEM_MESSAGE},
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": assistant_content}
     ]
 
     return {"messages": messages}
+
+
+# System message paired with BSP user prompts during training.
+# Exposed so callers (evaluator/generators) can mirror it at inference.
+BSP_SYSTEM_MESSAGE = (
+    "You are an expert at generating structured hierarchical BSP tree data "
+    "for floor plans in JSON format."
+)
+
+
+# ---------------------------------------------------------------------------
+# House-Diffusion JSON prompts
+#
+# These mirror the prompt format used by
+# ``scripts/data_preparation_housediffusion_llm.py`` so that the evaluator can
+# reproduce the EXACT user/assistant template the model was trained on.
+# Single source of truth: data prep imports these helpers.
+# ---------------------------------------------------------------------------
+
+HD_SYSTEM_MESSAGE = (
+    "You are an expert at generating apartment floor plan layouts in "
+    "House-Diffusion JSON format from access graphs. Each layout is a single "
+    "JSON object describing room types, axis-aligned bounding boxes, and "
+    "wall/door edges in pixel coordinates."
+)
+
+
+HD_FORMAT_RULES_TEXT = """\
+# CRITICAL STRUCTURE RULES:
+
+## 1. House-Diffusion JSON Schema (MUST FOLLOW):
+The output is a single JSON object with EXACTLY these four fields:
+
+### 1.1 `room_type` -- list[int]
+- One integer category id per layout entry, in canonical order: rooms first, then door entries (interior doors, then a single front door at the end).
+- Standard RPLAN-style category IDs:
+    1  = Living Room       2  = Kitchen        3  = Bedroom (bed)
+    4  = Bathroom (bath)   5  = Balcony        6  = Entrance / Hall
+    7  = Dining Room       8  = Study Room    10  = Storage
+   15  = Front Door       17  = Interior Door
+
+### 1.2 `boxes` -- list[[x1, y1, x2, y2]]
+- One axis-aligned bounding box per entry in `room_type`, SAME ORDER and SAME LENGTH.
+- Coordinates are integer-valued pixels in `[0, 256]`; (x1, y1) is the top-left corner, (x2, y2) is the bottom-right corner (so x1 < x2 and y1 < y2).
+
+### 1.3 `edges` -- list[[x1, y1, x2, y2, ra, rb]]
+- One entry per wall / door segment that bounds a node (a room OR a door entry).
+- (x1, y1, x2, y2) are the integer pixel endpoints of the segment.
+- `ra` is the **category id** (a value taken from `room_type`) of the node that emits this segment.
+- `rb` is **0** when the segment lies on the apartment exterior, otherwise the **category id** of the node on the other side of the wall. So interior doors appear as `rb = 17` for the rooms they connect, and the front door appears as `rb = 15`.
+
+### 1.4 `ed_rm` -- list[list[int]]
+- One entry per row of `edges`, in the SAME ORDER as `edges`.
+- Each entry is a list of **node indices** (0-based positions into `room_type` / `boxes`) that the segment touches. The indices can refer to ROOMS or to DOOR entries (categories 15 / 17), not just to rooms.
+- A length-1 entry `[i]` means the segment lies on the apartment exterior, owned by node `i`; the corresponding `edges` row has `rb == 0`.
+- A length-2 entry `[i, j]` means the segment is shared between nodes `i` and `j`; the corresponding `edges` row has `rb != 0`, and the invariant `room_type[i] == ra` and `room_type[j] == rb` MUST hold.
+- `ed_rm` is what disambiguates `edges` whenever multiple rooms share a category (e.g. two bedrooms): `ra` / `rb` only carry types, but `ed_rm` carries the exact two entries.
+
+## 2. Geometric Consistency:
+- For every room, the union of its segments in `edges` must form a closed axis-aligned polygon contained inside that room's `boxes` rectangle.
+- Walls are emitted segment-by-segment; do not rely on implicit closures.
+- All coordinates are integers in `[0, 256]` (the canonical House-Diffusion grid).
+- `len(boxes) == len(room_type)` and `len(ed_rm) == len(edges)`.
+
+## 3. Connectivity (Access Graph -> JSON):
+- The access-graph `edges` list contains TWO kinds of entries:
+    * room-to-room edges `[a, b]`, where both endpoints are room ids that appear as keys in `nodes`, and
+    * outside edges `[r, "outside"]`, where the literal string `"outside"` indicates that room `r` carries the apartment's front door. `"outside"` is NOT a real room and is NOT a key in `nodes`; therefore room `r`'s box should sit on the apartment boundary so its front door faces the exterior.
+- The number of ROOM entries in `room_type` (entries with category id NOT 15 and NOT 17) MUST equal the number of nodes in the access graph (i.e., the count of keys in `nodes`; the `"outside"` reference does NOT count).
+- Each room entry's category id must match the corresponding access-graph node's room type, using this canonical mapping:
+    living=1, kitchen=2, bed=3, bath=4, balcony=5, entrance=6, dining=7, study=8, storage=10.
+- For every room-to-room edge `[a, b]` in the access graph, the JSON must realize that connection as an INTERIOR DOOR: an entry with category id 17 in `room_type` whose segment rows have `ed_rm = [door_index, room_index]` for each of the two connected rooms (so room `a` and room `b` end up sharing exactly one interior door).
+- For every outside edge `[r, "outside"]` in the access graph, the JSON must include exactly one Front-Door entry (category 15) in `room_type` whose `ed_rm` rows pair it with room `r`; room `r` must therefore have at least one row in `edges` with `rb == 15`."""
+
+
+HD_REQUIREMENTS_TMPL = """\
+## Requirements:
+1. The number of ROOM entries in `room_type` (entries with category id != 15 and != 17) MUST equal {num_nodes} (number of access-graph nodes; the `"outside"` reference does NOT count).
+2. Each room's category id must match the corresponding access-graph room type.
+3. Every room-to-room edge `[a, b]` in the access graph must be realized by an Interior-Door entry (category 17) whose `ed_rm` rows pair it with both rooms.
+4. Every outside edge `[r, "outside"]` in the access graph must be realized by a Front-Door entry (category 15) whose `ed_rm` rows pair it with room `r`; that room's box must sit on the apartment boundary.
+5. All coordinates are integers in `[0, 256]`.
+6. `len(boxes) == len(room_type)` and `len(ed_rm) == len(edges)`.
+7. Each room's `boxes` rectangle must enclose all of its segments in `edges`.
+8. Output ONLY the JSON object, no markdown fences and no commentary."""
+
+
+def create_hd_instruction_prompt():
+    """Long-form instruction explaining the HD JSON format. No examples."""
+    return f"""You are an expert at generating apartment floor plan layouts in the House-Diffusion JSON format that represent floor plans.
+
+Your task is to generate a House-Diffusion JSON object from an access graph. An access graph is a simple representation of room connectivity:
+- `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "bed", "2": "kitchen"}}).
+- `edges`: List of connections. Each entry is either a room-to-room pair (e.g. `["1", "2"]`) or an outside reference (e.g. `["1", "outside"]`). The literal string `"outside"` is NOT a room and is NOT listed in `nodes`; it marks the room that owns the apartment's front door (i.e., the entry-door room), and that room's box should therefore lie on the apartment boundary so its front door can face the exterior.
+
+{HD_FORMAT_RULES_TEXT}
+
+# YOUR TASK:
+
+Generate a House-Diffusion JSON object for the following access graph."""
+
+
+def create_simple_prompt_hd(target_accessgraph):
+    """User-side prompt for HD JSON generation (matches training).
+
+    Returns the SAME ``user`` content emitted by
+    ``create_hd_training_sample``. Used by ``evaluator.py`` (--mode trained,
+    --prompt-format hd) so the fine-tuned model sees the exact template it
+    was trained on.
+    """
+    instruction = create_hd_instruction_prompt()
+    return f"""{instruction}
+
+### Access Graph:
+```json
+{json.dumps(target_accessgraph, indent=2)}
+```
+
+{HD_REQUIREMENTS_TMPL.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
+
+Generate ONLY the House-Diffusion JSON object, no additional text or explanation:"""
+
+
+def create_hd_training_sample(accessgraph, hd_json):
+    """Build one chat-format SFT sample (system + user + assistant) for HD."""
+    user_content = create_simple_prompt_hd(accessgraph)
+    assistant_content = json.dumps(hd_json, indent=2)
+
+    return {
+        "messages": [
+            {"role": "system", "content": HD_SYSTEM_MESSAGE},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ]
+    }
