@@ -1,6 +1,6 @@
-# Benchmark: HouseGAN++, House-Diffusion & DiffPlanner
+# Benchmark: HouseGAN++, House-Diffusion, DiffPlanner & iPLAN
 
-This benchmark evaluates three published floor-plan generators against
+This benchmark evaluates four published floor-plan generators against
 HypergraphFormer:
 
 | Model | Dataset | Inputs |
@@ -8,17 +8,20 @@ HypergraphFormer:
 | **HouseGAN++** | WMR24 | room set + adjacency graph |
 | **House-Diffusion** | WMR24 | room set + adjacency graph |
 | **DiffPlanner** | RPLAN | input boundary + room count + room categories (`b+nc` mode) |
+| **iPLAN** (CVPR 2022) | RPLAN | input boundary + room count + room categories (`OurII` mode; Stage 1 skipped) |
 
 It ships automated setup scripts, data conversion utilities, and a
 shared evaluation pipeline. Available metrics are: GED, room accuracy
 (combined / count-only / type-only), delta (geometric similarity), area
-proportion error, and -- for DiffPlanner -- boundary gap ratio.
+proportion error, plus boundary-aware coverage / outside-spill /
+inter-room overlap ratios for the boundary-conditioned models.
 
 ## Table of Contents
 
 - [Quick Start: HouseGAN++](#quick-start-houseganpp)
 - [Quick Start: House-Diffusion](#quick-start-house-diffusion)
 - [Quick Start: DiffPlanner](#quick-start-diffplanner)
+- [Quick Start: iPLAN](#quick-start-iplan)
 - [Evaluation Metrics](#evaluation-metrics)
 - [Shell Scripts](#shell-scripts)
 - [Core Scripts](#core-scripts)
@@ -178,18 +181,109 @@ python -m benchmark.utils.visualize_diffplanner \
 
 ---
 
+## Quick Start: iPLAN
+
+iPLAN is evaluated on the **RPLAN** test split (12,110 samples) in its
+`OurII` mode: the user supplies the boundary AND the per-floorplan
+ground-truth room types/count, and iPLAN's three-stage cascade fills
+in the rest:
+
+- Stage 1 (BCVAE for room types) -- **skipped** (`rTypes := gt_rTypes`)
+- Stage 2 (room locations, ResNet18 + ASPP) -- runs
+- Stage 3 (room partitions, step-wise GAN) -- runs (with iterative refinement)
+
+iPLAN ships its own pinned Python 3.8 / `torch==1.10.1+cu113` stack
+that is incompatible with the shared `.venv` used by HouseGAN++ /
+House-Diffusion / DiffPlanner, so it lives in a dedicated `iplan` conda
+env. The setup script bootstraps it on first run.
+
+### 1. One-Time Dataset Prep
+
+If you have not already, download the RPLAN floorplan PNGs:
+
+```bash
+# from the repo root
+./prepare_rplan_hypergraph.sh
+```
+
+This places the PNGs at
+`dataset/rplan/dataset_original/floorplan_dataset/*.png`. iPLAN's
+`.mat` files are derived from these in step 2.
+
+### 2. One-Command iPLAN Setup
+
+```bash
+cd benchmark
+./setup_iplan.sh
+```
+
+This will (idempotently):
+
+- Clone the iPLAN repository
+  (`https://github.com/hsalehipour/iPLAN-Interactive-and-Procedural-Layout-Planning.git`)
+  alongside the project
+- Apply 3 small inference-time patches to upstream iPLAN so its modules
+  can be imported and run from outside the iPLAN repo (these fix
+  pre-existing import-shadowing and cwd-relative path bugs in the
+  upstream code; not algorithm changes)
+- Create the `iplan` conda env if missing and `pip install` a
+  version-pinned dependency list (Python 3.8 + the cu113 torch wheel
+  from PyTorch's own index)
+- Download the iPLAN trained-model bundle from the official Google
+  Drive folder using `gdown` and lay each `.pth` / `.pkl` at the exact
+  path the evaluator's `_load_iplan_models()` expects
+- Build `dataset/rplan/dataset_iplan/` by running
+  `benchmark/utils/convert_png_to_iplan_mat.py` on RPLAN's test split
+  (~12,110 `.mat` files; ~4 minutes on 64 cores)
+
+Useful flags: `--force-checkpoints`, `--force-dataset`,
+`--force-patches`, `--force-env`, `--skip-dataset`.
+
+### 3. Evaluate
+
+Run the full cascade once and cache the post-processed records:
+
+```bash
+conda activate iplan
+cd <repo root>
+python -m benchmark.src.evaluate_iplan \
+    --iplan_data_dir dataset/rplan/dataset_iplan \
+    --iplan_root     ../iPlan \
+    --save_generations cache/iplan_ourII_test.pkl \
+    --out benchmark/eval_results_iplan_ourII
+```
+
+Re-score from the cache as many times as you like (no GPU required):
+
+```bash
+python -m benchmark.src.evaluate_iplan \
+    --load_generations cache/iplan_ourII_test.pkl \
+    --out benchmark/eval_results_iplan_ourII
+```
+
+Both inputs and ground truth are read from the same iPLAN `.mat` file
+(`Boundary`, `gt_rTypes`, `gt_rBoxes` for GT; `rTypes` is seeded from
+`gt_rTypes` and Stage 2/3 fill in `rCenters` / `rBoxes`). This
+sidesteps any cross-format coordinate-frame or category-vocabulary
+mapping and keeps the evaluation strictly inside iPLAN's native 128px
+13-class space. There is no `eval_iplan.sh` wrapper today; the two
+commands above are the recommended invocations.
+
+---
+
 ## Evaluation Metrics
 
 All evaluation scripts delegate statistics computation, printing, and
 file output to `utils/report_results.py`. Per-script metric coverage:
 
-| Metric | HouseGAN++ | House-Diffusion | DiffPlanner |
-|---|:---:|:---:|:---:|
-| **GED** | yes | yes | -- |
-| **Room Accuracy** (combined / count / type) | yes | yes | yes |
-| **Delta (Room Similarity)** | yes | yes | yes |
-| **Area Proportion Error** | yes | yes | yes |
-| **Boundary Gap Ratio** | -- | -- | yes |
+| Metric | HouseGAN++ | House-Diffusion | DiffPlanner | iPLAN |
+|---|:---:|:---:|:---:|:---:|
+| **GED** | yes | yes | -- | -- |
+| **Room Accuracy** (combined / count / type) | yes | yes | yes | yes |
+| **Delta (Room Similarity)** | yes | yes | yes | yes |
+| **Area Proportion Error** | yes | yes | yes | yes |
+| **Spatial Overlap Ratio** (no boundary) | yes | yes | -- | -- |
+| **Boundary geometry triplet** (gap / outside / overlap) | -- | -- | yes | yes |
 
 Definitions:
 
@@ -203,17 +297,35 @@ Definitions:
   rooms" means the rooms that survive post-processing (rooms whose
   `r_boundary_aligned` was dropped by `regularize_fp` or covered by a
   sibling in `get_room_boundary` are counted as lost). The lost-room
-  rate is also reported as `Hidden rooms` in `results.txt`.
+  rate is also reported as `Hidden rooms` in `results.txt`. For iPLAN,
+  predicted rooms are read from the rasterized 128px Stage-3 layout (one
+  bbox per connected component, including the Living room which iPLAN
+  recovers as the leftover interior).
 - **Delta (Room Similarity)** -- Geometric shape similarity between
   matched predicted and ground-truth room pairs, based on area and
   perimeter ratios.
 - **Area Proportion Error** -- Mean absolute difference between
   room-area proportions of paired predicted and ground-truth rooms of
   the same type.
-- **Boundary Gap Ratio** *(DiffPlanner only)* -- Fraction of the input
-  boundary polygon NOT covered by the union of post-aligned predicted
-  rooms. Quantifies the visible "gap" artifacts produced by the cascade
-  + post-processing pipeline. 0.0 = perfect tiling, 1.0 = no rooms.
+- **Spatial Overlap Ratio** *(HouseGAN++ / House-Diffusion)* --
+  `1 - area(union(pred)) / sum(area(pred_i))`. Captures inter-room
+  overlap only; not normalized by an input boundary because the
+  WMR24-conditioned models are not given one.
+- **Boundary geometry triplet** *(DiffPlanner / iPLAN)* -- Three
+  complementary ratios, all normalized by the input boundary area F so
+  values are directly comparable across samples and methods. Let
+  `U = union of predicted room polygons` and
+  `S = sum of their individual areas`:
+
+  | Metric | Formula | Ideal | Failure mode it catches |
+  |---|---|---|---|
+  | **`gap_ratio`** | `area(F − U) / area(F)` | 0 | predicted rooms leave the boundary uncovered |
+  | **`outside_ratio`** | `area(U − F) / area(F)` | 0 | predicted rooms spill outside the boundary |
+  | **`overlap_ratio`** | `(S − area(U)) / area(F)` | 0 | rooms double-count area by overlapping each other |
+
+  See `compute_boundary_geometry_metrics()` in
+  `evaluate_diffplanner.py` and `evaluate_iplan.py` for the exact
+  Shapely implementation.
 
 All metrics are saved to `results.npz` and a human-readable
 `results.txt` summary.
@@ -273,6 +385,35 @@ split. Idempotent; pass `--force-checkpoints` to re-download the
 The script assumes the dataset JSONs themselves were already produced
 by `./prepare_rplan_hypergraph.sh` from the repo root.
 
+### `setup_iplan.sh`
+
+Complete automated setup for iPLAN evaluation on the RPLAN test split
+in `OurII` mode. Five idempotent steps; pass `--force-checkpoints`,
+`--force-dataset`, `--force-patches`, `--force-env`, or
+`--skip-dataset` to override individual stages.
+
+1. Clones the iPLAN repo (`hsalehipour/iPLAN-Interactive-and-Procedural-Layout-Planning`)
+   alongside the project (skipped if already present)
+2. Applies 3 small inference-time patches to upstream iPLAN
+   (`room_partition/models/__init__.py`, `loss_layer.py`, `net.py`)
+   that fix pre-existing import-shadowing and cwd-relative path bugs.
+   Marker file `<iPlan>/.hf_inference_patches_applied` makes re-runs a
+   no-op.
+3. Creates the `iplan` conda env with Python 3.8 and `pip install`s a
+   version-pinned dependency list (including the cu113 torch wheel
+   from PyTorch's own index). Existing envs are left alone unless
+   `--force-env` is passed.
+4. Downloads the iPLAN trained-model bundle from the official Google
+   Drive folder using `gdown` and lays out 8 weight files
+   (`<iPlan>/room_location/{pretrained_model,weights}/*.pth` and
+   `<iPlan>/room_partition/weights/{G_net_210.pth,renderer.pkl}`).
+5. Builds `dataset/rplan/dataset_iplan/` from
+   `dataset_original/floorplan_dataset/*.png` via
+   `benchmark/utils/convert_png_to_iplan_mat.py` (~12,110 `.mat` files).
+
+The script assumes `./prepare_rplan_hypergraph.sh` has already
+populated the original RPLAN PNGs in `dataset_original/`.
+
 ### `eval_houseganpp.sh`
 
 Evaluate a trained HouseGAN++ model.  Supports generation caching via
@@ -282,9 +423,10 @@ Evaluate a trained HouseGAN++ model.  Supports generation caching via
 
 Evaluate a trained House-Diffusion model.  Same caching support as above.
 
-DiffPlanner has no `eval_*.sh` wrapper today; see the
-[Quick Start: DiffPlanner](#quick-start-diffplanner) section for the
-recommended invocation.
+DiffPlanner and iPLAN have no `eval_*.sh` wrappers today; see the
+[Quick Start: DiffPlanner](#quick-start-diffplanner) and
+[Quick Start: iPLAN](#quick-start-iplan) sections for the recommended
+invocations.
 
 ---
 
@@ -326,8 +468,9 @@ Evaluate House-Diffusion with the same four metrics.
 ### `src/evaluate_diffplanner.py`
 
 Evaluate DiffPlanner's `b+nc` cascade end-to-end on the RPLAN test
-split. Computes delta, area proportion error, boundary gap ratio, and
-the three room-accuracy sub-scores (combined / count / type).
+split. Computes delta, area proportion error, the boundary geometry
+triplet (gap / outside / overlap ratios), and the three
+room-accuracy sub-scores (combined / count / type).
 
 - Loads all three sub-model checkpoints (NodeDiff, AdjacencyDiff,
   PartitioningDiff) and runs the cascade in-memory in batches
@@ -338,6 +481,36 @@ the three room-accuracy sub-scores (combined / count / type).
 - Generation caching via `--save_generations` / `--load_generations`
   (post-processed records are pickled, so re-scoring metrics is GPU-free)
 - Supports `--use_ddim` for ~10x faster sampling than ancestral DDPM
+
+### `src/evaluate_iplan.py`
+
+Evaluate iPLAN's `OurII` cascade on the RPLAN test split (Stage 1
+skipped; Stage 2 + Stage 3 run with ground-truth room types as input).
+Computes delta, area proportion error, the boundary geometry triplet,
+and the three room-accuracy sub-scores. **Must run inside the `iplan`
+conda env** -- iPLAN's pinned torch / cv2 stack is not in the shared
+`.venv`.
+
+- Loads Stage 2 (Living + Location ResNet18+ASPP) and Stage 3 (G_net
+  GAN + renderer) checkpoints from the iPLAN repo, then runs both
+  stages per sample
+- Stage 2 is iteratively re-rolled (default 50 attempts) when
+  `get_rcenters` fails to place all rooms; falls back to the
+  most-complete partial placement so Stage 3 still has centers to
+  partition over
+- Reads BOTH inputs (`Boundary`, `gt_rTypes`) and ground truth
+  (`gt_rTypes`, `gt_rBoxes`) from the same iPLAN `.mat` file --
+  no cross-format coordinate or category mapping is needed
+- Predicted rooms come from connected-component analysis of the
+  rasterized 128px Stage-3 layout, so the Living room (which iPLAN
+  recovers as the leftover interior, not a predicted bbox) is included
+- Generation caching via `--save_generations` / `--load_generations`
+  (cached records are pickled `.mat`-style dicts, so re-scoring is
+  GPU-free and doesn't even need the iPLAN repo)
+- Python-3.8-friendly: imports `utils.metrics` and
+  `utils.report_results` by absolute file path so the evaluator runs
+  inside iPLAN's pinned env without dragging in the rest of the
+  HypergraphFormer Python-3.10 stack
 
 ---
 
@@ -368,6 +541,21 @@ room taxonomy (`living`, `bed`, `kitchen`, `bath`, `foyer`, `extra`)
 onto DiffPlanner's 6-class category id space (0..5) and emits per-sample
 records with `rooms[*].{id, category, r_boundary, size, location, box,
 order}`, `adjacencies`, and `access_adjacencies`.
+
+### `utils/convert_png_to_iplan_mat.py`
+
+Convert original RPLAN PNGs to iPLAN's native `.mat` format for a given
+split. Wraps iPLAN's own `FloorPlan` parser (no algorithm changes) and
+parallelises across CPU workers. The output `.mat` carries `name`,
+`Boundary`, `gt_rTypes`, `gt_rBoxes`, `rTypes`, `rBoxes`, `rCenters`
+fields and is the canonical input for `evaluate_iplan.py`. Runs inside
+the `iplan` conda env (needs iPLAN's pinned `scipy` and `cv2`); the
+default `--out-dir` points directly at
+`dataset/rplan/dataset_iplan/` so re-running `setup_iplan.sh` is
+sufficient to refresh the dataset. Honors iPLAN's shipped split lists
+(`<iplan-root>/data/{train,val,test}.txt`) so we evaluate on the same
+test split iPLAN was trained against. Default `test` split has 12,110
+entries; ~4 minutes on 64 cores.
 
 ### `utils/visualize_diffplanner.py`
 
@@ -452,6 +640,26 @@ Produced by `convert_json_to_npz.py`:
 | `gen_masks` | `(N, 100, 100)` | Generation masks |
 | `ids` | `(N,)` object | Sample ID strings |
 
+### iPLAN `.mat` Format
+
+Produced by `convert_png_to_iplan_mat.py` (one file per RPLAN sample,
+under `dataset/rplan/dataset_iplan/<id>.mat`). Each file has a top-level
+`data` struct with the fields:
+
+| Field | Shape | Description |
+|---|---|---|
+| `name` | scalar string | Source PNG filename |
+| `Boundary` | `(N_v, 4)` int | Boundary polygon vertices `(y, x, dir, isNew)`; first two points indicate the front door |
+| `gt_rTypes` | `(1, R_gt)` int | Ground-truth room categories (iPLAN 13-class vocab) |
+| `gt_rBoxes` | `(R_gt, 4)` int | Ground-truth axis-aligned room boxes `(y0, x0, y1, x1)` in 128-grid pixels |
+| `rTypes` | `(1, R_pred)` int | Inference-filled predicted room types (Stage 1 output, or seeded from `gt_rTypes` in OurII mode) |
+| `rCenters` | `(R_pred, 2)` int | Stage 2 predicted room centers |
+| `rBoxes` | `(R_pred, 4)` int | Stage 3 predicted axis-aligned room boxes |
+
+Coordinate conventions in `.mat` files come straight from iPLAN's
+upstream parser, so `(y, x)` ordering is preserved; `evaluate_iplan.py`
+swaps to `(x, y)` for Shapely internally.
+
 ### Room Type Mapping
 
 | WMR24 mergeid | RPLAN ID | Room Type | HouseGAN++ Color |
@@ -474,6 +682,7 @@ benchmark/
 ├── setup_houseganpp.sh                  # HouseGAN++ automated setup
 ├── setup_housediffusion.sh              # House-Diffusion automated setup
 ├── setup_diffplanner.sh                 # DiffPlanner automated setup
+├── setup_iplan.sh                       # iPLAN automated setup (clone+patch+env+weights+data)
 ├── eval_houseganpp.sh                   # HouseGAN++ evaluation launcher
 ├── eval_housediffusion.sh               # House-Diffusion evaluation launcher
 │
@@ -481,13 +690,15 @@ benchmark/
 │   ├── dataset_loader.py                # Shared PyTorch dataset module
 │   ├── evaluate_houseganpp.py           # HouseGAN++ evaluation (WMR24)
 │   ├── evaluate_housediffusion.py       # House-Diffusion evaluation (WMR24)
-│   └── evaluate_diffplanner.py          # DiffPlanner b+nc cascade evaluation (RPLAN)
+│   ├── evaluate_diffplanner.py          # DiffPlanner b+nc cascade evaluation (RPLAN)
+│   └── evaluate_iplan.py                # iPLAN OurII cascade evaluation (RPLAN, runs in iplan conda env)
 │
 ├── utils/                               # Utility and conversion scripts
 │   ├── convert_hypergraph_to_housegan_json.py  # WMR24 JSON → HouseGAN++ JSON
 │   ├── convert_hypergraph_to_diffplanner.py    # WMR24 JSON → DiffPlanner JSON
 │   ├── convert_json_to_pickle.py               # HouseGAN++ JSON → pickle
 │   ├── convert_json_to_npz.py                  # HouseGAN++ JSON → NPZ
+│   ├── convert_png_to_iplan_mat.py             # RPLAN PNG → iPLAN .mat (parallel)
 │   ├── visualize_rplan_json.py                 # RPLAN JSON visualization
 │   └── visualize_diffplanner.py                # DiffPlanner panel renderer (GT/pred)
 │
