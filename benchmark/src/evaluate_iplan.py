@@ -27,11 +27,21 @@ Metrics computed (per sample):
   2. ``area_proportion_error``   Mean absolute area-proportion difference
                                   between paired rooms
                                   (``compute_room_area_proportion_error``).
-  3. ``spatial_overlap_ratio``   Fraction of the total predicted room
-                                  area that is lost to inter-room overlap
-                                  (``1 - union_area / sum_of_areas``).
-                                  Mirrors the polygon-based metric in
-                                  ``evaluate_housediffusion.py``.
+  3. Boundary-aware geometry metrics (all normalized by the input
+     boundary area F, so values are comparable across samples and
+     methods; see :func:`compute_boundary_geometry_metrics`):
+
+       * ``gap_ratio``     -- area(F − U) / area(F):
+                              fraction of the boundary left uncovered.
+                              Ideal = 0.
+       * ``outside_ratio`` -- area(U − F) / area(F):
+                              predicted room area spilling outside
+                              the boundary, normalized by F. Ideal = 0.
+       * ``overlap_ratio`` -- (S − area(U)) / area(F):
+                              total area double-counted by overlapping
+                              rooms, normalized by F. Ideal = 0.
+
+     where U = union of predicted room polygons, S = sum of their areas.
   4. Room accuracy (combined / count-only / type-only)
                                  (``room_type_accuracy``).
 
@@ -503,7 +513,7 @@ def run_iplan_one(mat_path_in: Path, models: dict,
     if n_placed == 0:
         # Stage 2 produced no centers; Stage 3 cannot run. Return a record
         # marked 'failed' so downstream metrics see an empty prediction
-        # (no pred polygons -> spatial_overlap_ratio = NaN, no matched rooms).
+        # (no pred polygons -> gap_ratio = 1.0, no matched rooms).
         rec = _read_iplan_mat_meta(str(mat_path))
         rec["layout"] = np.full((IPLAN_CANVAS_SIZE, IPLAN_CANVAS_SIZE), 13,
                                 dtype=np.int16).tolist()
@@ -614,32 +624,71 @@ def _to_area_list(rooms: list[dict]) -> list[tuple[str, float]]:
             for r in rooms]
 
 
-def compute_spatial_overlap_ratio(pred_rooms: list[dict]) -> float:
-    """Fraction of the total predicted room area lost to inter-room overlap:
-    ``1 - union_area / sum_of_areas``.
+def _boundary_polygon_from_iplan(record: dict) -> Optional[ShapelyPolygon]:
+    """Building outline as a Shapely polygon, in iPLAN's 128 frame.
 
-    Mirrors :func:`compute_spatial_overlap_ratio_from_polygons` in
-    :mod:`evaluate_housediffusion`. A perfectly tiled apartment with no
-    overlapping room polygons returns 0.0; if every pair of rooms fully
-    overlaps, the ratio approaches ``(N - 1) / N``. Returns NaN if no
-    valid room polygons exist for this prediction.
+    iPLAN's ``Boundary`` is an ``N x 4`` array of ``[row, col, dir, isNew]``
+    rows produced by contour-walking the boundary mask in
+    ``data/preprocess/floorplan.py`` (so col 0 holds image *row* = y, and
+    col 1 holds image *col* = x). We swap to ``(x, y)`` for Shapely.
 
-    Note on the choice of polygon-based vs. mask-based: iPLAN's final
-    layout is a *one-hot* pixel labelling (each pixel belongs to exactly
-    one room code), so a per-pixel mask-based overlap ratio would be
-    trivially 0 by construction. The polygons we extract are the
-    axis-aligned bounding boxes of the connected components of each
-    code, which CAN overlap when a room's bbox intrudes onto a
-    neighbour (e.g. an L-shaped bedroom whose bbox covers part of the
-    adjacent kitchen). That's the meaningful signal to surface.
+    This matches the same indexing used elsewhere in the iPLAN cascade,
+    e.g. ``synth/test_roompartition.py`` permutes ``boundary[:, [1, 0, 2, 3]]``
+    before passing it to the partition network.
     """
+    coords_yx = record.get("Boundary_iplan")
+    if not coords_yx:
+        return None
+    coords = [[float(p[1]), float(p[0])] for p in coords_yx if len(p) >= 2]
+    return _shapely_polygon_safe(coords)
+
+
+def compute_boundary_geometry_metrics(record: dict,
+                                      pred_rooms: list[dict]) -> dict[str, float]:
+    """Compute the three boundary-normalized geometry metrics for one
+    sample. All denominators are ``area(F)`` (the input boundary area),
+    so values are directly comparable across samples and methods.
+
+    Returns a dict with keys ``gap_ratio``, ``outside_ratio``,
+    ``overlap_ratio``. Each is NaN if F is degenerate; ``gap_ratio`` is
+    1.0 (and the others 0.0) if there are no valid room polygons.
+
+    Identities (per inclusion-exclusion):
+        S / area(F) = coverage_ratio + outside_ratio + overlap_ratio
+        gap_ratio   = 1 - coverage_ratio
+    where coverage_ratio = area(U ∩ F) / area(F).
+
+    Note on iPLAN's representation: the predicted polygons are the
+    axis-aligned bounding boxes of connected components in iPLAN's
+    one-hot layout. So a non-rectangular room (e.g. L-shaped) will have
+    a bbox that *overlaps* with a neighbour (-> contributes to
+    ``overlap_ratio``) AND *spills outside* the boundary in the L-cutout
+    region (-> contributes to ``outside_ratio``). The two signals
+    together let you read off how much of the geometry tax is due to
+    the bbox representation vs. genuine misalignment.
+    """
+    boundary = _boundary_polygon_from_iplan(record)
+    if boundary is None or boundary.area <= 0:
+        return {"gap_ratio": float("nan"),
+                "outside_ratio": float("nan"),
+                "overlap_ratio": float("nan")}
+
+    F_area = boundary.area
     if not pred_rooms:
-        return float("nan")
-    sum_of_areas = sum(r["polygon"].area for r in pred_rooms)
-    if sum_of_areas <= 0:
-        return float("nan")
-    union_area = unary_union([r["polygon"] for r in pred_rooms]).area
-    return float(max(0.0, 1.0 - union_area / sum_of_areas))
+        return {"gap_ratio": 1.0, "outside_ratio": 0.0, "overlap_ratio": 0.0}
+
+    polys = [r["polygon"] for r in pred_rooms]
+    union = unary_union(polys)
+    sum_areas = sum(p.area for p in polys)
+    inter_area = union.intersection(boundary).area
+    union_area = union.area
+
+    gap_ratio = max(0.0, 1.0 - inter_area / F_area)
+    outside_ratio = max(0.0, (union_area - inter_area) / F_area)
+    overlap_ratio = max(0.0, (sum_areas - union_area) / F_area)
+    return {"gap_ratio": float(gap_ratio),
+            "outside_ratio": float(outside_ratio),
+            "overlap_ratio": float(overlap_ratio)}
 
 
 # =====================================================================
@@ -664,7 +713,7 @@ def evaluate_sample(record: dict, *, pp_status: str, results: dict) -> None:
         _to_area_list(pred_rooms), _to_area_list(gt_rooms)
     )
 
-    overlap_ratio = compute_spatial_overlap_ratio(pred_rooms)
+    geom = compute_boundary_geometry_metrics(record, pred_rooms)
 
     pred_labels = [IPLAN_ID_TO_MERGE_ID.get(r["category"], str(r["category"]))
                    for r in pred_rooms]
@@ -680,7 +729,9 @@ def evaluate_sample(record: dict, *, pp_status: str, results: dict) -> None:
         float(delta) if delta is not None else float("nan"))
     results["area_proportion_errors"].append(
         float(area_metric["area_proportion_error"]))
-    results["spatial_overlap_ratios"].append(float(overlap_ratio))
+    results["gap_ratios"].append(geom["gap_ratio"])
+    results["outside_ratios"].append(geom["outside_ratio"])
+    results["overlap_ratios"].append(geom["overlap_ratio"])
     results["accuracies"].append(float(rt_metric["accuracy"]))
     results["room_count_accuracies"].append(float(rt_metric["room_count_accuracy"]))
     results["room_type_accuracies"].append(float(rt_metric["room_type_accuracy"]))
@@ -700,7 +751,9 @@ def _make_results_dict() -> dict:
     return {
         "similarity_scores": [],
         "area_proportion_errors": [],
-        "spatial_overlap_ratios": [],
+        "gap_ratios": [],
+        "outside_ratios": [],
+        "overlap_ratios": [],
         "accuracies": [],
         "room_count_accuracies": [],
         "room_type_accuracies": [],
@@ -813,8 +866,12 @@ def _build_report_kwargs(results: dict) -> dict:
                                   np.array(results["similarity_scores"])),
             "area_proportion_errors": ("Area Proportion Error",
                                        np.array(results["area_proportion_errors"])),
-            "spatial_overlap_ratios": ("Spatial Overlap Ratio",
-                                       np.array(results["spatial_overlap_ratios"])),
+            "gap_ratios": ("Gap Ratio (uncovered boundary)",
+                           np.array(results["gap_ratios"])),
+            "outside_ratios": ("Outside Ratio (rooms outside boundary)",
+                               np.array(results["outside_ratios"])),
+            "overlap_ratios": ("Overlap Ratio (inter-room overlap)",
+                               np.array(results["overlap_ratios"])),
             "accuracies": ("Room Accuracy (combined)",
                            np.array(results["accuracies"])),
             "room_count_accuracies": ("Room Count Accuracy",
@@ -906,7 +963,7 @@ def main() -> int:
                     print(f"\n  [{name}] inference failed: {exc}")
                     # Keep GT fields even on failure so per-sample metrics
                     # still see something to compare against (predictions
-                    # will be empty -> spatial_overlap_ratio = NaN, etc.).
+                    # will be empty -> gap_ratio = 1.0, etc.).
                     try:
                         rec = _read_iplan_mat_meta(str(src_mat))
                     except Exception:

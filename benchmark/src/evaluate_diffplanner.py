@@ -18,18 +18,28 @@ For each test sample we run the full 3-stage cascade --
                                cuts precise polygons, fills the living-room
                                with leftover gaps.
 
--- and compute three metrics against ground truth:
+-- and compute these metrics against ground truth:
 
   1. ``delta``                        Room shape regularity deviation
                                        (``compute_room_similarity_score``).
   2. ``area_proportion_error``        Mean absolute area-proportion difference
                                        between paired rooms
                                        (``compute_room_area_proportion_error``).
-  3. ``boundary_gap_ratio``  (NEW)    Fraction of the input boundary polygon
-                                       that is NOT covered by the union of the
-                                       predicted (post-aligned) room polygons.
-                                       Captures gaps left by the cascade /
-                                       post-processing as an artifact metric.
+  3. Boundary-aware geometry metrics (all normalized by the input
+     boundary area F, so values are comparable across samples and
+     methods; see :func:`compute_boundary_geometry_metrics`):
+
+       * ``gap_ratio``     -- area(F − U) / area(F):
+                              fraction of the boundary left uncovered.
+                              Ideal = 0.
+       * ``outside_ratio`` -- area(U − F) / area(F):
+                              predicted room area spilling outside
+                              the boundary, normalized by F. Ideal = 0.
+       * ``overlap_ratio`` -- (S − area(U)) / area(F):
+                              total area double-counted by overlapping
+                              rooms, normalized by F. Ideal = 0.
+
+     where U = union of predicted room polygons, S = sum of their areas.
 
 Caching mirrors ``benchmark/src/evaluate_housediffusion.py`` -- ``--save_generations``
 writes a pickle of the post-processed DiffPlanner JSON records so a re-run of
@@ -753,32 +763,51 @@ def _to_area_list(rooms: list[dict]) -> list[tuple[str, float]]:
     ]
 
 
-def _boundary_polygon(sample: dict) -> Optional[ShapelyPolygon]:
+def _boundary_polygon(record: dict) -> Optional[ShapelyPolygon]:
     """Build the building outline as a Shapely polygon (defensive)."""
-    coords = sample.get("boundary_expand") or [
-        [p[0], p[1]] for p in sample.get("boundary", []) if len(p) >= 2
+    coords = record.get("boundary_expand") or [
+        [p[0], p[1]] for p in record.get("boundary", []) if len(p) >= 2
     ]
     return _shapely_polygon_safe(coords)
 
 
-def compute_boundary_gap_ratio(record: dict) -> float:
-    """NEW METRIC: fraction of the input boundary polygon that is NOT covered
-    by the union of the predicted (post-aligned) room polygons.
+def compute_boundary_geometry_metrics(record: dict) -> dict[str, float]:
+    """Compute the three boundary-normalized geometry metrics for one
+    sample. All denominators are ``area(F)`` (the input boundary area),
+    so values are directly comparable across samples and methods.
 
-    A perfectly tiled apartment returns 0.0; an empty prediction returns 1.0.
-    Returns NaN if the boundary itself is degenerate.
+    Returns a dict with keys ``gap_ratio``, ``outside_ratio``,
+    ``overlap_ratio``. Each is NaN if F is degenerate; ``gap_ratio`` is
+    1.0 (and the others 0.0) if there are no valid room polygons.
+
+    Identities (per inclusion-exclusion):
+        S / area(F) = coverage_ratio + outside_ratio + overlap_ratio
+        gap_ratio   = 1 - coverage_ratio
+    where coverage_ratio = area(U ∩ F) / area(F).
     """
     boundary = _boundary_polygon(record)
     if boundary is None or boundary.area <= 0:
-        return float("nan")
+        return {"gap_ratio": float("nan"),
+                "outside_ratio": float("nan"),
+                "overlap_ratio": float("nan")}
 
     rooms = _aligned_polygons_from_record(record)
+    F_area = boundary.area
     if not rooms:
-        return 1.0
+        return {"gap_ratio": 1.0, "outside_ratio": 0.0, "overlap_ratio": 0.0}
 
-    union_pred = unary_union([r["polygon"] for r in rooms])
-    covered = union_pred.intersection(boundary).area
-    return float(max(0.0, 1.0 - covered / boundary.area))
+    polys = [r["polygon"] for r in rooms]
+    union = unary_union(polys)
+    sum_areas = sum(p.area for p in polys)
+    inter_area = union.intersection(boundary).area
+    union_area = union.area
+
+    gap_ratio = max(0.0, 1.0 - inter_area / F_area)
+    outside_ratio = max(0.0, (union_area - inter_area) / F_area)
+    overlap_ratio = max(0.0, (sum_areas - union_area) / F_area)
+    return {"gap_ratio": float(gap_ratio),
+            "outside_ratio": float(outside_ratio),
+            "overlap_ratio": float(overlap_ratio)}
 
 
 # =====================================================================
@@ -797,7 +826,7 @@ def evaluate_sample(
     Metrics computed (per sample):
       - delta (room similarity score)
       - area_proportion_error
-      - boundary_gap_ratio
+      - gap_ratio, outside_ratio, overlap_ratio (boundary-normalized)
       - room accuracy (combined / count-only / type-only)
 
     Side-effect counters: raw_fallback_count, lost_room_count,
@@ -814,7 +843,7 @@ def evaluate_sample(
     area_gt = _to_area_list(gt_rooms)
     area_metric = compute_room_area_proportion_error(area_pred, area_gt)
 
-    gap_ratio = compute_boundary_gap_ratio(pred_record)
+    geom = compute_boundary_geometry_metrics(pred_record)
 
     # Room accuracy: only count rooms whose post-aligned polygon survives
     # (the ones the renderer would actually paint). Lost rooms are tracked
@@ -828,7 +857,9 @@ def evaluate_sample(
 
     results["similarity_scores"].append(float(delta) if delta is not None else float("nan"))
     results["area_proportion_errors"].append(float(area_metric["area_proportion_error"]))
-    results["boundary_gap_ratios"].append(float(gap_ratio))
+    results["gap_ratios"].append(geom["gap_ratio"])
+    results["outside_ratios"].append(geom["outside_ratio"])
+    results["overlap_ratios"].append(geom["overlap_ratio"])
     results["accuracies"].append(float(rt_metric["accuracy"]))
     results["room_count_accuracies"].append(float(rt_metric["room_count_accuracy"]))
     results["room_type_accuracies"].append(float(rt_metric["room_type_accuracy"]))
@@ -846,7 +877,9 @@ def _make_results_dict() -> dict:
     return {
         "similarity_scores": [],
         "area_proportion_errors": [],
-        "boundary_gap_ratios": [],
+        "gap_ratios": [],
+        "outside_ratios": [],
+        "overlap_ratios": [],
         "accuracies": [],
         "room_count_accuracies": [],
         "room_type_accuracies": [],
@@ -980,8 +1013,12 @@ def _build_report_kwargs(results: dict) -> dict:
                                   np.array(results["similarity_scores"])),
             "area_proportion_errors": ("Area Proportion Error",
                                        np.array(results["area_proportion_errors"])),
-            "boundary_gap_ratios": ("Boundary Gap Ratio (predicted)",
-                                    np.array(results["boundary_gap_ratios"])),
+            "gap_ratios": ("Gap Ratio (uncovered boundary)",
+                           np.array(results["gap_ratios"])),
+            "outside_ratios": ("Outside Ratio (rooms outside boundary)",
+                               np.array(results["outside_ratios"])),
+            "overlap_ratios": ("Overlap Ratio (inter-room overlap)",
+                               np.array(results["overlap_ratios"])),
             "accuracies": ("Room Accuracy (combined)",
                            np.array(results["accuracies"])),
             "room_count_accuracies": ("Room Count Accuracy",
