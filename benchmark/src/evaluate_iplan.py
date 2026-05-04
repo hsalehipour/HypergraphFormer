@@ -201,7 +201,8 @@ IPLAN_CANVAS_SIZE = 128
 
 
 # =====================================================================
-# iPLAN cascade plumbing -- modeled after tools/run_ourII_and_visualize.py
+# iPLAN cascade plumbing -- modeled after iPLAN's own per-stage scripts
+# (synth/test_roomlocation.py, synth/test_roompartition.py).
 # =====================================================================
 
 def _add_iplan_to_path(iplan_root: Path) -> None:
@@ -215,9 +216,9 @@ def _load_iplan_models(iplan_root: Path, device_str: str) -> dict:
     """Instantiate Stage-2 (living + location) and Stage-3 (G_net) models
     once and return them as a single bundle dict.
 
-    Mirrors :func:`tools/run_ourII_and_visualize._load_*` from the iPlan
-    repo. Pulled inline here so the evaluator doesn't depend on the
-    visualisation script being on PYTHONPATH.
+    Loads the same checkpoints iPLAN's own ``synth/test_roomlocation.py``
+    and ``synth/test_roompartition.py`` use at inference time -- pulled
+    inline so the evaluator doesn't depend on those CLI entry points.
     """
     import torch
     from room_location.Living import models as living_mod
@@ -322,10 +323,12 @@ def _run_stage2(mat_path: str, models: dict, max_iters: int = 50) -> tuple[bool,
     """Predict room centers (Stage 2). Writes back ``rCenters`` to the
     .mat. Returns ``(fully_converged, n_placed, n_target)``.
 
-    Mirrors :func:`tools/run_ourII_and_visualize._run_stage2`: re-rolls up
-    to ``max_iters`` times (because ``get_rcenters`` shuffles room order
-    internally) and falls back to the most-complete partial placement if
-    none of the attempts converges.
+    Mirrors the per-sample loop in iPLAN's ``synth/test_roomlocation.py``,
+    with one robustness tweak: re-roll up to ``max_iters`` times because
+    ``get_rcenters`` shuffles room order internally and a fresh seed per
+    attempt helps it converge. If no attempt converges fully, fall back
+    to the most-complete partial placement so Stage 3 still has centers
+    to partition over.
     """
     import scipy.io as sio
     import torch
