@@ -107,6 +107,12 @@ MAX_BOUNDARY_CORNERS = 40
 # 256x256 canvas (matches data_preparation.py).
 MIN_ROOM_AREA = 150
 
+# DiffPlanner's b+nc transformer tensorises rooms as ``8 x 5`` (see
+# ``MAX_NUM_ROOMS`` in ``benchmark/src/evaluate_diffplanner.py``). Samples
+# with more rooms cannot be evaluated, so the converter caps them by
+# default. Override with ``--max-rooms`` to lift / tighten the cap.
+DEFAULT_MAX_ROOMS = 8
+
 # Polygon comparisons can wobble by a fraction of a pixel after rounding;
 # we use these loose tolerances when checking the perfect-tiling gate.
 AREA_TOL_FRAC = 0.02  # |sum(rooms.area) - boundary.area| / boundary.area
@@ -439,13 +445,19 @@ def _build_boundary(
 
 # ── Core conversion ──────────────────────────────────────────────────
 
-def convert_entry(entry: dict) -> dict | None:
+def convert_entry(entry: dict, *, max_rooms: int = DEFAULT_MAX_ROOMS) -> dict | None:
     """Convert a single hypergraph entry to a DiffPlanner JSON dict.
 
     Returns None on failure (the caller logs and counts). Failure modes:
-    missing/invalid geometry, mergeid we cannot map, boundary > 40 corners,
-    coordinates out of [1, 254], room area < 150 px^2, or the rooms do not
-    tile the boundary.
+    missing/invalid geometry, mergeid we cannot map, ``> max_rooms`` rooms,
+    boundary > 40 corners, coordinates out of [COORD_MIN, COORD_MAX], room
+    area < 150 px^2, or the rooms do not tile the boundary.
+
+    Args:
+        entry: one record from the WMR24 list.
+        max_rooms: cap on number of rooms (default :data:`DEFAULT_MAX_ROOMS`,
+            i.e. 8 to match DiffPlanner's b+nc transformer). Pass ``0`` to
+            disable.
     """
     split_str = entry.get("split", "{}")
     hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
@@ -464,6 +476,8 @@ def convert_entry(entry: dict) -> dict | None:
     leaves = hg.leaves
     n_rooms = len(leaves)
     if n_rooms == 0:
+        return None
+    if max_rooms and n_rooms > max_rooms:
         return None
 
     # Reject samples whose mergeid we have no DiffPlanner mapping for.
@@ -649,6 +663,12 @@ def main():
         help="Output directory for per-sample JSON files "
              "(default: alongside input, named <stem>_diffplanner_json/)",
     )
+    parser.add_argument(
+        "--max-rooms", type=int, default=DEFAULT_MAX_ROOMS,
+        help=f"Skip samples with more than this many rooms "
+             f"(default: {DEFAULT_MAX_ROOMS}, matches DiffPlanner's b+nc "
+             "transformer; pass 0 to disable).",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -663,15 +683,38 @@ def main():
 
     logger.info("Loaded %d entries from %s", len(data), input_path)
     logger.info("Output directory: %s", output_dir)
+    logger.info("max_rooms cap: %s",
+                f"{args.max_rooms}" if args.max_rooms else "disabled")
 
     success = 0
-    failed = 0
+    failed = 0          # generic failure (geometry, validity gate, etc.)
+    skipped_rooms = 0   # too many rooms -- broken out so the user sees it
     failed_ids: list[str] = []
+    skipped_ids: list[str] = []
 
     for i, entry in enumerate(data):
         eid = entry.get("id", f"sample_{i}")
+
+        # Cheap pre-check so we can distinguish "too many rooms" from
+        # genuine conversion failures in the summary.
+        too_many = False
+        if args.max_rooms:
+            split_str = entry.get("split", "{}")
+            try:
+                hg_dict = json.loads(split_str) if isinstance(split_str, str) else split_str
+                hg = Hypergraph(hg_dict)
+                if len(hg.leaves) > args.max_rooms:
+                    too_many = True
+            except Exception:
+                pass  # fall through to convert_entry, which will fail cleanly
+
+        if too_many:
+            skipped_rooms += 1
+            skipped_ids.append(eid)
+            continue
+
         try:
-            result = convert_entry(entry)
+            result = convert_entry(entry, max_rooms=args.max_rooms)
         except Exception as exc:
             logger.debug("Entry %s failed: %s", eid, exc)
             result = None
@@ -689,19 +732,23 @@ def main():
         if (i + 1) % 100 == 0:
             logger.info("  processed %d/%d ...", i + 1, len(data))
 
+    excluded = set(failed_ids) | set(skipped_ids)
     list_path = output_dir / "list.txt"
     with open(list_path, "w") as f:
         for entry in data:
             eid = entry.get("id", "")
-            if eid not in failed_ids:
+            if eid and eid not in excluded:
                 f.write(f"{eid}.json\n")
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Converted: %d / %d", success, len(data))
-    logger.info("Failed:    %d", failed)
+    logger.info("Converted:        %d / %d", success, len(data))
+    logger.info("Skipped (>rooms): %d", skipped_rooms)
+    logger.info("Failed:           %d", failed)
+    if skipped_ids:
+        logger.info("Skipped IDs (first 20): %s", skipped_ids[:20])
     if failed_ids:
-        logger.info("Failed IDs (first 20): %s", failed_ids[:20])
+        logger.info("Failed IDs (first 20):  %s", failed_ids[:20])
     logger.info("Output:    %s", output_dir)
     logger.info("List file: %s", list_path)
     logger.info("=" * 60)
