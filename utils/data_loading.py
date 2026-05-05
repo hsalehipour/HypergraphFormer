@@ -37,6 +37,10 @@ def load_example_hypergraphs(examples_dir, num_examples=3, exclude_file=None, se
               When None, uses the global random state.
     """
     examples_dir = Path(examples_dir)
+
+    if num_examples is not None and num_examples <= 0:
+        return []
+
     example_files = list(examples_dir.glob("*.txt"))
 
     if not example_files:
@@ -155,10 +159,12 @@ class HypergraphDataset(Dataset):
 
     Args:
         file_paths: List of Path objects pointing to .txt JSON files
-        include_ground_truth: If True, each item includes 'ground_truth'
-                              parsed from the file's 'hypergraph' field.
-                              Set to False for rooms-only evaluation where
-                              ground truth comparison is not applicable.
+        include_ground_truth: If True, each item includes 'ground_truth' from the
+                              file's 'hypergraph' field when present; otherwise
+                              ``None`` (e.g. access-only eval files).
+                              Set to False to omit the key (rooms-only).
+        include_bounds: If True, each item includes 'bounds' parsed from the
+                        file's 'bounds' field (apartment footprint).
     """
 
     def __init__(self, file_paths, include_ground_truth=True):
@@ -184,10 +190,11 @@ class HypergraphDataset(Dataset):
         }
 
         if self.include_ground_truth:
-            hypergraph_str = data.get('hypergraph', '')
-            item['ground_truth'] = (
-                json.loads(hypergraph_str) if isinstance(hypergraph_str, str) else hypergraph_str
-            )
+            h = data.get("hypergraph")
+            if h is None or (isinstance(h, str) and not h.strip()):
+                item["ground_truth"] = None
+            else:
+                item["ground_truth"] = json.loads(h) if isinstance(h, str) else h
 
         return item
 

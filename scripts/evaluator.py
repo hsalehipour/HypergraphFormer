@@ -38,6 +38,10 @@ Usage:
     # Few-shot GPT
     python scripts/evaluator.py --mode fewshot-gpt --model gpt-4-turbo \\
         --dataset-dir data/test
+
+    # Zero-shot (no in-context examples) — works with both fewshot-qwen and fewshot-gpt
+    python scripts/evaluator.py --mode fewshot-gpt --model gpt-5.5 \\
+        --dataset-dir data/test --num-examples 0
 """
 
 from __future__ import annotations
@@ -694,8 +698,11 @@ class Evaluator(ABC):
         with open(fpath) as f:
             data = json.load(f)
         ag = data.get("accessgraph", {})
-        hg_str = data.get("hypergraph", "")
-        hg = json.loads(hg_str) if isinstance(hg_str, str) else hg_str
+        h = data.get("hypergraph")
+        if h is None or (isinstance(h, str) and not h.strip()):
+            hg = None
+        else:
+            hg = json.loads(h) if isinstance(h, str) else h
         bounds_str = data.get("bounds", "{}")
         bounds = json.loads(bounds_str) if isinstance(bounds_str, str) else bounds_str
         return {
@@ -1086,10 +1093,13 @@ class FewShotQwenEvaluator(Evaluator):
         from utils.prompts import create_structured_prompt
         from utils.data_loading import load_example_hypergraphs
 
-        examples = load_example_hypergraphs(
-            self.args.dataset_dir, self.args.num_examples,
-            exclude_file=sample["filename"], seed=self.args.seed,
-        )
+        if self.args.num_examples and self.args.num_examples > 0:
+            examples = load_example_hypergraphs(
+                self.args.dataset_dir, self.args.num_examples,
+                exclude_file=sample["filename"], seed=self.args.seed,
+            )
+        else:
+            examples = []
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
@@ -1175,10 +1185,13 @@ class FewShotGPTEvaluator(Evaluator):
         from utils.prompts import create_structured_prompt
         from utils.data_loading import load_example_hypergraphs
 
-        examples = load_example_hypergraphs(
-            self.args.dataset_dir, self.args.num_examples,
-            exclude_file=sample["filename"], seed=self.args.seed,
-        )
+        if self.args.num_examples and self.args.num_examples > 0:
+            examples = load_example_hypergraphs(
+                self.args.dataset_dir, self.args.num_examples,
+                exclude_file=sample["filename"], seed=self.args.seed,
+            )
+        else:
+            examples = []
         return create_structured_prompt(examples, sample["accessgraph"])
 
     def extract_hypergraph(self, response):
@@ -1280,8 +1293,13 @@ def cli():
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--nccl-timeout", type=int, default=7200)
 
-    # Few-shot
-    parser.add_argument("--num-examples", type=int, default=3)
+    # Few-shot (set --num-examples 0 for zero-shot prompting)
+    parser.add_argument(
+        "--num-examples",
+        type=int,
+        default=3,
+        help="Number of in-context examples for fewshot-* modes. Use 0 for zero-shot.",
+    )
     parser.add_argument("--gpu", type=int, default=0)
 
     vllm = parser.add_argument_group("vLLM (Qwen local inference; default on if installed)")

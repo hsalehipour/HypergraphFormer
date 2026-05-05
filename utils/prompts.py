@@ -103,6 +103,15 @@ def create_structured_prompt(examples, target_accessgraph=None):
             When None, produces a generic generation prompt instead.
     """
 
+    has_examples = bool(examples)
+
+    intro_examples_line = (
+        "You will be shown examples of access graphs paired with their corresponding hypergraphs, "
+        "then generate a new hypergraph following the same structure and rules."
+        if has_examples
+        else "Generate a hypergraph for the given access graph following the structure and rules below."
+    )
+
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
 Your task is to learn how to generate a hypergraph from an access graph. An access graph is a simple representation of room connectivity:
@@ -111,26 +120,27 @@ Your task is to learn how to generate a hypergraph from an access graph. An acce
 
 {_OUTSIDE_RULES_TEXT_1}
 
-You will be shown examples of access graphs paired with their corresponding hypergraphs, then generate a new hypergraph following the same structure and rules.
+{intro_examples_line}
 
 {BSP_RULES_TEXT}
-
-# TRAINING EXAMPLES (Access Graph → Hypergraph):
-
-Below are examples showing how access graphs map to hypergraphs. Learn from these input-output pairs:
-
 """
 
-    for i, example in enumerate(examples, 1):
-        prompt += f"\n## Example {i} ({example['filename']}):\n\n"
-        prompt += "### Input - Access Graph:\n"
-        prompt += "```json\n"
-        prompt += json.dumps(example['accessgraph'], indent=2)
-        prompt += "\n```\n\n"
-        prompt += "### Output - Hypergraph:\n"
-        prompt += "```json\n"
-        prompt += json.dumps(example['hypergraph'], indent=2)
-        prompt += "\n```\n"
+    if has_examples:
+        prompt += (
+            "\n# TRAINING EXAMPLES (Access Graph → Hypergraph):\n\n"
+            "Below are examples showing how access graphs map to hypergraphs. "
+            "Learn from these input-output pairs:\n\n"
+        )
+        for i, example in enumerate(examples, 1):
+            prompt += f"\n## Example {i} ({example['filename']}):\n\n"
+            prompt += "### Input - Access Graph:\n"
+            prompt += "```json\n"
+            prompt += json.dumps(example['accessgraph'], indent=2)
+            prompt += "\n```\n\n"
+            prompt += "### Output - Hypergraph:\n"
+            prompt += "```json\n"
+            prompt += json.dumps(example['hypergraph'], indent=2)
+            prompt += "\n```\n"
 
     if target_accessgraph:
         prompt += f"""

@@ -1205,36 +1205,46 @@ def _plot_bsp_result_panel(ax, room_dict, boundary, access_edges, title,
                            entrance_info=None):
     """Draw BSP result rooms with access edges on *ax*.
 
+    Visual styling (polygon edges, fill opacity, boundary, access-edge lines,
+    centroid label fontsize, axis labels) is intentionally matched to
+    :func:`draw_rplan_on_axis` so the two panels render identically.
+
     *entrance_info*, when provided, is ``(entrance_room_id, entrance_poly)``
     and draws the Outside node and its edge to the entrance room.
     """
+    patches = []
+    face_colors = []
+    centroids = {}
+
     for rid, rinfo in room_dict.items():
         poly = rinfo["polygon"]
         coords = np.array(list(poly.exterior.coords))
-        color = CATEGORY_COLORS.get(rinfo["room_type"], "#DDDDDD")
-        p = MplPolygon(coords, closed=True, facecolor=color,
-                       edgecolor="black", linewidth=1.0, alpha=0.8)
-        ax.add_patch(p)
-        cx, cy = poly.centroid.x, poly.centroid.y
-        label = f"{rinfo['name']}\n#{rid}"
-        ax.text(cx, cy, label, ha="center", va="center",
-                fontsize=5, fontweight="bold", zorder=4)
-
-    if boundary is not None:
-        bcoords = np.array(list(boundary.exterior.coords))
-        ax.plot(bcoords[:, 0], bcoords[:, 1], "k-", linewidth=2, zorder=5)
-
-    centroids = {}
-    for rid, rinfo in room_dict.items():
-        poly = rinfo["polygon"]
+        patches.append(MplPolygon(coords, closed=True))
+        face_colors.append(CATEGORY_COLORS.get(rinfo["room_type"], "#DDDDDD"))
         centroids[rid] = (poly.centroid.x, poly.centroid.y)
+
+    pc = PatchCollection(patches, match_original=False, edgecolors="black",
+                         linewidths=1.2, zorder=2)
+    pc.set_facecolor(face_colors)
+    ax.add_collection(pc)
 
     for u, v in access_edges:
         if u in centroids and v in centroids:
             xu, yu = centroids[u]
             xv, yv = centroids[v]
             ax.plot([xu, xv], [yu, yv], color="#555555", linewidth=0.8,
-                    linestyle="--", zorder=3, alpha=0.6)
+                    linestyle="--", zorder=3)
+
+    for rid, rinfo in room_dict.items():
+        cx, cy = centroids[rid]
+        label = f"{rinfo['name']}\n#{rid}"
+        ax.text(cx, cy, label, ha="center", va="center", fontsize=6,
+                fontweight="bold", zorder=4)
+
+    if boundary is not None:
+        bcoords = np.array(list(boundary.exterior.coords))
+        ax.plot(bcoords[:, 0], bcoords[:, 1], color="black", linewidth=2.0,
+                zorder=5)
 
     if entrance_info is not None:
         ent_rid, ent_poly = entrance_info
@@ -1250,7 +1260,11 @@ def _plot_bsp_result_panel(ax, room_dict, boundary, access_edges, title,
     ax.set_aspect("equal")
     ax.autoscale_view()
     ax.invert_yaxis()
-    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    if title:
+        ax.set_title(title, fontsize=10)
 
 
 def _draw_entrance_on_axis(ax, sample: dict):
@@ -1280,11 +1294,13 @@ def _draw_entrance_on_axis(ax, sample: dict):
 
 def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
                    sample_name="", sample=None, entrance_info=None):
-    """Plot original RPLAN (left), BSP result (centre), and tree text (right)."""
-    fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(20, 7),
-                                         gridspec_kw={"width_ratios": [1, 1, 0.7]})
+    """Plot original RPLAN (left) and BSP result (right) side by side.
 
-    # -- Left panel: original RPLAN (identical to process_unsuccessful.py) --
+    Both panels share identical visual styling (see
+    :func:`_plot_bsp_result_panel`).
+    """
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 7))
+
     if sample is not None:
         draw_rplan_on_axis(ax0, sample,
                            title=f"Original RPLAN — {sample_name}")
@@ -1292,7 +1308,6 @@ def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
     else:
         ax0.set_visible(False)
 
-    # -- Centre panel: BSP result --
     all_leaf_rooms = {}
     _collect_leaves(tree, all_leaf_rooms)
 
@@ -1307,18 +1322,9 @@ def plot_final_bsp(tree, rooms, boundary, access_edges, output_path,
         for cat in categories_bsp
     ]
     ax1.legend(handles=legend_patches_bsp, loc="upper left",
-               fontsize=7, framealpha=0.8)
+               fontsize=8, framealpha=0.8)
 
-    # -- Right panel: BSP tree text --
-    tree_text = format_tree(tree, indent=0)
-    ax2.text(0.02, 0.98, tree_text, transform=ax2.transAxes,
-             fontsize=7, verticalalignment="top", fontfamily="monospace")
-    ax2.set_xlim(0, 1)
-    ax2.set_ylim(0, 1)
-    ax2.axis("off")
-    ax2.set_title("BSP Tree", fontsize=10)
-
-    fig.subplots_adjust(top=0.93, wspace=0.08)
+    fig.subplots_adjust(top=0.93, wspace=0.10)
     fig.savefig(str(output_path), dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -1387,8 +1393,14 @@ def _resolve_entrance(sample: dict, leaves: dict):
 
 def process_sample(sample, output_dir: Path, label: str = "",
                    lookahead: int = 1, evolve: bool = False,
-                   evo_pop: int = 100, evo_gens: int = 30):
-    """Run the full BSP pipeline on one RPLAN sample."""
+                   evo_pop: int = 100, evo_gens: int = 30,
+                   plot_format: str = "png"):
+    """Run the full BSP pipeline on one RPLAN sample.
+
+    ``plot_format`` controls the figure file extension passed to matplotlib
+    (it infers the file format from the suffix). Supported values: ``"png"``,
+    ``"pdf"``.
+    """
     name = str(sample.get("name", "unknown"))
     rooms = sample_to_rooms(sample)
     if len(rooms) < 2:
@@ -1420,7 +1432,7 @@ def process_sample(sample, output_dir: Path, label: str = "",
         ent_rid, _ = entrance_info
         final_access.append((OUTSIDE_ROOM_ID, ent_rid))
 
-    out_path = output_dir / f"{label}_{name}_bsp.png"
+    out_path = output_dir / f"{label}_{name}_bsp.{plot_format}"
     plot_final_bsp(tree, all_rooms_ref, boundary, final_access, out_path, name,
                    sample=sample, entrance_info=entrance_info)
 
@@ -1740,7 +1752,11 @@ def main():
     )
     parser.add_argument(
         "--output-dir", "-o", type=str, default="debug_bsp_output",
-        help="Output directory for debug PNGs",
+        help="Output directory for debug plots (PNG by default, see --plot-format)",
+    )
+    parser.add_argument(
+        "--plot-format", type=str, default="png", choices=["png", "pdf"],
+        help="File format for debug BSP plots (default: png)",
     )
     parser.add_argument("--split", type=str, default=None,
                         choices=["train", "val", "test"])
@@ -1875,6 +1891,7 @@ def main():
                     evolve=args.evolve,
                     evo_pop=args.evo_pop,
                     evo_gens=args.evo_gens,
+                    plot_format=args.plot_format,
                 )
                 if success:
                     ok += 1
