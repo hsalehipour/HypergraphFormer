@@ -295,33 +295,57 @@ _SIMPLE_REQUIREMENTS = """\
 
 def create_simple_prompt(target_accessgraph):
     """
-    Create a prompt with BSP rules and target access graph but no few-shot examples.
-    Used by evaluator.py (--mode trained) for fine-tuned model evaluation.
+    Create a prompt with BSP rules and a target ROOM SET (no edges) for the
+    fine-tuned model. The model must invent its own connectivity; exactly one
+    room must own the outside door.
+
+    The argument is still the full ``accessgraph`` dict (so existing call
+    sites pass ``sample["accessgraph"]`` unchanged), but only ``nodes`` is
+    shown to the model -- ``edges`` are intentionally hidden so the model
+    cannot rely on supplied connectivity.
+
+    Used by evaluator.py (--mode trained).
     """
+    room_set = target_accessgraph.get('nodes', {}) or {}
+    n_rooms = len(room_set)
+
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
-Your task is to generate a hypergraph from an access graph. An access graph is a simple representation of room connectivity:
-- `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
-- `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
+Your task is to generate a hypergraph from a SET OF ROOMS. A room set is a dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}}). You are NOT given any connectivity information; you must invent a sensible spatial layout AND a valid adjacency graph between the rooms.
 
 {_OUTSIDE_RULES_TEXT_1}
 
 {_SIMPLE_BSP_RULES_TEXT}
 
-{_SIMPLE_CONNECTIVITY_RULES}
+{_ROOMS_ONLY_CONNECTIVITY_RULES}
 
 {_ANGLE_RULES}
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
+Generate a hypergraph (BSP tree) for the following room set. {_OUTSIDE_RULES_TEXT_2}
 
-### Access Graph:
+### Room Set:
 ```json
-{json.dumps(target_accessgraph, indent=2)}
+{json.dumps(room_set, indent=2)}
 ```
 
-{_SIMPLE_REQUIREMENTS.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
+## Requirements:
+1. Number of leaf nodes MUST equal the number of rooms in the input set ({n_rooms}); do not add, drop, or duplicate any room.
+2. Each leaf's mergeid must match a room type from the input set, and the multiset of leaf mergeids must equal the multiset of values in the input set.
+3. Infer reasonable connectivity between rooms based on typical architectural patterns. Adjacency must be bidirectional (if A's `connected` lists B, B's `connected` must list A).
+4. Exactly ONE leaf must own the outside door -- mark this by including the literal string `"outside"` in that leaf's `connected` array; its box should sit on the apartment boundary so the front door faces the exterior. `"outside"` is NOT itself a leaf and must not appear as a `name`.
+5. Follow the binary tree structure (each non-leaf has exactly 2 children).
+6. Use proper hierarchical naming (root → rootL/rootR → rootLL/rootLR/rootRL/rootRR, etc.).
+7. Ensure area conservation (parent ≈ sum of children).
+8. Create realistic centroids for spatial consistency.
+9. **CRITICAL - ANGLES**: All angles must be horizontal or vertical (0, π/2, π, or 3π/2 only).
+10. **CRITICAL - CONNECTIVITY**: The `connected` array in each LEAF node must contain ONLY the `name` values of OTHER LEAF NODES (plus optionally the literal string `"outside"` for the single leaf that owns the outside door).
+   - ✅ CORRECT: `"connected": ["rootLLR", "rootLLLLL", "outside"]`
+   - ❌ WRONG: Including internal nodes like "rootLL" or "rootL" in connected
+   - ❌ WRONG: Including mergeid values like "Bedroom" or "Corridor"
+   - ❌ WRONG: Including the node's own name (NO SELF-LOOPS)
+11. Use final=false for internal nodes, final=true for room leaves.
 
 Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
 
