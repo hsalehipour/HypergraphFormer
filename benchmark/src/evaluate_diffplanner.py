@@ -91,6 +91,7 @@ from tqdm import tqdm
 from utils.metrics import (
     compute_room_similarity_score,
     compute_room_area_proportion_error,
+    ged_between_graphs,
     room_type_accuracy,
 )
 from utils.report_results import report_results
@@ -685,6 +686,140 @@ def _aligned_polygons_from_record(record: dict) -> list[dict]:
     return rooms
 
 
+# =====================================================================
+# Adjacency-graph (shared-wall) construction + GED
+#
+# DiffPlanner's *adjacency graph* is the spatial-topological graph where
+# two rooms are connected iff they share a wall segment. This is fundamentally
+# different from House-Diffusion's *access graph*, which is door-mediated
+# (two rooms connect only if an interior-door entry pairs them via ``ed_rm``).
+#
+# In the DP record this lives in ``adjacencies_aligned`` (post-processing
+# output) -- a list of ``[i, j]`` pairs of room indices into ``record["rooms"]``.
+# We label each node by its DiffPlanner category id (0-5), matching how
+# ``_visible_room_categories`` already labels rooms, so GED's ``node_match``
+# requires both an isomorphic structure AND matching room-type sequence to
+# yield 0 -- the same semantics as the House-Diffusion access-graph GED.
+# =====================================================================
+
+def _build_adjacency_graph_from_record(record: dict, *, source: str = "auto") -> "Any":
+    """Build the spatial wall-sharing graph from one DP record.
+
+    Args:
+        record: A DP per-sample dict with ``rooms`` and ``adjacencies_aligned``
+            (or ``adjacencies`` as fallback).
+        source: ``"aligned"`` to use ``adjacencies_aligned`` only,
+            ``"raw"`` to use ``adjacencies`` only, or ``"auto"`` (default)
+            to prefer ``adjacencies_aligned`` and fall back to ``adjacencies``.
+
+    Returns:
+        A ``networkx.Graph`` with one labeled node per VISIBLE room
+        (rooms whose ``r_boundary_aligned`` polygon survives) and one
+        undirected edge per adjacency that connects two visible rooms.
+        Lost rooms (and edges that touch them) are dropped, mirroring
+        :func:`_visible_room_categories`.
+    """
+    import networkx as nx
+
+    G = nx.Graph()
+    rooms = record.get("rooms", []) or []
+
+    # Decide which adjacency list to use.
+    if source == "aligned":
+        adj_list = record.get("adjacencies_aligned", []) or []
+    elif source == "raw":
+        adj_list = record.get("adjacencies", []) or []
+    else:
+        adj_list = record.get("adjacencies_aligned")
+        if not adj_list:
+            adj_list = record.get("adjacencies", []) or []
+
+    # Compute the visible-room mask (same notion as _visible_room_categories
+    # / _aligned_polygons_from_record): a room is visible iff its post-aligned
+    # polygon is a non-degenerate Shapely polygon. For raw_fallback records,
+    # ``r_boundary_aligned`` is a synthesized rectangle from the raw box, so
+    # all rooms are "visible" -- consistent with the rest of the pipeline.
+    visible: dict[int, int] = {}
+    for i, r in enumerate(rooms):
+        coords = r.get("r_boundary_aligned")
+        poly = _shapely_polygon_safe(coords) if coords else None
+        if poly is None:
+            continue
+        visible[i] = int(r.get("category", -1))
+
+    for i, cat in visible.items():
+        G.add_node(i, label=cat)
+
+    for edge in adj_list:
+        if not (isinstance(edge, (list, tuple)) and len(edge) >= 2):
+            continue
+        try:
+            a, b = int(edge[0]), int(edge[1])
+        except (TypeError, ValueError):
+            continue
+        if a == b:
+            continue
+        if a in visible and b in visible:
+            G.add_edge(a, b)
+    return G
+
+
+def _build_adjacency_graph_from_gt(gt_record: dict) -> "Any":
+    """Build the spatial wall-sharing graph from a GT sample dict.
+
+    GT samples in ``data_test.json`` use ``adjacencies`` (no _aligned suffix)
+    and have valid ``box`` / ``r_boundary`` for every room, so we treat all
+    rooms as visible and label by their declared category.
+    """
+    import networkx as nx
+
+    G = nx.Graph()
+    rooms = gt_record.get("rooms", []) or []
+    for i, r in enumerate(rooms):
+        G.add_node(i, label=int(r.get("category", -1)))
+    for edge in gt_record.get("adjacencies", []) or []:
+        if not (isinstance(edge, (list, tuple)) and len(edge) >= 2):
+            continue
+        try:
+            a, b = int(edge[0]), int(edge[1])
+        except (TypeError, ValueError):
+            continue
+        if a == b or a not in G or b not in G:
+            continue
+        G.add_edge(a, b)
+    return G
+
+
+def _adj_ged_worker(pair) -> float:
+    """Compute GED for a single (G_pred, G_true, idx, upper_bound) tuple.
+
+    Same shape as ``benchmark.src.evaluate_housediffusion._ged_worker`` so a
+    parallel runner can be reused unchanged.
+    """
+    G_pred, G_true, sample_idx, upper_bound = pair
+    ged, _ = ged_between_graphs(
+        G_pred, G_true, sample_idx,
+        upper_bound=upper_bound,
+    )
+    return ged if ged is not None else float("nan")
+
+
+def _parallel_adj_ged(ged_pairs: list, desc: str = "Computing adjacency-graph GED") -> list[float]:
+    """Resolve queued GED pairs in parallel via joblib (one core per pair)."""
+    import multiprocessing
+    from joblib import Parallel, delayed
+
+    if not ged_pairs:
+        return []
+    num_cores = multiprocessing.cpu_count()
+    print(f"\nComputing adjacency-graph GED for {len(ged_pairs)} pairs "
+          f"using {num_cores} cores...")
+    return Parallel(n_jobs=num_cores)(
+        delayed(_adj_ged_worker)(pair)
+        for pair in tqdm(ged_pairs, desc=desc)
+    )
+
+
 def _visible_room_categories(record: dict) -> tuple[list[int], int]:
     """Strict counterpart to :func:`_aligned_polygons_from_record`.
 
@@ -820,6 +955,7 @@ def evaluate_sample(
     *,
     pp_status: str,
     results: dict,
+    ged_upper_bound: int = 40,
 ) -> None:
     """Compute every metric for one sample and append into ``results``.
 
@@ -828,6 +964,8 @@ def evaluate_sample(
       - area_proportion_error
       - gap_ratio, outside_ratio, overlap_ratio (boundary-normalized)
       - room accuracy (combined / count-only / type-only)
+      - adjacency-graph GED (queued via ``adj_ged_pairs``; resolved in bulk
+        after all samples are scored, see :func:`_parallel_adj_ged`)
 
     Side-effect counters: raw_fallback_count, lost_room_count,
     samples_with_lost_rooms (== ``hidden_count`` in HD nomenclature).
@@ -872,6 +1010,14 @@ def evaluate_sample(
     if pp_status == "raw_fallback":
         results["raw_fallback_count"] += 1
 
+    # Queue an adjacency-graph GED pair for batched parallel resolution.
+    G_pred_adj = _build_adjacency_graph_from_record(pred_record, source="auto")
+    G_true_adj = _build_adjacency_graph_from_gt(gt_record)
+    sample_idx = len(results["similarity_scores"]) - 1
+    results["adj_ged_pairs"].append(
+        (G_pred_adj, G_true_adj, sample_idx, ged_upper_bound)
+    )
+
 
 def _make_results_dict() -> dict:
     return {
@@ -889,6 +1035,11 @@ def _make_results_dict() -> dict:
         "lost_room_count": 0,
         "samples_with_lost_rooms": 0,
         "raw_fallback_count": 0,
+        # Adjacency-graph (shared-wall) GED. Pairs are queued per-sample and
+        # resolved in parallel after all samples are scored to avoid
+        # spawning joblib workers inside the main per-sample loop.
+        "adj_ged_pairs": [],
+        "adj_geds": [],
     }
 
 
@@ -1025,6 +1176,9 @@ def _build_report_kwargs(results: dict) -> dict:
                                       np.array(results["room_count_accuracies"])),
             "room_type_accuracies": ("Room Type Accuracy",
                                      np.array(results["room_type_accuracies"])),
+            "adj_geds": ("GED (adjacency graph, shared walls)",
+                         np.array(results["adj_geds"], dtype=float)
+                         if results["adj_geds"] else np.array([], dtype=float)),
         },
         "room_counts": np.array(results["per_sample_room_counts"]),
         "extra": {
@@ -1189,6 +1343,17 @@ def main() -> int:
           f"{results['samples_with_lost_rooms']:,} of {n:,} samples "
           f"({100.0 * results['samples_with_lost_rooms'] / n:.1f}% of samples "
           f"have at least one room dropped by post-processing).")
+
+    # Resolve queued adjacency-graph GED pairs in parallel. Each per-sample
+    # entry was appended in scoring order, so positional alignment with
+    # similarity_scores / area_proportion_errors / etc. is preserved.
+    if results["adj_ged_pairs"] and not results["adj_geds"]:
+        try:
+            results["adj_geds"] = _parallel_adj_ged(results["adj_ged_pairs"])
+        except Exception as exc:  # pragma: no cover -- defensive
+            print(f"WARNING: Parallel adjacency-graph GED failed ({exc}); "
+                  f"leaving GED column empty.")
+            results["adj_geds"] = []
 
     report_results(
         str(args.out),
