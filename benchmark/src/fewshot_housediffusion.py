@@ -2,9 +2,8 @@
 """
 Few-shot evaluator for House-Diffusion-LLM models.
 
-Two modes:
-    fewshot-qwen -- Base / fine-tuned Qwen via vLLM (default) or HuggingFace, single GPU
-    fewshot-gpt  -- GPT via OpenAI API, single process
+Mode:
+    fewshot-gpt -- GPT via the OpenAI API, single process
 
 The model is asked to produce a House-Diffusion JSON (``room_type`` / ``boxes``
 / ``edges`` / ``ed_rm``) from an access graph. Eval samples are the per-id
@@ -37,18 +36,17 @@ For ``--output results/run.json``:
 
 Usage
 -----
-    # Few-shot Qwen (single GPU; vLLM by default if installed)
-    python benchmark/src/fewshot_housediffusion.py --mode fewshot-qwen \\
-        --dataset-dir dataset/rplan/dataset_housediffusion/test
-
-    # Zero-shot variant (no in-context examples)
-    python benchmark/src/fewshot_housediffusion.py --mode fewshot-qwen \\
-        --dataset-dir dataset/rplan/dataset_housediffusion/test --num-examples 0
+    export OPENAI_API_KEY=...
 
     # Few-shot GPT
     python benchmark/src/fewshot_housediffusion.py --mode fewshot-gpt \\
         --model gpt-4-turbo \\
         --dataset-dir dataset/rplan/dataset_housediffusion/test
+
+    # Zero-shot variant (no in-context examples)
+    python benchmark/src/fewshot_housediffusion.py --mode fewshot-gpt \\
+        --model gpt-4-turbo \\
+        --dataset-dir dataset/rplan/dataset_housediffusion/test --num-examples 0
 """
 
 from __future__ import annotations
@@ -67,9 +65,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-# Set BEFORE importing vllm (via scripts.generators) — see scripts/evaluator.py.
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
 from tqdm import tqdm
 
 from scripts.data_preparation_housediffusion_llm import (
@@ -84,12 +79,7 @@ from scripts.data_preparation_housediffusion_llm import (
     create_hd_instruction_prompt,
     extract_access_graph_from_hd,
 )
-from scripts.generators import (
-    VLLM_AVAILABLE,
-    GPTGenerator,
-    QwenGenerator,
-    VllmQwenGenerator,
-)
+from scripts.generators import GPTGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -147,49 +137,6 @@ def _largest_balanced_objects(s: str) -> list[str]:
                 start = None
     out.sort(key=len, reverse=True)
     return out
-
-
-def extract_hd_json_from_qwen(response: str) -> Optional[dict]:
-    """Extract an HD JSON dict from a Qwen-style response (with ``<|im_start|>assistant``).
-
-    The vLLM wrapper in :mod:`scripts.generators` already prepends the assistant
-    marker if missing, so this works both for HF and vLLM outputs. Falls back to
-    parsing the raw response when the marker is absent.
-    """
-    text = response or ""
-
-    marker = "<|im_start|>assistant"
-    idx = text.find(marker)
-    candidates: list[str] = []
-    if idx != -1:
-        section = text[idx + len(marker):]
-        end = section.find("<|im_end|>")
-        if end != -1:
-            section = section[:end]
-        candidates.append(_strip_code_fences(section))
-    candidates.append(_strip_code_fences(text))
-
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-            if _looks_like_hd_json(obj):
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-        obj = _try_parse_first_object(cand)
-        if _looks_like_hd_json(obj):
-            return obj
-
-        for blob in _largest_balanced_objects(cand):
-            try:
-                obj = json.loads(blob)
-                if _looks_like_hd_json(obj):
-                    return obj
-            except json.JSONDecodeError:
-                continue
-
-    return None
 
 
 def extract_hd_json_from_gpt(response: str) -> Optional[dict]:
@@ -925,8 +872,6 @@ class HdFewShotEvaluator(ABC):
             "num_examples": args.num_examples,
             "total_samples": len(results),
         }
-        if args.mode == "fewshot-qwen":
-            meta["vllm"] = (not getattr(args, "no_vllm", False)) and VLLM_AVAILABLE
 
         output_data = {"metadata": meta, "statistics": stats, "results": results}
         with open(args.output, "w") as f:
@@ -953,74 +898,12 @@ class HdFewShotEvaluator(ABC):
         )
 
 
-# -------- Qwen backend ---------------------------------------------------
+def _patch_system_prompt(new_system_prompt: str) -> None:
+    """Override the default BSP system prompt baked into ``scripts.generators``.
 
-class HdFewShotQwenEvaluator(HdFewShotEvaluator):
-    """Few-shot HD generation with a local Qwen model (vLLM by default)."""
-
-    def load_model(self) -> None:
-        gpu = getattr(self.args, "gpu", 0)
-        use_vllm = (not getattr(self.args, "no_vllm", False)) and VLLM_AVAILABLE
-        if not getattr(self.args, "no_vllm", False) and not VLLM_AVAILABLE:
-            logger.warning("vLLM not installed; falling back to HuggingFace generate (pip install vllm)")
-
-        if use_vllm:
-            tp = getattr(self.args, "tensor_parallel", 1)
-            if tp > 1:
-                gpu_list = ",".join(str(gpu + i) for i in range(tp))
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list
-                logger.info("vLLM tensor parallel: CUDA_VISIBLE_DEVICES=%s", gpu_list)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
-
-            model_path = Path(self.args.model)
-            is_lora = (model_path / "adapter_config.json").exists()
-            self.generator = VllmQwenGenerator(
-                self.args.model if not is_lora else str(_resolve_base_from_lora(model_path)),
-                lora_path=model_path if is_lora else None,
-                max_tokens=self.args.max_tokens,
-                temperature=self.args.temperature,
-                gpu_memory_utilization=self.args.vllm_gpu_memory,
-                max_model_len=self.args.vllm_max_model_len,
-                tensor_parallel_size=tp,
-                enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
-            )
-            # Override BSP system prompt with HD-specific one (one-process eval).
-            _patch_qwen_system_prompt(HD_SYSTEM_MESSAGE)
-            logger.info("vLLM generator loaded (HD system prompt active).")
-            return
-
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        import torch
-
-        logger.info("Loading model: %s on GPU %s", self.args.model, gpu)
-        tokenizer = AutoTokenizer.from_pretrained(self.args.model)
-        model = AutoModelForCausalLM.from_pretrained(
-            self.args.model, torch_dtype=torch.float16, device_map={"": gpu},
-        )
-        self.generator = QwenGenerator(model=model, tokenizer=tokenizer)
-        _patch_qwen_system_prompt(HD_SYSTEM_MESSAGE)
-
-    def extract_hd(self, response: str) -> Optional[dict]:
-        return extract_hd_json_from_qwen(response)
-
-
-def _resolve_base_from_lora(lora_path: Path) -> str:
-    cfg_path = lora_path / "adapter_config.json"
-    with cfg_path.open() as f:
-        cfg = json.load(f)
-    base = cfg.get("base_model_name_or_path")
-    if not base:
-        raise ValueError(f"Missing base_model_name_or_path in {cfg_path}")
-    return base
-
-
-def _patch_qwen_system_prompt(new_system_prompt: str) -> None:
-    """Override the BSP system prompt baked into ``scripts.generators``.
-
-    Both ``QwenGenerator`` and ``VllmQwenGenerator`` build their chat messages
-    using the module-level ``SYSTEM_PROMPT`` constant. This replaces it for the
-    lifetime of the process so HD evaluation gets the right system role.
+    ``GPTGenerator`` builds its chat messages using the module-level
+    ``SYSTEM_PROMPT`` constant. This replaces it for the lifetime of the
+    process so HD evaluation gets the right system role.
     """
     import scripts.generators as _gen
     _gen.SYSTEM_PROMPT = new_system_prompt
@@ -1036,7 +919,7 @@ class HdFewShotGPTEvaluator(HdFewShotEvaluator):
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not set")
         self.generator = GPTGenerator(model_name=self.args.model, api_key=api_key)
-        _patch_qwen_system_prompt(HD_SYSTEM_MESSAGE)
+        _patch_system_prompt(HD_SYSTEM_MESSAGE)
         logger.info("GPT generator initialised (%s)", self.args.model)
 
     def extract_hd(self, response: str) -> Optional[dict]:
@@ -1048,7 +931,6 @@ class HdFewShotGPTEvaluator(HdFewShotEvaluator):
 # ===================================================================
 
 MODE_MAP: dict[str, type[HdFewShotEvaluator]] = {
-    "fewshot-qwen": HdFewShotQwenEvaluator,
     "fewshot-gpt": HdFewShotGPTEvaluator,
 }
 
@@ -1092,24 +974,11 @@ def cli() -> int:
     )
 
     parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--gpu", type=int, default=0)
-
-    vllm = parser.add_argument_group("vLLM (Qwen local inference; default on if installed)")
-    vllm.add_argument("--no-vllm", action="store_true",
-                      help="Use HuggingFace generate instead of vLLM")
-    vllm.add_argument("--vllm-gpu-memory", type=float, default=0.85)
-    vllm.add_argument("--vllm-max-model-len", type=int, default=6900)
-    vllm.add_argument("--tensor-parallel", type=int, default=1)
-    vllm.add_argument("--vllm-no-enforce-eager", action="store_true",
-                      help="Allow vLLM CUDA graphs (default: enforce_eager=True)")
 
     args = parser.parse_args()
 
     if args.model is None:
-        if args.mode == "fewshot-qwen":
-            args.model = "Qwen/Qwen3-4B-Instruct-2507"
-        elif args.mode == "fewshot-gpt":
-            args.model = "gpt-4"
+        args.model = "gpt-4"
 
     if args.output is None:
         slug = Path(args.model).name

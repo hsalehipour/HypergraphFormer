@@ -537,15 +537,11 @@ from the resulting boxes).
 
 ### `src/fewshot_housediffusion.py`
 
-Few-shot LLM evaluator for the House-Diffusion JSON format. Two
-backends are supported:
-
-- `--mode fewshot-qwen` -- base or SFT-fine-tuned Qwen via vLLM
-  (default) or HuggingFace, single GPU
-- `--mode fewshot-gpt` -- GPT via the OpenAI API, single process
-
-The model is asked to produce a House-Diffusion JSON
+Few-shot LLM evaluator for the House-Diffusion JSON format. Single
+backend: `--mode fewshot-gpt` -- GPT via the OpenAI API, single
+process. The model is asked to produce a House-Diffusion JSON
 (`room_type` / `boxes` / `edges` / `ed_rm`) from an access graph.
+
 Scoring is HD-specific (no GED): structural validation on the
 generated HD JSON, plus reconstruction of an access graph from the
 generated HD via the same door-mediated convention used at data-prep
@@ -736,7 +732,7 @@ benchmark/
 │   ├── evaluate_diffplanner.py          # DiffPlanner b+nc cascade evaluation (RPLAN)
 │   ├── evaluate_iplan.py                # iPLAN OurII cascade evaluation (RPLAN, runs in iplan conda env)
 │   ├── fewshot_diffplanner.py           # LLM few-shot eval in DiffPlanner JSON format (b+nc)
-│   └── fewshot_housediffusion.py        # LLM few-shot eval in House-Diffusion JSON format (Qwen / GPT)
+│   └── fewshot_housediffusion.py        # LLM few-shot eval in House-Diffusion JSON format (GPT)
 │
 ├── utils/                               # Utility and conversion scripts
 │   ├── convert_hypergraph_to_housegan_json.py  # WMR24 JSON → HouseGAN++ JSON
