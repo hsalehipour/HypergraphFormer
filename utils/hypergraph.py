@@ -151,6 +151,166 @@ def repair_bsp_tree_names(hypergraph: dict) -> dict:
     return hg
 
 
+# ---------------------------------------------------------------------------
+# Mesh / polygon adjacency primitives
+#
+# Shared by ``Hypergraph.correct_accessgraph`` (intersection of declared edges
+# with mesh adjacency) and ``Hypergraph.adjacency_graph`` /
+# ``adjacency_graph_from_polygons`` (full mesh-adjacency graph used by the
+# AdjacencyGED metric in ``scripts/score_results.py``).
+#
+# Geometry rules (kept identical to the original
+# ``correct_accessgraph._polygons_adjacent`` so behaviour is unchanged):
+#   - point contact  -> not adjacent
+#   - shared edge    -> adjacent if length > 1e-4
+#   - shared overlap -> adjacent if area   > max(1e-4, 1e-3 * min(area))
+#   - mixed geometry collection -> any of the above qualifies
+# ---------------------------------------------------------------------------
+
+
+def _polygons_adjacent(a, b) -> bool:
+    """Are two shapely polygons adjacent (share a non-sliver wall)?"""
+    if a.is_empty or b.is_empty:
+        return False
+    try:
+        inter = a.intersection(b)
+    except Exception:
+        return False
+    if inter.is_empty:
+        return False
+    gt = inter.geom_type
+    if gt == "Point":
+        return False
+    if gt in ("LineString", "LinearRing"):
+        return inter.length > 1e-4
+    if gt == "MultiLineString":
+        return inter.length > 1e-4
+    if gt == "Polygon":
+        return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
+    if gt == "GeometryCollection":
+        for g in inter.geoms:
+            if g.geom_type == "Point":
+                continue
+            if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
+                return True
+            if g.geom_type == "MultiLineString" and g.length > 1e-4:
+                return True
+            if g.geom_type == "Polygon" and g.area > max(
+                1e-4, 1e-3 * min(a.area, b.area)
+            ):
+                return True
+    return False
+
+
+def _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor):
+    """Materialize each face polygon and the access id it belongs to.
+
+    Returns ``(polys, face_node)`` parallel lists; ``face_node[i]`` is the
+    leaf access id (e.g. ``\"3\"``) or ``None`` if the face's ``unique_id``
+    does not map to any leaf.
+    """
+    from shapely.affinity import scale as _scale
+    from shapely.geometry import Polygon
+
+    n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+    polys: list = []
+    face_node: list = []
+    for i in range(n_faces):
+        face = mesh.faceList[i]
+        uid = getattr(face, "unique_id", "") or ""
+        face_node.append(leaf_name_to_id.get(uid))
+        pts = face.getPoints()
+        corners = [
+            (float(pts[j].X), float(pts[j].Y))
+            for j in range(int(getattr(pts, "Count", 0) or 0))
+        ]
+        poly = Polygon(corners) if len(corners) >= 3 else Polygon()
+        if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+            poly = _scale(
+                poly,
+                xfact=float(scale_factor),
+                yfact=float(scale_factor),
+                origin="centroid",
+            )
+        polys.append(poly)
+    return polys, face_node
+
+
+def _polygon_adjacency_pairs_by_id(polys, ids) -> set[tuple[str, str]]:
+    """All adjacency pairs ``(u, v)`` between polygons, sorted by integer id.
+
+    ``polys[i]`` is paired with id ``ids[i]``; ``None`` ids and empty
+    polygons are skipped. Useful both for hypergraph meshes (one face per
+    leaf) and for ``room_polygons`` lists where ``ids[i]`` is the polygon's
+    integer id.
+    """
+    out: set[tuple[str, str]] = set()
+    n = len(polys)
+    for i in range(n):
+        u = ids[i]
+        if u is None or polys[i].is_empty:
+            continue
+        for j in range(i + 1, n):
+            v = ids[j]
+            if v is None or polys[j].is_empty or u == v:
+                continue
+            try:
+                if _polygons_adjacent(polys[i], polys[j]):
+                    out.add(tuple(sorted((str(u), str(v)), key=int)))
+            except Exception:
+                continue
+    return out
+
+
+def adjacency_graph_from_polygons(
+    room_polygons: list, *, scale_factor: float = 1.05,
+) -> dict:
+    """Build a mesh-adjacency graph from a ``room_polygons`` list.
+
+    Each item must have ``id`` (1-based), ``mergeid``, and ``coords``; this is
+    the format stored in dataset ``.txt`` files (see
+    :func:`utils.metrics.produce_room_list_from_polygons`).
+
+    Returns ``{"nodes": {id: mergeid, ...}, "edges": [[u, v], ...]}`` using
+    the same adjacency rules as :meth:`Hypergraph.adjacency_graph`.
+    """
+    from shapely.affinity import scale as _scale
+    from shapely.geometry import Polygon
+
+    polys: list = []
+    ids: list = []
+    nodes: dict[str, str] = {}
+    for rp in room_polygons or []:
+        rid = rp.get("id")
+        if rid is None:
+            continue
+        rid_str = str(rid)
+        coords = rp.get("coords") or []
+        poly = Polygon(coords) if len(coords) >= 3 else Polygon()
+        if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+            try:
+                poly = _scale(
+                    poly,
+                    xfact=float(scale_factor),
+                    yfact=float(scale_factor),
+                    origin="centroid",
+                )
+            except Exception:
+                pass
+        polys.append(poly)
+        ids.append(rid_str)
+        nodes[rid_str] = str(rp.get("mergeid", "Unknown"))
+
+    pairs = _polygon_adjacency_pairs_by_id(polys, ids)
+    edges = [
+        [u, v] for (u, v) in sorted(pairs, key=lambda e: (int(e[0]), int(e[1])))
+    ]
+    return {
+        "nodes": {k: nodes[k] for k in sorted(nodes, key=int)},
+        "edges": edges,
+    }
+
+
 class Hypergraph:
     """A BSP-tree hypergraph representing a spatial floor plan subdivision.
 
@@ -835,6 +995,71 @@ class Hypergraph:
             pairs.append((i, j))
         return pairs
 
+    def _compute_mesh_adjacency(
+        self, bounds: dict, *, scale_factor: float = 1.05,
+    ) -> tuple[set[tuple[str, str]], dict[str, str], set[str]] | None:
+        """Build the full mesh-adjacency edge set between BSP leaves.
+
+        Returns ``(mesh_adj, id_to_mergeid, node_ids)`` where every
+        ``mesh_adj`` pair ``(u, v)`` is sorted by integer id. Returns
+        ``None`` if there are no leaves or the mesh is empty.
+
+        Used by both :meth:`correct_accessgraph` (filtered) and
+        :meth:`adjacency_graph` (unfiltered).
+        """
+        leaves = self.leaves
+        if not leaves:
+            return None
+
+        leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
+        node_ids = set(leaf_name_to_id.values())
+        id_to_mergeid = {
+            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+        }
+
+        mesh = self.to_mesh(bounds=bounds)
+        n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+        if n_faces <= 0:
+            return set(), id_to_mergeid, node_ids
+
+        polys, face_node = _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor)
+        mesh_adj = _polygon_adjacency_pairs_by_id(polys, face_node)
+        return mesh_adj, id_to_mergeid, node_ids
+
+    def adjacency_graph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
+        """Pure mesh-adjacency graph between BSP leaves (no edge filtering).
+
+        Identical mesh-adjacency primitive as :meth:`correct_accessgraph` (same
+        ``scale_factor`` heuristic, same shapely intersection rules), but
+        returns *every* pair of leaves whose face polygons share a non-sliver
+        wall — without filtering by the predicted access graph and without the
+        connectivity-bridge logic.
+
+        This is the natural ground for **AdjacencyGED**: which rooms physically
+        touch in the mesh, regardless of what was declared in the access
+        graph. Complement of :meth:`correct_accessgraph`, which is the
+        intersection of declared edges with mesh adjacency (plus bridges).
+
+        Args:
+            bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
+            scale_factor: Same default ``1.05`` as :meth:`correct_accessgraph`.
+
+        Returns:
+            ``{"nodes": {id: mergeid, ...}, "edges": [[u, v], ...]}`` with
+            edge ids sorted by integer value.
+        """
+        out = self._compute_mesh_adjacency(bounds, scale_factor=scale_factor)
+        if out is None:
+            return {"nodes": {}, "edges": []}
+        mesh_adj, id_to_mergeid, node_ids = out
+        edges = [
+            [u, v] for (u, v) in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1])))
+        ]
+        return {
+            "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
+            "edges": edges,
+        }
+
     def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
         """Correct the leaf access graph using **mesh adjacency between access node ids**.
 
@@ -855,55 +1080,17 @@ class Hypergraph:
                 Default ``1.05`` matches the prior heuristic (bridges small mesh gaps); use ``1.0`` for
                 no inflation (stricter contact).
         """
-        from shapely.affinity import scale as _scale
-        from shapely.geometry import Polygon
-
-        def _geoms_from_collection(geom) -> list:
-            if geom.geom_type == "GeometryCollection":
-                return list(geom.geoms)
-            return [geom]
-
-        def _polygons_adjacent(a: Polygon, b: Polygon) -> bool:
-            if a.is_empty or b.is_empty:
-                return False
-            try:
-                inter = a.intersection(b)
-            except Exception:
-                return False
-            if inter.is_empty:
-                return False
-            if inter.geom_type == "Point":
-                return False
-            if inter.geom_type in ("LineString", "LinearRing"):
-                return inter.length > 1e-4
-            if inter.geom_type == "MultiLineString":
-                return inter.length > 1e-4
-            if inter.geom_type == "Polygon":
-                return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
-            if inter.geom_type == "GeometryCollection":
-                for g in _geoms_from_collection(inter):
-                    if g.geom_type == "Point":
-                        continue
-                    if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
-                        return True
-                    if g.geom_type == "MultiLineString" and g.length > 1e-4:
-                        return True
-                    if g.geom_type == "Polygon" and g.area > max(
-                        1e-4, 1e-3 * min(a.area, b.area)
-                    ):
-                        return True
-            return False
-
-        leaves = self.leaves
-        if not leaves:
+        out = self._compute_mesh_adjacency(bounds, scale_factor=scale_factor)
+        if out is None:
             return {"nodes": {}, "edges": []}
-
-        leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
-        node_ids = set(leaf_name_to_id.values())
+        mesh_adj, id_to_mergeid, node_ids = out
 
         ag = self.access_graph or {}
         if not isinstance(ag, dict):
             ag = {}
+
+        def _edge_pair(u: str, v: str) -> tuple[str, str]:
+            return tuple(sorted((str(u), str(v)), key=int))
 
         raw_edges: list[list[str]] = []
         for e in (ag.get("edges") or []):
@@ -914,15 +1101,9 @@ class Hypergraph:
                 continue
             raw_edges.append([u, v])
 
-        def _edge_pair(u: str, v: str) -> tuple[str, str]:
-            return tuple(sorted((str(u), str(v)), key=int))
-
-        mesh = self.to_mesh(bounds=bounds)
-        n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-        if n_faces <= 0:
-            id_to_mergeid = {
-                str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
-            }
+        if not mesh_adj:
+            # Mesh produced no adjacency information -- preserve the cleaned
+            # raw edges (matches prior behaviour when n_faces <= 0).
             return {
                 "nodes": {k: id_to_mergeid[k] for k in node_ids if k in id_to_mergeid},
                 "edges": [
@@ -930,42 +1111,6 @@ class Hypergraph:
                     for p in sorted({_edge_pair(u, v) for u, v in raw_edges})
                 ],
             }
-
-        polys: list[Polygon] = []
-        face_node: list[str | None] = []
-        for i in range(n_faces):
-            face = mesh.faceList[i]
-            uid = getattr(face, "unique_id", "") or ""
-            face_node.append(leaf_name_to_id.get(uid))
-            pts = face.getPoints()
-            corners = [
-                (float(pts[j].X), float(pts[j].Y))
-                for j in range(int(getattr(pts, "Count", 0) or 0))
-            ]
-            poly = Polygon(corners) if len(corners) >= 3 else Polygon()
-            if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
-                poly = _scale(
-                    poly,
-                    xfact=float(scale_factor),
-                    yfact=float(scale_factor),
-                    origin="centroid",
-                )
-            polys.append(poly)
-
-        mesh_adj: set[tuple[str, str]] = set()
-        for i in range(n_faces):
-            u = face_node[i]
-            if u is None or polys[i].is_empty:
-                continue
-            for j in range(i + 1, n_faces):
-                v = face_node[j]
-                if v is None or polys[j].is_empty or u == v:
-                    continue
-                try:
-                    if _polygons_adjacent(polys[i], polys[j]):
-                        mesh_adj.add(_edge_pair(u, v))
-                except Exception:
-                    continue
 
         kept: list[tuple[str, str]] = []
         seen_kept: set[tuple[str, str]] = set()
@@ -1010,9 +1155,6 @@ class Hypergraph:
 
         out_edges.sort(key=lambda e: (int(e[0]), int(e[1])))
 
-        id_to_mergeid = {
-            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
-        }
         return {
             "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
             "edges": out_edges,

@@ -281,6 +281,87 @@ def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=20000,
     )
 
 
+def compute_adjacency_ged(
+    gt: dict,
+    hypergraph: dict,
+    _id,
+    *,
+    bounds: dict,
+    timeout: int = 20000,
+    upper_bound: int = 40,
+    timeout_capture_best: bool = False,
+    scale_factor: float = 1.05,
+):
+    """Compute GED between **mesh-adjacency** graphs of GT and prediction.
+
+    Unlike :func:`compute_ged_from_hypergraph` (which compares declared
+    access graphs), this metric compares which rooms physically touch in
+    the *mesh* — built from ``room_polygons`` for GT (preferred when
+    available, since they are the dataset-stamped true geometry) or from
+    ``Hypergraph(gt['hypergraph']).adjacency_graph(bounds)`` as a fallback,
+    and from ``Hypergraph(hypergraph).adjacency_graph(bounds)`` for the
+    prediction.
+
+    Args:
+        gt: Ground-truth dict with ``room_polygons`` and/or ``hypergraph``
+            (and ``bounds`` already pulled out by the caller).
+        hypergraph: Predicted hypergraph BSP-tree dict.
+        _id: Sample identifier for log messages.
+        bounds: Boundary metadata dict for prediction mesh generation.
+        timeout: Timeout in milliseconds (default: 20 000), same as GED.
+        upper_bound: Upper bound for GED computation.
+        timeout_capture_best: If *True*, return the best partial result
+            on timeout.
+        scale_factor: Polygon scale factor for adjacency tests (default
+            ``1.05``, matching :meth:`Hypergraph.correct_accessgraph`).
+
+    Returns:
+        ``(min_dist, num_gt_nodes)`` -- see :func:`ged_between_graphs`.
+    """
+    from utils.hypergraph import Hypergraph, adjacency_graph_from_polygons
+
+    if not (isinstance(bounds, dict) and bounds.get("corners")):
+        raise ValueError(
+            f"compute_adjacency_ged requires bounds with 'corners' for sample {_id}"
+        )
+
+    try:
+        if isinstance(gt, dict) and gt.get("room_polygons"):
+            gt_ag = adjacency_graph_from_polygons(
+                gt["room_polygons"], scale_factor=scale_factor,
+            )
+        elif isinstance(gt, dict) and gt.get("hypergraph"):
+            gt_ag = Hypergraph(gt["hypergraph"]).adjacency_graph(
+                bounds, scale_factor=scale_factor,
+            )
+        else:
+            print(
+                f"⚠️  No GT geometry (room_polygons or hypergraph) for sample {_id}"
+            )
+            return None, None
+
+        pred_ag = Hypergraph(hypergraph).adjacency_graph(
+            bounds, scale_factor=scale_factor,
+        )
+
+        if not pred_ag.get("nodes"):
+            print(f"⚠️  No leaf nodes found in hypergraph for sample {_id}")
+            return None, None
+
+        G_pred = accessgraph_dict_to_nx(pred_ag)
+        G_true = accessgraph_dict_to_nx(gt_ag)
+
+    except Exception as e:
+        print(f"⚠️  Error building adjacency graphs for sample {_id}: {e}")
+        return None, None
+
+    return ged_between_graphs(
+        G_pred, G_true, _id,
+        timeout=timeout, upper_bound=upper_bound,
+        timeout_capture_best=timeout_capture_best,
+    )
+
+
 def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplicate_mismatched=False, area_sorting=True):
     """
     Compute delta metric between two room lists, measuring shape regularity deviation.

@@ -70,7 +70,9 @@ from utils.report_results import report_results
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_METRICS = ("ged", "accuracy", "delta", "area_proportion_error")
+AVAILABLE_METRICS = (
+    "ged", "adjacency_ged", "accuracy", "delta", "area_proportion_error",
+)
 
 
 # ===================================================================
@@ -100,9 +102,17 @@ def _gt_room_area_list(gt):
 # ===================================================================
 
 def _ged_worker_main() -> int:
-    """Compute GED for a single sample and print results to stdout."""
+    """Compute GED (access-graph or mesh-adjacency) for a single sample.
+
+    The ``--metric`` switch chooses between:
+      ``access`` (default)  -> :func:`utils.compute_ged_from_hypergraph`
+      ``adjacency``         -> :func:`utils.compute_adjacency_ged`
+
+    Both variants share the same worker scaffold (subprocess timeout,
+    ged-workers pool, shared ``--ged-timeout`` setting).
+    """
     import argparse
-    from utils import compute_ged_from_hypergraph
+    from utils import compute_ged_from_hypergraph, compute_adjacency_ged
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--_ged-worker", action="store_true")
@@ -111,6 +121,11 @@ def _ged_worker_main() -> int:
     parser.add_argument("--test-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--correct-accessgraph", action="store_true")
+    parser.add_argument(
+        "--metric", choices=("access", "adjacency"), default="access",
+        help="GED variant: 'access' (declared accessgraph) or "
+             "'adjacency' (mesh-adjacency)",
+    )
     args = parser.parse_args()
 
     def _parse_jsonish(val):
@@ -128,20 +143,35 @@ def _ged_worker_main() -> int:
         raw = json.load(f)
     gt = {
         "accessgraph": raw.get("accessgraph", {}),
+        "hypergraph": _parse_jsonish(raw.get("hypergraph", None)),
+        "room_polygons": raw.get("room_polygons", None),
         "bounds": _parse_jsonish(raw.get("bounds", "{}")),
     }
 
-    bounds = gt["bounds"] if args.correct_accessgraph else None
-
+    timeout_ms = int(args.timeout_seconds * 1000)
     start = time.perf_counter()
-    ged, graph_len = compute_ged_from_hypergraph(
-        gt["accessgraph"],
-        copy.deepcopy(results[sample_id]) if args.correct_accessgraph else results[sample_id],
-        sample_id,
-        timeout=int(args.timeout_seconds * 1000),
-        correct_accessgraph=args.correct_accessgraph,
-        bounds=bounds,
-    )
+
+    if args.metric == "adjacency":
+        # Adjacency-GED always uses the mesh; ``--correct-accessgraph`` is
+        # not relevant here (the prediction is rebuilt from the mesh
+        # itself, no declared edges to filter against).
+        ged, graph_len = compute_adjacency_ged(
+            gt,
+            copy.deepcopy(results[sample_id]),
+            sample_id,
+            bounds=gt["bounds"],
+            timeout=timeout_ms,
+        )
+    else:
+        bounds = gt["bounds"] if args.correct_accessgraph else None
+        ged, graph_len = compute_ged_from_hypergraph(
+            gt["accessgraph"],
+            copy.deepcopy(results[sample_id]) if args.correct_accessgraph else results[sample_id],
+            sample_id,
+            timeout=timeout_ms,
+            correct_accessgraph=args.correct_accessgraph,
+            bounds=bounds,
+        )
     elapsed = time.perf_counter() - start
 
     print(f"ged: {ged}")
@@ -209,8 +239,13 @@ def _run_ged_subprocess(
     test_dir: Path,
     timeout_seconds: float,
     correct_accessgraph: bool,
+    metric: str = "access",
 ) -> dict:
-    """Re-invoke this script in worker mode for a single sample."""
+    """Re-invoke this script in worker mode for a single sample.
+
+    *metric* selects between ``access`` (declared accessgraph) and
+    ``adjacency`` (mesh-adjacency); see :func:`_ged_worker_main`.
+    """
     wall_timeout = timeout_seconds + 30.0
     cmd = [
         sys.executable, str(Path(__file__).resolve()),
@@ -219,8 +254,9 @@ def _run_ged_subprocess(
         "--results-file", str(results_file),
         "--test-dir", str(test_dir),
         "--timeout-seconds", str(timeout_seconds),
+        "--metric", metric,
     ]
-    if correct_accessgraph:
+    if correct_accessgraph and metric == "access":
         cmd.append("--correct-accessgraph")
 
     try:
@@ -254,29 +290,33 @@ def _run_ged_subprocess(
     return {"sample_id": sample_id, "ged": ged, "graph_len": graph_len}
 
 
-def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
-              results_file: Path = None, test_dir: Path = None,
-              timeout_seconds: float = 20.0, workers: int = 64):
-    """Compute GED for every sample in *results*.
-
-    Each sample runs in an isolated subprocess so timed-out GED threads never
-    accumulate and throttle subsequent computations.
-
-    If *correct_accessgraph* is True, applies correct_accessgraph before GED.
-    Returns ``{"per_sample": [...], "summary": {...}}``.
-    """
+def _score_graph_ged(
+    results, ground_truth, skip_ids,
+    *,
+    metric: str,
+    correct_accessgraph: bool = False,
+    results_file: Path = None,
+    test_dir: Path = None,
+    timeout_seconds: float = 20.0,
+    workers: int = 64,
+):
+    """Shared scaffold for GED-style metrics (access or adjacency)."""
     sample_ids = [
         sid for sid in results
         if sid not in skip_ids and sid in ground_truth
     ]
 
     per_sample: list[dict] = []
-    desc = "Computing GED" + (" (corrected)" if correct_accessgraph else "")
+    if metric == "adjacency":
+        desc = "Computing AdjacencyGED"
+    else:
+        desc = "Computing GED" + (" (corrected)" if correct_accessgraph else "")
 
     if workers <= 1:
         for sid in tqdm(sample_ids, desc=desc, unit="sample"):
             per_sample.append(_run_ged_subprocess(
-                sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+                sid, results_file, test_dir, timeout_seconds,
+                correct_accessgraph, metric=metric,
             ))
     else:
         futures = {}
@@ -284,7 +324,8 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
             for sid in sample_ids:
                 f = pool.submit(
                     _run_ged_subprocess,
-                    sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+                    sid, results_file, test_dir, timeout_seconds,
+                    correct_accessgraph, metric,
                 )
                 futures[f] = sid
 
@@ -304,6 +345,40 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
         "skipped": len(results) - len(sample_ids),
     }
     return {"per_sample": per_sample, "summary": summary}
+
+
+def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
+              results_file: Path = None, test_dir: Path = None,
+              timeout_seconds: float = 20.0, workers: int = 64):
+    """Compute access-graph GED for every sample (see :func:`_score_graph_ged`)."""
+    return _score_graph_ged(
+        results, ground_truth, skip_ids,
+        metric="access",
+        correct_accessgraph=correct_accessgraph,
+        results_file=results_file, test_dir=test_dir,
+        timeout_seconds=timeout_seconds, workers=workers,
+    )
+
+
+def score_adjacency_ged(results, ground_truth, skip_ids,
+                        results_file: Path = None, test_dir: Path = None,
+                        timeout_seconds: float = 20.0, workers: int = 64):
+    """Compute mesh-adjacency GED for every sample.
+
+    The metric compares the predicted hypergraph's mesh-adjacency graph
+    (built via :meth:`utils.hypergraph.Hypergraph.adjacency_graph`) against
+    the GT mesh-adjacency graph (built from ``room_polygons`` when
+    available, else from ``gt['hypergraph']`` via the same method). Reuses
+    the same subprocess scaffold and ``--ged-workers`` /
+    ``--ged-timeout`` settings as the access-graph GED.
+    """
+    return _score_graph_ged(
+        results, ground_truth, skip_ids,
+        metric="adjacency",
+        correct_accessgraph=False,
+        results_file=results_file, test_dir=test_dir,
+        timeout_seconds=timeout_seconds, workers=workers,
+    )
 
 
 # ===================================================================
@@ -527,6 +602,14 @@ def cli():
                 timeout_seconds=args.ged_timeout,
                 workers=args.ged_workers,
             )
+        elif metric == "adjacency_ged":
+            metric_results["adjacency_ged"] = score_adjacency_ged(
+                results, ground_truth, skip_ids,
+                results_file=results_path,
+                test_dir=Path(args.test_dir),
+                timeout_seconds=args.ged_timeout,
+                workers=args.ged_workers,
+            )
         elif metric == "accuracy":
             metric_results["accuracy"] = score_accuracy(
                 results, ground_truth, skip_ids,
@@ -557,6 +640,16 @@ def cli():
             np.array([
                 r["ged"] if r["ged"] is not None else np.nan
                 for r in ged_result["per_sample"]
+            ]),
+        )
+
+    adj_ged_result = metric_results.get("adjacency_ged")
+    if adj_ged_result and adj_ged_result["per_sample"]:
+        all_metrics["adjacency_geds"] = (
+            "AdjacencyGED",
+            np.array([
+                r["ged"] if r["ged"] is not None else np.nan
+                for r in adj_ged_result["per_sample"]
             ]),
         )
 
