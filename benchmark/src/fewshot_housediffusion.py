@@ -6,9 +6,10 @@ Mode:
     fewshot-gpt -- GPT via the OpenAI API, single process
 
 The model is asked to produce a House-Diffusion JSON (``room_type`` / ``boxes``
-/ ``edges`` / ``ed_rm``) from an access graph. Eval samples are the per-id
-``<id>.txt`` files written by ``scripts/data_preparation_housediffusion_llm.py``
-(``{"accessgraph": ..., "hypergraph": <hd_json_str>}``).
+/ ``edges`` / ``ed_rm``) from an access graph. Eval samples are per-id
+``<id>.txt`` files of the form ``{"accessgraph": ..., "hypergraph": <hd_json_str>}``,
+where the access graph is the LLM-visible input and the ``hypergraph`` field
+holds the ground-truth HD JSON used for scoring.
 
 Scoring is the SAME pipeline as ``benchmark/src/evaluate_housediffusion.py``
 (delta / room similarity, area-proportion error, spatial overlap, room-count
@@ -78,19 +79,192 @@ from typing import Any, Optional
 import numpy as np
 from tqdm import tqdm
 
-from scripts.data_preparation_housediffusion_llm import (
-    DOOR_CATS,
-    FRONT_DOOR_CAT,
-    HD_CATEGORY_TO_NAME,
-    HD_FORMAT_RULES_TEXT,
-    HD_REQUIREMENTS_TMPL,
-    HD_SYSTEM_MESSAGE,
-    INTERIOR_DOOR_CAT,
-    OUTSIDE_LABEL,
-    create_hd_instruction_prompt,
-    extract_access_graph_from_hd,
-)
 from scripts.generators import GPTGenerator
+
+# ===================================================================
+# House-Diffusion JSON contract: category ids, label names, and the
+# textual rules we put in front of the LLM. Inlined here so this script
+# is self-contained (no dependency on a separate data-preparation module).
+# Mirrors the layout used by ``benchmark/src/fewshot_diffplanner.py``.
+# ===================================================================
+
+CANVAS_SIZE = 256
+
+# Door category ids in the House-Diffusion / RPLAN class scheme.
+FRONT_DOOR_CAT = 15
+INTERIOR_DOOR_CAT = 17
+_DOOR_CATS = (FRONT_DOOR_CAT, INTERIOR_DOOR_CAT)
+
+# Sentinel name for the synthetic "outside" reference appended to edges
+# leaving the apartment via the front door. It shows up as the second
+# endpoint of edges like ``["3", "outside"]`` but is NOT listed as a key
+# in the access graph's ``nodes`` dict.
+OUTSIDE_LABEL = "outside"
+
+# House-Diffusion category id -> short access-graph room-type label,
+# matching the labels used by the existing access graphs
+# (``bed`` / ``bath`` / ``living`` / ``kitchen`` / ``balcony`` / ``storage``).
+_HD_CATEGORY_TO_NAME: dict[int, str] = {
+    1:  "living",
+    2:  "kitchen",
+    3:  "bed",
+    4:  "bath",
+    5:  "balcony",
+    6:  "entrance",
+    7:  "dining",
+    8:  "study",
+    10: "storage",
+    16: "extra",   # rare in the dataset; safest catch-all label
+}
+
+
+HD_SYSTEM_MESSAGE = (
+    "You are an expert at generating apartment floor plan layouts in "
+    "House-Diffusion JSON format from access graphs. Each layout is a single "
+    "JSON object describing room types, axis-aligned bounding boxes, and "
+    "wall/door edges in pixel coordinates."
+)
+
+
+HD_FORMAT_RULES_TEXT = """\
+# CRITICAL STRUCTURE RULES:
+
+## 1. House-Diffusion JSON Schema (MUST FOLLOW):
+The output is a single JSON object with EXACTLY these four fields:
+
+### 1.1 `room_type` -- list[int]
+- One integer category id per layout entry, in canonical order: rooms first, then door entries (interior doors, then a single front door at the end).
+- Standard RPLAN-style category IDs:
+    1  = Living Room       2  = Kitchen        3  = Bedroom (bed)
+    4  = Bathroom (bath)   5  = Balcony        6  = Entrance / Hall
+    7  = Dining Room       8  = Study Room    10  = Storage
+   15  = Front Door       17  = Interior Door
+
+### 1.2 `boxes` -- list[[x1, y1, x2, y2]]
+- One axis-aligned bounding box per entry in `room_type`, SAME ORDER and SAME LENGTH.
+- Coordinates are integer-valued pixels in `[0, 256]`; (x1, y1) is the top-left corner, (x2, y2) is the bottom-right corner (so x1 < x2 and y1 < y2).
+
+### 1.3 `edges` -- list[[x1, y1, x2, y2, ra, rb]]
+- One entry per wall / door segment that bounds a node (a room OR a door entry).
+- (x1, y1, x2, y2) are the integer pixel endpoints of the segment.
+- `ra` is the **category id** (a value taken from `room_type`) of the node that emits this segment.
+- `rb` is **0** when the segment lies on the apartment exterior, otherwise the **category id** of the node on the other side of the wall. So interior doors appear as `rb = 17` for the rooms they connect, and the front door appears as `rb = 15`.
+
+### 1.4 `ed_rm` -- list[list[int]]
+- One entry per row of `edges`, in the SAME ORDER as `edges`.
+- Each entry is a list of **node indices** (0-based positions into `room_type` / `boxes`) that the segment touches. The indices can refer to ROOMS or to DOOR entries (categories 15 / 17), not just to rooms.
+- A length-1 entry `[i]` means the segment lies on the apartment exterior, owned by node `i`; the corresponding `edges` row has `rb == 0`.
+- A length-2 entry `[i, j]` means the segment is shared between nodes `i` and `j`; the corresponding `edges` row has `rb != 0`, and the invariant `room_type[i] == ra` and `room_type[j] == rb` MUST hold.
+- `ed_rm` is what disambiguates `edges` whenever multiple rooms share a category (e.g. two bedrooms): `ra` / `rb` only carry types, but `ed_rm` carries the exact two entries.
+
+## 2. Geometric Consistency:
+- For every room, the union of its segments in `edges` must form a closed axis-aligned polygon contained inside that room's `boxes` rectangle.
+- Walls are emitted segment-by-segment; do not rely on implicit closures.
+- All coordinates are integers in `[0, 256]` (the canonical House-Diffusion grid).
+- `len(boxes) == len(room_type)` and `len(ed_rm) == len(edges)`.
+
+## 3. Connectivity (Access Graph -> JSON):
+- The access-graph `edges` list contains TWO kinds of entries:
+    * room-to-room edges `[a, b]`, where both endpoints are room ids that appear as keys in `nodes`, and
+    * outside edges `[r, "outside"]`, where the literal string `"outside"` indicates that room `r` carries the apartment's front door. `"outside"` is NOT a real room and is NOT a key in `nodes`; therefore room `r`'s box should sit on the apartment boundary so its front door faces the exterior.
+- The number of ROOM entries in `room_type` (entries with category id NOT 15 and NOT 17) MUST equal the number of nodes in the access graph (i.e., the count of keys in `nodes`; the `"outside"` reference does NOT count).
+- Each room entry's category id must match the corresponding access-graph node's room type, using this canonical mapping:
+    living=1, kitchen=2, bed=3, bath=4, balcony=5, entrance=6, dining=7, study=8, storage=10.
+- For every room-to-room edge `[a, b]` in the access graph, the JSON must realize that connection as an INTERIOR DOOR: an entry with category id 17 in `room_type` whose segment rows have `ed_rm = [door_index, room_index]` for each of the two connected rooms (so room `a` and room `b` end up sharing exactly one interior door).
+- For every outside edge `[r, "outside"]` in the access graph, the JSON must include exactly one Front-Door entry (category 15) in `room_type` whose `ed_rm` rows pair it with room `r`; room `r` must therefore have at least one row in `edges` with `rb == 15`."""
+
+
+HD_REQUIREMENTS_TMPL = """\
+## Requirements:
+1. The number of ROOM entries in `room_type` (entries with category id != 15 and != 17) MUST equal {num_nodes} (number of access-graph nodes; the `"outside"` reference does NOT count).
+2. Each room's category id must match the corresponding access-graph room type.
+3. Every room-to-room edge `[a, b]` in the access graph must be realized by an Interior-Door entry (category 17) whose `ed_rm` rows pair it with both rooms.
+4. Every outside edge `[r, "outside"]` in the access graph must be realized by a Front-Door entry (category 15) whose `ed_rm` rows pair it with room `r`; that room's box must sit on the apartment boundary.
+5. All coordinates are integers in `[0, 256]`.
+6. `len(boxes) == len(room_type)` and `len(ed_rm) == len(edges)`.
+7. Each room's `boxes` rectangle must enclose all of its segments in `edges`.
+8. Output ONLY the JSON object, no markdown fences and no commentary."""
+
+
+def create_hd_instruction_prompt() -> str:
+    """Long-form instruction explaining the HD JSON format. No examples."""
+    return f"""You are an expert at generating apartment floor plan layouts in the House-Diffusion JSON format that represent floor plans.
+
+Your task is to generate a House-Diffusion JSON object from an access graph. An access graph is a simple representation of room connectivity:
+- `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "bed", "2": "kitchen"}}).
+- `edges`: List of connections. Each entry is either a room-to-room pair (e.g. `["1", "2"]`) or an outside reference (e.g. `["1", "outside"]`). The literal string `"outside"` is NOT a room and is NOT listed in `nodes`; it marks the room that owns the apartment's front door (i.e., the entry-door room), and that room's box should therefore lie on the apartment boundary so its front door can face the exterior.
+
+{HD_FORMAT_RULES_TEXT}
+
+# YOUR TASK:
+
+Generate a House-Diffusion JSON object for the following access graph."""
+
+
+def extract_access_graph_from_hd(hd_json: dict) -> dict:
+    """Build a ``{nodes, edges}`` access graph from a House-Diffusion JSON.
+
+    Door-mediated convention:
+
+    - Rooms (categories 1-10, 16) are nodes; door entries (categories 15
+      and 17) are NOT in ``nodes``.
+    - Two rooms ``a, b`` get a single edge ``[a, b]`` iff there is an
+      interior-door entry (category 17) at index ``k`` such that ``ed_rm``
+      pairs ``k`` with both ``a`` and ``b`` (i.e. some rows of ``ed_rm``
+      look like ``[k, a]`` and ``[k, b]``).
+    - The front-door entry (category 15) at index ``f`` produces the
+      synthetic outside reference: every room ``r`` that ``ed_rm`` pairs
+      with ``f`` gets an extra edge ``[r, "outside"]``. The literal string
+      ``"outside"`` is intentionally NOT a key in ``nodes``.
+    - Output uses 1-indexed string ids in ``nodes`` and pairs of those ids
+      (or the literal string ``"outside"``) in ``edges``.
+    """
+    rt: list[int] = hd_json.get("room_type", [])
+    ed_rm: list[list[int]] = hd_json.get("ed_rm", [])
+
+    room_orig_indices = [i for i, c in enumerate(rt) if c not in _DOOR_CATS]
+    orig_to_new_id = {orig: str(new_idx + 1) for new_idx, orig in enumerate(room_orig_indices)}
+    room_orig_set = set(room_orig_indices)
+
+    nodes: dict[str, str] = {
+        orig_to_new_id[orig]: _HD_CATEGORY_TO_NAME.get(rt[orig], "extra")
+        for orig in room_orig_indices
+    }
+
+    interior_door_rooms: dict[int, set[int]] = {
+        i: set() for i, c in enumerate(rt) if c == INTERIOR_DOOR_CAT
+    }
+    front_door_indices: set[int] = {i for i, c in enumerate(rt) if c == FRONT_DOOR_CAT}
+    front_door_rooms: set[int] = set()
+
+    for row in ed_rm:
+        for k in row:
+            if k in interior_door_rooms:
+                for r in row:
+                    if r in room_orig_set:
+                        interior_door_rooms[k].add(r)
+            elif k in front_door_indices:
+                for r in row:
+                    if r in room_orig_set:
+                        front_door_rooms.add(r)
+
+    seen: set = set()
+    edges: list = []
+    for door_rooms in interior_door_rooms.values():
+        rooms = sorted(door_rooms)
+        for ai in range(len(rooms)):
+            for bi in range(ai + 1, len(rooms)):
+                a = orig_to_new_id[rooms[ai]]
+                b = orig_to_new_id[rooms[bi]]
+                key = tuple(sorted([a, b], key=lambda x: int(x)))
+                if key not in seen:
+                    seen.add(key)
+                    edges.append([key[0], key[1]])
+
+    for r_orig in sorted(front_door_rooms):
+        edges.append([orig_to_new_id[r_orig], OUTSIDE_LABEL])
+
+    return {"nodes": nodes, "edges": edges}
 
 # We delegate metric computation to the same helpers used by
 # benchmark.src.evaluate_housediffusion so the few-shot results pipeline emits
@@ -272,7 +446,7 @@ def create_hd_fewshot_prompt(target_accessgraph: dict, examples: list[dict]) -> 
 
 
 def _zero_shot_user_content(target_accessgraph: dict) -> str:
-    """Same shape as ``data_preparation_housediffusion_llm.create_hd_training_sample`` user side."""
+    """Zero-shot user-content prompt: instruction + access graph + requirements."""
     instruction = create_hd_instruction_prompt()
     return (
         f"{instruction}\n\n"
@@ -641,7 +815,7 @@ def score_against_accessgraph(
 # ===================================================================
 
 def load_sample(fpath: Path) -> dict:
-    """Load one ``<id>.txt`` file written by ``data_preparation_housediffusion_llm.py``."""
+    """Load one per-id ``<id>.txt`` eval file (``{"accessgraph": ..., "hypergraph": <hd_json_str>}``)."""
     with fpath.open() as f:
         data = json.load(f)
     ag = data.get("accessgraph", {}) or {}
@@ -710,7 +884,8 @@ def load_hd_examples(
     if not examples:
         raise ValueError(
             f"Could not load any HD examples from {examples_dir}; "
-            "did you run data_preparation_housediffusion_llm.py?"
+            "expected per-id .txt files of shape "
+            '{"accessgraph": ..., "hypergraph": <hd_json_str>}.',
         )
     return examples
 
@@ -1365,7 +1540,8 @@ def cli() -> int:
 
     parser.add_argument(
         "--dataset-dir", type=str, required=True,
-        help="Directory of <id>.txt files written by data_preparation_housediffusion_llm.py",
+        help='Directory of per-id <id>.txt eval files of shape '
+             '{"accessgraph": ..., "hypergraph": <hd_json_str>}',
     )
     parser.add_argument(
         "--examples-dir", type=str, default=None,
