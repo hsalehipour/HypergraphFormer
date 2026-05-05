@@ -97,9 +97,11 @@ from scripts.generators import GPTGenerator
 from benchmark.src.evaluate_diffplanner import (
     DP_CATEGORY_TO_MERGE_ID,
     _add_diffplanner_to_path,
+    _adj_ged_worker,
     _aligned_polygons_from_record,
     _build_report_kwargs,
     _make_results_dict,
+    _parallel_adj_ged,
     _post_process_record as _dp_post_process_record,
     _visible_room_categories,
     compute_boundary_geometry_metrics,
@@ -637,12 +639,31 @@ def score_dp_sample(
             "accuracy": 0.0,
             "room_count_accuracy": 0.0,
             "room_type_accuracy": 0.0,
+            "adj_ged": float("nan"),
             "lost_rooms": 0,
             "pp_status": pp_status,
             "num_predicted_rooms_visible": 0,
             "num_gt_rooms": len(gt_sample.get("rooms", []) or []),
             "post_processed_dp": aligned,
         }
+
+    # Resolve the adjacency-graph GED inline. ``_dp_evaluate_sample`` queues a
+    # (G_pred, G_true, idx, upper_bound) tuple in ``adj_ged_pairs`` per call;
+    # because the few-shot pipeline is per-sample (not batched like the cascade
+    # in ``evaluate_diffplanner.main``), the cleanest place to score it is here.
+    # The graphs are tiny (<= MAX_NUM_ROOMS = 8 nodes), so this is sub-ms in
+    # the common case and well under the 20s timeout in
+    # ``ged_between_graphs``. We pop the queue and append into ``adj_geds`` so
+    # ``_build_report_kwargs`` finds positional alignment with the other
+    # per-sample arrays at finalize time.
+    adj_pair = run_results["adj_ged_pairs"].pop()
+    try:
+        adj_ged_val = _adj_ged_worker(adj_pair)
+    except Exception as exc:  # pragma: no cover -- defensive
+        logger.warning("adj-graph GED failed for sample %s: %s",
+                       gt_sample.get("name", "?"), exc)
+        adj_ged_val = float("nan")
+    run_results["adj_geds"].append(adj_ged_val)
 
     pred_visible_cats, _ = _visible_room_categories(aligned)
     return {
@@ -654,6 +675,7 @@ def score_dp_sample(
         "accuracy": run_results["accuracies"][-1],
         "room_count_accuracy": run_results["room_count_accuracies"][-1],
         "room_type_accuracy": run_results["room_type_accuracies"][-1],
+        "adj_ged": float(adj_ged_val) if adj_ged_val is not None else float("nan"),
         "lost_rooms": run_results["lost_rooms_per_sample"][-1],
         "pp_status": pp_status,
         "num_predicted_rooms_visible": len(pred_visible_cats),
@@ -987,7 +1009,8 @@ class DpFewShotEvaluator(ABC):
                 msg = (
                     f"OK  | delta={result.get('delta', float('nan')):.2f} "
                     f"area_err={result.get('area_proportion_error', float('nan')):.3f} "
-                    f"gap={result.get('gap_ratio', float('nan')):.2f}"
+                    f"gap={result.get('gap_ratio', float('nan')):.2f} "
+                    f"adj_ged={result.get('adj_ged', float('nan')):.1f}"
                 )
             elif result.get("json_extracted"):
                 fails = result["validation"]["failed_checks"][:2]
@@ -1045,6 +1068,7 @@ class DpFewShotEvaluator(ABC):
             accs = list(rr["accuracies"])
             rcas = list(rr["room_count_accuracies"])
             rtas = list(rr["room_type_accuracies"])
+            adj_geds = list(rr["adj_geds"])
             lost_total = int(rr["lost_room_count"])
             samples_with_lost = int(rr["samples_with_lost_rooms"])
             raw_fb = int(rr["raw_fallback_count"])
@@ -1057,6 +1081,7 @@ class DpFewShotEvaluator(ABC):
             accs = [r["accuracy"] for r in results if "accuracy" in r]
             rcas = [r["room_count_accuracy"] for r in results if "room_count_accuracy" in r]
             rtas = [r["room_type_accuracy"] for r in results if "room_type_accuracy" in r]
+            adj_geds = [r["adj_ged"] for r in results if "adj_ged" in r]
             lost_total = sum(int(r.get("lost_rooms", 0)) for r in results)
             samples_with_lost = sum(1 for r in results if int(r.get("lost_rooms", 0)) > 0)
             raw_fb = sum(1 for r in results if r.get("pp_status") == "raw_fallback")
@@ -1080,6 +1105,7 @@ class DpFewShotEvaluator(ABC):
             "room_accuracy_avg": _nan_avg(accs),
             "room_count_accuracy_avg": _nan_avg(rcas),
             "room_type_accuracy_avg": _nan_avg(rtas),
+            "adj_ged_avg": _nan_avg(adj_geds),
             "lost_room_count": lost_total,
             "samples_with_lost_rooms": samples_with_lost,
             "raw_fallback_count": raw_fb,
@@ -1119,6 +1145,11 @@ class DpFewShotEvaluator(ABC):
                 rr["accuracies"].append(float(r.get("accuracy", 0.0)))
                 rr["room_count_accuracies"].append(float(r.get("room_count_accuracy", 0.0)))
                 rr["room_type_accuracies"].append(float(r.get("room_type_accuracy", 0.0)))
+                # ``adj_ged`` is serialized into the checkpoint per sample, so a
+                # resume can reconstitute the GED column without re-running the
+                # adjacency-graph optimizer. Older checkpoints (pre-GED) won't
+                # have the field; fall back to NaN so the array stays aligned.
+                rr["adj_geds"].append(float(r.get("adj_ged", float("nan"))))
                 rr["per_sample_room_counts"].append(int(r.get("num_gt_rooms", 0)))
                 pp_status = str(r.get("pp_status", "raw_fallback"))
                 rr["pp_status"].append(pp_status)
@@ -1230,6 +1261,18 @@ class DpFewShotEvaluator(ABC):
             return
         n = len(self.run_results["similarity_scores"])
         rr = self.run_results
+        # Defensive: drain any leftover queued GED pairs into ``adj_geds`` so
+        # the array is positionally aligned with the other per-sample arrays.
+        # Under the normal flow ``score_dp_sample`` already pops + scores each
+        # pair inline, so this is a no-op; this guards future codepaths that
+        # might enqueue without scoring (e.g. a batched evaluator variant).
+        if rr["adj_ged_pairs"]:
+            try:
+                rr["adj_geds"].extend(_parallel_adj_ged(rr["adj_ged_pairs"]))
+                rr["adj_ged_pairs"].clear()
+            except Exception as exc:  # pragma: no cover -- defensive
+                logger.warning("Final adjacency-graph GED drain failed (%s); "
+                               "leaving GED column partial.", exc)
         print(
             f"\nScored {n} samples; raw_fallback (post-processing failed) "
             f"on {rr['raw_fallback_count']} of them."
