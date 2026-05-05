@@ -1080,6 +1080,31 @@ class HdFewShotEvaluator(ABC):
             logger.info("Room filter (max %d): kept %d/%d", args.max_rooms, len(kept), len(all_files))
             all_files = kept
 
+        # Random-subset selection BEFORE checkpoint filtering / first-N
+        # truncation, so the chosen pool is fully determined by
+        # (--subset-size, --subset-seed) and is independent of which
+        # samples have already been completed in a prior run. The pool is
+        # re-sorted afterwards to keep per-sample ordering deterministic
+        # (important for checkpoint resume).
+        subset_size = getattr(args, "subset_size", None)
+        if subset_size:
+            if subset_size > len(all_files):
+                logger.warning(
+                    "--subset-size %d > pool size %d; using full pool.",
+                    subset_size, len(all_files),
+                )
+            else:
+                subset_seed = getattr(args, "subset_seed", None)
+                if subset_seed is None:
+                    subset_seed = args.seed
+                rng = random.Random(subset_seed)
+                all_files = sorted(rng.sample(all_files, subset_size),
+                                   key=lambda p: p.name)
+                logger.info(
+                    "Random subset: kept %d files (subset_seed=%d).",
+                    len(all_files), subset_seed,
+                )
+
         existing, completed = self._load_checkpoint(args)
         files_to_process = [f for f in all_files if f.name not in completed]
         if args.max_samples:
@@ -1438,6 +1463,14 @@ class HdFewShotEvaluator(ABC):
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "seed": args.seed,
+            "subset_size": getattr(args, "subset_size", None),
+            "subset_seed": (
+                getattr(args, "subset_seed", None)
+                if getattr(args, "subset_seed", None) is not None
+                else (args.seed if getattr(args, "subset_size", None) else None)
+            ),
+            "max_samples": getattr(args, "max_samples", None),
+            "max_rooms": getattr(args, "max_rooms", None),
             "num_examples": args.num_examples,
             "total_samples": len(results),
         }
@@ -1573,8 +1606,28 @@ def cli() -> int:
     )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=5120)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for in-context example sampling and "
+                             "(by default) for the --subset-size selection.")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Cap the number of samples actually evaluated, "
+                             "taken in deterministic sort order from the "
+                             "(possibly subsetted) pool. Useful for short "
+                             "smoke tests; for a STABLE evaluation pool use "
+                             "--subset-size instead.")
+    parser.add_argument("--subset-size", type=int, default=None,
+                        help="Evaluate on a random subset of N samples drawn "
+                             "uniformly without replacement from the full "
+                             "test pool. Reproducible: the same "
+                             "(--subset-size, --subset-seed) always yields "
+                             "the same N samples. Applied AFTER --max-rooms "
+                             "filtering and BEFORE --max-samples truncation, "
+                             "so resuming from a checkpoint stays consistent.")
+    parser.add_argument("--subset-seed", type=int, default=None,
+                        help="Seed used for --subset-size selection. Defaults "
+                             "to --seed; set independently to vary the random "
+                             "subset without changing in-context example "
+                             "sampling.")
     parser.add_argument("--max-rooms", type=int, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=300)
