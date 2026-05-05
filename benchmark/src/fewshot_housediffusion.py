@@ -38,15 +38,15 @@ For ``--output results/run.json``:
 Usage
 -----
     # Few-shot Qwen (single GPU; vLLM by default if installed)
-    python scripts/evaluator_housediffusion.py --mode fewshot-qwen \\
+    python benchmark/src/fewshot_housediffusion.py --mode fewshot-qwen \\
         --dataset-dir dataset/rplan/dataset_housediffusion/test
 
     # Zero-shot variant (no in-context examples)
-    python scripts/evaluator_housediffusion.py --mode fewshot-qwen \\
+    python benchmark/src/fewshot_housediffusion.py --mode fewshot-qwen \\
         --dataset-dir dataset/rplan/dataset_housediffusion/test --num-examples 0
 
     # Few-shot GPT
-    python scripts/evaluator_housediffusion.py --mode fewshot-gpt \\
+    python benchmark/src/fewshot_housediffusion.py --mode fewshot-gpt \\
         --model gpt-4-turbo \\
         --dataset-dir dataset/rplan/dataset_housediffusion/test
 """
@@ -69,11 +69,6 @@ from typing import Any, Optional
 
 # Set BEFORE importing vllm (via scripts.generators) — see scripts/evaluator.py.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-# Make ``utils`` importable when the script is run from the repo root.
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from tqdm import tqdm
 

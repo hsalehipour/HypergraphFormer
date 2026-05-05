@@ -49,8 +49,8 @@ Inputs
 adjacencies``). Few-shot examples are drawn from the same file (with the
 target sample excluded).
 
-Outputs (same pattern as ``evaluator_housediffusion.py``)
----------------------------------------------------------
+Outputs (same pattern as ``benchmark/src/fewshot_housediffusion.py``)
+--------------------------------------------------------------------
 ``results/run.json``           Aggregate report (metadata, statistics, every
                                per-sample record incl. ``generated_dp``).
 ``results/run_partial.json``   Incremental snapshot for crash-resume via
@@ -62,9 +62,9 @@ Outputs (same pattern as ``evaluator_housediffusion.py``)
 Usage
 -----
     export OPENAI_API_KEY=...
-    python scripts/evaluator_diffplanner.py \
-        --dataset-json dataset/rplan/dataset_diffplanner/data_test.json \
-        --num-examples 3 --max-samples 100 \
+    python benchmark/src/fewshot_diffplanner.py \\
+        --dataset-json dataset/rplan/dataset_diffplanner/data_test.json \\
+        --num-examples 3 --max-samples 100 \\
         --output results_dp_gpt4_3shot.json
 """
 
@@ -83,10 +83,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from tqdm import tqdm
 
