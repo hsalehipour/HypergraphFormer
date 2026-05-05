@@ -10,29 +10,39 @@ The model is asked to produce a House-Diffusion JSON (``room_type`` / ``boxes``
 ``<id>.txt`` files written by ``scripts/data_preparation_housediffusion_llm.py``
 (``{"accessgraph": ..., "hypergraph": <hd_json_str>}``).
 
-Scoring is HD-specific (no GED): structural validation on the generated HD
-JSON, plus reconstruction of an access graph from the generated HD via the
-same door-mediated convention used at data-prep time and a comparison with
-the input access graph (room count, room-type multiset, edge-set F1).
+Scoring is the SAME pipeline as ``benchmark/src/evaluate_housediffusion.py``
+(delta / room similarity, area-proportion error, spatial overlap, room-count
+and room-type accuracies, GED, and a hidden-room counter), reusing those
+helpers directly so the few-shot ``results.npz`` / ``results.txt`` are byte-
+for-byte the same shape as the diffusion benchmark's. The lighter-weight
+access-graph reconstruction scores (edge F1, outside-match, etc.) are kept
+around as diagnostic fields in the JSON log.
 
 Outputs
 -------
 For ``--output results/run.json``:
 
-* ``results/run.json``           Aggregate eval report: metadata, statistics,
-                                 and per-sample result records (one entry per
-                                 sample, including its ``generated_hd`` payload).
-* ``results/run_partial.json``   Same shape, written incrementally after every
-                                 sample so a crashed run can be resumed via
-                                 ``--checkpoint``.
-* ``results/run_hd/<id>.json``   ONE file per successful generation, holding
-                                 just the HD JSON dict (``room_type`` /
-                                 ``boxes`` / ``edges`` / ``ed_rm``). Written
-                                 incrementally as each sample completes; this
-                                 is the shape ``benchmark/utils/visualize_rplan_json.py``
-                                 and ``benchmark/utils/convert_json_to_pickle.py``
-                                 expect. Override the directory with
-                                 ``--per-sample-dir``.
+* ``results/run.json``               Aggregate eval JSON log: metadata,
+                                     statistics summary, and per-sample result
+                                     records (each with its ``generated_hd``
+                                     payload).
+* ``results/run_partial.json``       Same shape, written incrementally after
+                                     every sample so a crashed run can be
+                                     resumed via ``--checkpoint``.
+* ``results/run_hd/<id>.json``       ONE file per successful generation, holding
+                                     just the HD JSON dict (``room_type`` /
+                                     ``boxes`` / ``edges`` / ``ed_rm``). Written
+                                     incrementally as each sample completes; this
+                                     is the shape ``benchmark/utils/visualize_rplan_json.py``
+                                     and ``benchmark/utils/convert_json_to_pickle.py``
+                                     expect. Override the directory with
+                                     ``--per-sample-dir``.
+* ``results/run_metrics/results.{npz,txt}``
+                                     Aggregate geometric-metrics report,
+                                     produced via ``utils.report_results`` --
+                                     same layout as
+                                     ``benchmark/src/evaluate_housediffusion.py``.
+                                     Override the directory with ``--out``.
 
 Usage
 -----
@@ -65,6 +75,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 from tqdm import tqdm
 
 from scripts.data_preparation_housediffusion_llm import (
@@ -80,6 +91,26 @@ from scripts.data_preparation_housediffusion_llm import (
     extract_access_graph_from_hd,
 )
 from scripts.generators import GPTGenerator
+
+# We delegate metric computation to the same helpers used by
+# benchmark.src.evaluate_housediffusion so the few-shot results pipeline emits
+# byte-for-byte the same statistics (delta, area-prop error, spatial overlap,
+# room-type/count accuracies, GED, hidden-room count) and the same
+# results.npz / results.txt layout.
+from benchmark.src.evaluate_housediffusion import (
+    _build_report_kwargs,
+    _make_results_dict,
+    _parallel_ged,
+    _room_geometries_to_area_tuples,
+    build_access_graph_from_polygons,
+    compute_room_similarity_score_polygons,
+    compute_spatial_overlap_ratio_from_polygons,
+    count_actual_rooms_from_polygons,
+    extract_room_geometries_from_polygons,
+)
+from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
+from utils.metrics import room_type_accuracy
+from utils.report_results import report_results
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +401,163 @@ def validate_hd_json(hd: dict) -> HdValidation:
     return HdValidation(is_valid=not failed, passed=passed, failed=failed)
 
 
+# ===================================================================
+# HD JSON -> polygon-list (the contract evaluate_housediffusion expects)
+# ===================================================================
+
+def hd_json_to_polygons(hd: dict) -> list[dict]:
+    """Convert an HD JSON ({room_type, boxes, edges, ed_rm}) into the polygon
+    list shape consumed by ``evaluate_housediffusion``'s metric helpers
+    (``count_actual_rooms_from_polygons``, ``extract_room_geometries_from_polygons``,
+    ``build_access_graph_from_polygons``, ``compute_room_similarity_score_polygons``).
+
+    Each polygon dict has: ``coords`` (list of ``(x, y)`` corner tuples),
+    ``room_type`` (RPLAN category id), ``room_idx`` (entry index in the HD JSON).
+
+    Coordinates are integer pixels on the same 256x256 canvas that
+    ``corners_to_polygons_and_types`` produces, so polygons coming from
+    real House-Diffusion samples and polygons coming from LLM HD JSONs are
+    directly comparable without any rescaling.
+
+    For each room/door entry ``i`` we use ``boxes[i]`` (the axis-aligned
+    bounding rectangle the LLM is required to provide) as the polygon
+    geometry. ``boxes[i]`` is the LLM's effective room shape: the HD format
+    forces every wall segment in ``edges`` to lie inside it, and downstream
+    visualisers (``benchmark/utils/visualize_rplan_json.py``) likewise
+    render rooms from the box. Using boxes here keeps the few-shot eval
+    aligned with what the user actually sees and what gets exported as a
+    per-sample HD JSON.
+    """
+    if not isinstance(hd, dict):
+        return []
+    rt = hd.get("room_type") or []
+    boxes = hd.get("boxes") or []
+    if not isinstance(rt, list) or not isinstance(boxes, list):
+        return []
+
+    polygons: list[dict] = []
+    for i, (cat, box) in enumerate(zip(rt, boxes)):
+        if not (isinstance(box, list) and len(box) == 4):
+            continue
+        try:
+            x1, y1, x2, y2 = (int(v) for v in box)
+        except (TypeError, ValueError):
+            continue
+        if not (x1 < x2 and y1 < y2):
+            continue
+        polygons.append({
+            "coords": [(x1, y1), (x2, y1), (x2, y2), (x1, y2)],
+            "room_type": int(cat),
+            "room_idx": i,
+        })
+    return polygons
+
+
+# ===================================================================
+# Per-sample evaluator: runs the same pipeline as
+# benchmark.src.evaluate_housediffusion.postprocess_sample, but on
+# (gt_hd, pred_hd) pairs rather than on diffusion tensors.
+# ===================================================================
+
+def score_hd_sample(
+    gt_hd: Optional[dict],
+    pred_hd: dict,
+    *,
+    sample_idx: int,
+    run_results: dict,
+    ged_upper_bound: int = 40,
+) -> dict:
+    """Run the full evaluate_housediffusion metric pipeline on one sample.
+
+    Updates ``run_results`` (the aggregate dict produced by
+    ``_make_results_dict``) in place AND returns a flat dict of the
+    per-sample metric values, ready to merge into the result record.
+
+    GED is *not* computed here: a (G_pred, G_true, sample_idx, upper_bound)
+    pair is appended to ``run_results['ged_pairs']`` and resolved in
+    parallel later via ``_parallel_ged``.
+    """
+    out: dict = {}
+
+    if not isinstance(pred_hd, dict):
+        out["scoring_error"] = "pred_hd is not a dict"
+        return out
+    if gt_hd is None:
+        out["scoring_error"] = "ground_truth_hd missing for this sample"
+        return out
+
+    pred_polygons = hd_json_to_polygons(pred_hd)
+    gt_polygons = hd_json_to_polygons(gt_hd)
+
+    if not pred_polygons:
+        out["scoring_error"] = "predicted HD JSON has no usable boxes"
+        return out
+    if not gt_polygons:
+        out["scoring_error"] = "ground-truth HD JSON has no usable boxes"
+        return out
+
+    G_true = build_access_graph_from_polygons(gt_polygons)
+    G_pred = build_access_graph_from_polygons(pred_polygons)
+
+    gt_room_type_list = [
+        int(p["room_type"]) for p in gt_polygons
+        if p["room_type"] not in (FRONT_DOOR_CAT, INTERIOR_DOOR_CAT)
+    ]
+    run_results["per_sample_room_counts"].append(len(gt_room_type_list))
+
+    room_count_info = count_actual_rooms_from_polygons(pred_polygons)
+    if len(room_count_info["hidden_rooms"]) > 0:
+        run_results["hidden_room_count"] += 1
+
+    # NOTE: This mirrors evaluate_housediffusion exactly: 'accuracy' is the
+    # combined room-count + room-type score, 'room_count_accuracy' is the
+    # count-only score, and 'room_type_accuracy' is the multiset-overlap
+    # score. The aggregate-bucket names are kept identical to the
+    # evaluate_housediffusion ones so _build_report_kwargs Just Works.
+    rta = room_type_accuracy(gt_room_type_list, room_count_info["actual_room_types"])
+    run_results["room_count_accuracies"].append(rta["accuracy"])
+    run_results["room_count_accuracy_scores"].append(rta["room_count_accuracy"])
+    run_results["room_type_accuracy_scores"].append(rta["room_type_accuracy"])
+
+    sim = compute_room_similarity_score_polygons(pred_polygons, gt_polygons)
+    run_results["similarity_scores"].append(sim["similarity_score"])
+    run_results["unmatched_pred_rooms"].append(sim["unmatched_pred"])
+    run_results["unmatched_gt_rooms"].append(sim["unmatched_gt"])
+    run_results["matched_room_pairs"].append(sim["matched_pairs"])
+
+    pred_geoms = extract_room_geometries_from_polygons(pred_polygons)
+    gt_geoms = extract_room_geometries_from_polygons(gt_polygons)
+    area = compute_area_prop_metric(
+        _room_geometries_to_area_tuples(pred_geoms),
+        _room_geometries_to_area_tuples(gt_geoms),
+    )
+    run_results["area_proportion_errors"].append(area["area_proportion_error"])
+
+    overlap = compute_spatial_overlap_ratio_from_polygons(pred_polygons)
+    run_results["spatial_overlap_ratios"].append(overlap)
+
+    run_results["ged_pairs"].append((G_pred, G_true, sample_idx, ged_upper_bound))
+
+    out.update({
+        # Combined accuracy (matches evaluate_housediffusion's
+        # 'room_count_accuracies' bucket / report label "Room Accuracy").
+        "accuracy": rta["accuracy"],
+        "room_count_accuracy": rta["room_count_accuracy"],
+        "room_type_accuracy": rta["room_type_accuracy"],
+        "similarity_score": sim["similarity_score"],
+        "area_proportion_error": area["area_proportion_error"],
+        "spatial_overlap_ratio": overlap,
+        "num_visible_pred_rooms": room_count_info["total_rooms"],
+        "num_expected_pred_rooms": room_count_info["expected_rooms"],
+        "num_hidden_pred_rooms": len(room_count_info["hidden_rooms"]),
+        "num_gt_rooms": len(gt_room_type_list),
+        "unmatched_pred_rooms": sim["unmatched_pred"],
+        "unmatched_gt_rooms": sim["unmatched_gt"],
+        "matched_room_pairs": sim["matched_pairs"],
+    })
+    return out
+
+
 def score_against_accessgraph(
     target_ag: dict, hd: dict,
 ) -> dict:
@@ -537,6 +725,17 @@ class HdFewShotEvaluator(ABC):
     def __init__(self, args):
         self.args = args
         self.generator = None  # set in load_model
+        # Aggregate metric arrays, identical layout to
+        # benchmark.src.evaluate_housediffusion. Per-sample evals append into
+        # this dict; _save_final flushes it to results.npz/results.txt via
+        # report_results(). The counter for raw/scoring failures is local;
+        # everything else is tracked through the standard buckets.
+        self.run_results: dict = _make_results_dict()
+        self.scoring_failure_count: int = 0
+        # Index used as ``sample_idx`` for the GED pairs queue. Must be
+        # unique per sample; we increment regardless of success so resumed
+        # runs stay aligned with the original ordering.
+        self._next_sample_idx: int = 0
 
     # -- subclass hooks ----------------------------------------------------
 
@@ -639,11 +838,44 @@ class HdFewShotEvaluator(ABC):
             "failed_checks": validation.failed,
         }
 
-        scores = score_against_accessgraph(sample["accessgraph"], hd)
-        result.update(scores)
-        # "success" is a coarse summary: structural validity + room count match.
+        # Keep the lightweight access-graph reconstruction scores around as
+        # diagnostic fields in the JSON log (edge F1, outside-match, etc.).
+        # They are NOT what gets aggregated into results.txt -- that pipeline
+        # is the evaluate_housediffusion-equivalent metrics computed below.
+        ag_scores = score_against_accessgraph(sample["accessgraph"], hd)
+        result.update(ag_scores)
+
+        # Geometric metrics (delta, area-prop, overlap, room accuracies, GED
+        # pair) -- the same pipeline as benchmark.src.evaluate_housediffusion.
+        # This requires the per-id .txt to carry the GT HD JSON in the
+        # ``hypergraph`` field; load_sample exposes it as ``ground_truth_hd``.
+        sample_idx = self._next_sample_idx
+        self._next_sample_idx += 1
+        try:
+            hd_scores = score_hd_sample(
+                sample.get("ground_truth_hd"),
+                hd,
+                sample_idx=sample_idx,
+                run_results=self.run_results,
+            )
+        except Exception as exc:  # pragma: no cover -- defensive
+            hd_scores = {"scoring_error": f"score_hd_sample crashed: {exc}"}
+        if "scoring_error" in hd_scores:
+            self.scoring_failure_count += 1
+        result.update(hd_scores)
+
+        # "success" is a coarse summary: structural validity + the visible
+        # predicted room count matches the GT room count. This is the
+        # closest analogue to evaluate_diffplanner's success criterion and
+        # uses the *post-hidden-room* count (rooms that survive shapely
+        # subset checks), so it stays consistent with the metrics we report.
+        n_visible = result.get("num_visible_pred_rooms")
+        n_gt = result.get("num_gt_rooms")
         result["success"] = bool(
-            validation.is_valid and scores.get("room_count_accuracy", 0.0) == 1.0,
+            validation.is_valid
+            and n_visible is not None
+            and n_gt is not None
+            and n_visible == n_gt,
         )
         return result
 
@@ -708,8 +940,10 @@ class HdFewShotEvaluator(ABC):
 
             if result["success"]:
                 msg = (
-                    f"OK  | edge-F1={result.get('edge_f1', 0):.2f} "
-                    f"room-types={result.get('room_type_accuracy', 0):.2f}"
+                    f"OK  | delta={result.get('similarity_score', float('nan')):.3f} "
+                    f"area-prop={result.get('area_proportion_error', float('nan')):.3f} "
+                    f"overlap={result.get('spatial_overlap_ratio', float('nan')):.3f} "
+                    f"room-acc={result.get('accuracy', 0):.2f}"
                 )
             elif result.get("json_extracted"):
                 msg = (
@@ -743,19 +977,56 @@ class HdFewShotEvaluator(ABC):
     # -- aggregate stats ---------------------------------------------------
 
     def compute_statistics(self, results: list[dict]) -> dict:
+        """Aggregate statistics for the JSON log.
+
+        Exposes both the geometric metrics that are reported through
+        ``report_results`` (delta, area-prop error, room accuracies, GED,
+        spatial overlap) AND the access-graph diagnostics (edge F1) we
+        keep around for backwards compatibility with older notebooks.
+        """
         n = len(results)
         json_ok = [r for r in results if r.get("json_extracted")]
         valid = [r for r in results if r.get("validation", {}).get("is_valid")]
         ok = [r for r in results if r.get("success")]
         timed_out = [r for r in results if r.get("timed_out")]
-        room_count_match = [r for r in results if r.get("room_count_accuracy", 0.0) == 1.0]
-        room_types_exact = [r for r in results if r.get("room_type_accuracy", 0.0) == 1.0]
         outside_ok = [r for r in results if r.get("outside_match")]
+        scored = [r for r in results if r.get("scoring_error") is None
+                  and r.get("similarity_score") is not None]
+
+        def _vals(key):
+            return [r[key] for r in scored if r.get(key) is not None
+                    and not (isinstance(r[key], float) and np.isnan(r[key]))]
+
+        # Use np.nanmean so a few NaNs (e.g. spatial overlap on degenerate
+        # samples) don't poison the average; if every sample is NaN the mean
+        # silently returns NaN, which is what report_results does too.
+        def _nanmean(xs):
+            if not xs:
+                return None
+            arr = np.asarray(xs, dtype=float)
+            if not np.isfinite(arr).any():
+                return None
+            return float(np.nanmean(arr))
+
+        deltas = _vals("similarity_score")
+        area_props = _vals("area_proportion_error")
+        overlaps = _vals("spatial_overlap_ratio")
+        accs = _vals("accuracy")
+        rcs = _vals("room_count_accuracy")
+        rts = _vals("room_type_accuracy")
+
+        # Hidden-room counter -- prefer the live aggregate (true while the
+        # run is in progress); fall back to a per-result scan so resumed
+        # runs (where self.run_results was rebuilt from a checkpoint) still
+        # report a consistent number.
+        hidden_count = self.run_results.get("hidden_room_count", 0)
+        if hidden_count == 0 and any(r.get("num_hidden_pred_rooms") for r in results):
+            hidden_count = sum(1 for r in results
+                               if (r.get("num_hidden_pred_rooms") or 0) > 0)
 
         edge_f1 = [r["edge_f1"] for r in results if "edge_f1" in r]
         edge_p = [r["edge_precision"] for r in results if "edge_precision" in r]
         edge_r = [r["edge_recall"] for r in results if "edge_recall" in r]
-        room_acc = [r["room_type_accuracy"] for r in results if "room_type_accuracy" in r]
         times = [r["generation_time"] for r in results if r.get("generation_time") is not None]
 
         def _avg(xs):
@@ -768,15 +1039,27 @@ class HdFewShotEvaluator(ABC):
             "successful": len(ok),
             "timed_out": len(timed_out),
             "success_rate": (len(ok) / n) if n else 0.0,
-            "room_count_match": len(room_count_match),
-            "room_types_exact_match": len(room_types_exact),
+            "scored_samples": len(scored),
+            "scoring_failures": self.scoring_failure_count
+                or sum(1 for r in results if r.get("scoring_error")),
+            "hidden_room_count": hidden_count,
             "outside_match": len(outside_ok),
+            # The same metrics that get persisted to results.txt by
+            # report_results, surfaced here for at-a-glance reading of
+            # the JSON log.
+            "geometric_metrics": {
+                "similarity_avg": _nanmean(deltas),
+                "area_proportion_error_avg": _nanmean(area_props),
+                "spatial_overlap_ratio_avg": _nanmean(overlaps),
+                "accuracy_avg": _nanmean(accs),
+                "room_count_accuracy_avg": _nanmean(rcs),
+                "room_type_accuracy_avg": _nanmean(rts),
+            },
             "edge_metrics": {
                 "f1_avg": _avg(edge_f1),
                 "precision_avg": _avg(edge_p),
                 "recall_avg": _avg(edge_r),
             },
-            "room_type_accuracy_avg": _avg(room_acc),
             "inference_time": {
                 "average_seconds": _avg(times),
                 "min_seconds": min(times) if times else None,
@@ -787,17 +1070,82 @@ class HdFewShotEvaluator(ABC):
 
     # -- I/O helpers -------------------------------------------------------
 
-    @staticmethod
-    def _load_checkpoint(args) -> tuple[list[dict], set[str]]:
+    def _load_checkpoint(self, args) -> tuple[list[dict], set[str]]:
+        """Reload a partially-completed run.
+
+        Replays the per-sample geometric metrics back into
+        ``self.run_results`` so that the final ``results.txt`` /
+        ``results.npz`` reflect ALL samples, not just the new ones. GED
+        cannot be replayed (the access graphs are not in the JSON log),
+        so for resumed runs the GED column in ``results.txt`` is computed
+        only from the newly-evaluated samples; the warning logged below
+        makes that explicit.
+        """
         existing: list[dict] = []
         completed: set[str] = set()
         cp = getattr(args, "checkpoint", None)
-        if cp and Path(cp).exists():
-            with open(cp) as f:
-                data = json.load(f)
-            existing = data.get("results", []) or []
-            completed = {r["filename"] for r in existing}
-            logger.info("Loaded checkpoint: %d samples", len(completed))
+        if not (cp and Path(cp).exists()):
+            return existing, completed
+
+        with open(cp) as f:
+            data = json.load(f)
+        existing = data.get("results", []) or []
+        completed = {r["filename"] for r in existing}
+        logger.info("Loaded checkpoint: %d samples", len(completed))
+
+        replayed = 0
+        for r in existing:
+            if r.get("scoring_error") is not None:
+                self.scoring_failure_count += 1
+                continue
+            if r.get("similarity_score") is None:
+                continue
+
+            self.run_results["similarity_scores"].append(r["similarity_score"])
+            self.run_results["area_proportion_errors"].append(
+                r.get("area_proportion_error", float("nan"))
+            )
+            self.run_results["spatial_overlap_ratios"].append(
+                r.get("spatial_overlap_ratio", float("nan"))
+            )
+            self.run_results["room_count_accuracies"].append(r.get("accuracy", 0.0))
+            self.run_results["room_count_accuracy_scores"].append(
+                r.get("room_count_accuracy", 0.0)
+            )
+            self.run_results["room_type_accuracy_scores"].append(
+                r.get("room_type_accuracy", 0.0)
+            )
+            self.run_results["per_sample_room_counts"].append(r.get("num_gt_rooms", 0))
+            self.run_results["unmatched_pred_rooms"].append(
+                r.get("unmatched_pred_rooms", 0)
+            )
+            self.run_results["unmatched_gt_rooms"].append(
+                r.get("unmatched_gt_rooms", 0)
+            )
+            self.run_results["matched_room_pairs"].append(
+                r.get("matched_room_pairs", [])
+            )
+            if (r.get("num_hidden_pred_rooms") or 0) > 0:
+                self.run_results["hidden_room_count"] += 1
+            replayed += 1
+
+        # Advance the GED-pair sample index past the replayed records.
+        self._next_sample_idx = len(existing)
+        if replayed and replayed < len(existing):
+            logger.info(
+                "Replayed %d/%d checkpoint samples into the metric aggregate "
+                "(%d had no scores).",
+                replayed, len(existing), len(existing) - replayed,
+            )
+        elif replayed:
+            logger.info("Replayed %d checkpoint samples into the metric aggregate.",
+                        replayed)
+        if replayed:
+            logger.info(
+                "Note: GED cannot be replayed from a JSON checkpoint; the "
+                "GED column in results.txt reflects only the newly-evaluated "
+                "samples in this resume.",
+            )
         return existing, completed
 
     @staticmethod
@@ -858,7 +1206,53 @@ class HdFewShotEvaluator(ABC):
                 indent=2,
             )
 
+    def _resolve_out_dir(self, args) -> Path:
+        """Where to write results.npz / results.txt.
+
+        Defaults to ``<output stem>_metrics/`` next to ``--output`` so a
+        user who runs ``--output results/run.json`` finds their aggregate
+        report under ``results/run_metrics/``. Override with ``--out``.
+        """
+        explicit = getattr(args, "out", None)
+        if explicit:
+            return Path(explicit)
+        out = Path(args.output)
+        return out.with_name(f"{out.stem}_metrics")
+
     def _save_final(self, args, results: list[dict]) -> None:
+        # Resolve any pending GED pairs IN PLACE on self.run_results so the
+        # JSON-log statistics and results.txt see the same all_geds list.
+        if self.run_results.get("ged_pairs") and not self.run_results.get("all_geds"):
+            try:
+                self.run_results["all_geds"] = _parallel_ged(
+                    self.run_results["ged_pairs"]
+                )
+            except Exception as exc:  # pragma: no cover -- defensive
+                logger.warning("Parallel GED failed (%s); leaving GED column empty.",
+                               exc)
+                self.run_results["all_geds"] = []
+
+        # Also mirror the per-sample GED back onto the result records so a
+        # user reading the JSON log sees the same number that ends up in
+        # results.txt. We pair by sample_idx (preserved when each pair was
+        # appended in evaluate_sample).
+        ged_by_idx: dict[int, float] = {}
+        for pair, ged in zip(self.run_results.get("ged_pairs", []),
+                             self.run_results.get("all_geds", [])):
+            if len(pair) >= 3:
+                ged_by_idx[int(pair[2])] = ged
+        # Position i in `results` matches sample_idx i (replays sit at the
+        # front of `results` in the same order they were originally
+        # evaluated, and new samples are appended afterwards with
+        # self._next_sample_idx starting at len(existing)).
+        for i, r in enumerate(results):
+            if i in ged_by_idx and "ged" not in r:
+                ged_val = ged_by_idx[i]
+                if isinstance(ged_val, float) and np.isnan(ged_val):
+                    r["ged"] = None
+                else:
+                    r["ged"] = float(ged_val)
+
         stats = self.compute_statistics(results)
         meta = {
             "timestamp": datetime.now().isoformat(),
@@ -896,6 +1290,34 @@ class HdFewShotEvaluator(ABC):
             "Per-sample HD JSONs in %s (%d total; %d written this finalize pass)",
             per_sample_dir, n_total_hd, n_written,
         )
+
+        # Final report (results.npz + results.txt) -- byte-for-byte the same
+        # layout produced by benchmark.src.evaluate_housediffusion.
+        if not self.run_results.get("room_count_accuracies"):
+            logger.warning(
+                "No samples were geometrically scored; skipping results.npz/results.txt. "
+                "Likely causes: every sample failed JSON extraction, or none of the "
+                "input .txt files carry a ground-truth HD JSON in their `hypergraph` field.",
+            )
+            return
+
+        out_dir = self._resolve_out_dir(args)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_results(
+            str(out_dir),
+            num_variations=1,
+            checkpoint_path=getattr(args, "model", None) or "n/a",
+            data_path=args.dataset_dir,
+            **_build_report_kwargs(self.run_results),
+        )
+        logger.info("Aggregate report (results.npz + results.txt) written to: %s",
+                    out_dir)
+        if self.run_results.get("hidden_room_count"):
+            logger.info("Hidden rooms: %d sample(s) had >=1 fully-occluded predicted room.",
+                        self.run_results["hidden_room_count"])
+        if self.scoring_failure_count:
+            logger.info("Scoring failures: %d sample(s) had no usable HD geometry.",
+                        self.scoring_failure_count)
 
 
 def _patch_system_prompt(new_system_prompt: str) -> None:
@@ -950,7 +1372,19 @@ def cli() -> int:
         help="Directory to draw few-shot examples from (defaults to --dataset-dir)",
     )
     parser.add_argument("--output", type=str, default=None,
-                        help="Aggregate eval report path (default: results_hd_<mode>_<model>_<seed>.json)")
+                        help="Aggregate eval JSON log path (default: results_hd_<mode>_<model>_<seed>.json). "
+                             "Holds metadata, the statistics summary, and every per-sample result record. "
+                             "The geometric metrics report (results.npz + results.txt) is written to a "
+                             "separate directory; see --out.")
+    parser.add_argument(
+        "--out", type=str, default=None,
+        help=(
+            "Directory for the aggregate metrics report (results.npz + results.txt), "
+            "produced via the same utils.report_results pipeline as "
+            "benchmark/src/evaluate_housediffusion.py. Defaults to "
+            "<output stem>_metrics/ next to --output."
+        ),
+    )
     parser.add_argument(
         "--per-sample-dir", type=str, default=None,
         help=(
