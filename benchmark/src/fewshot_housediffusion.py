@@ -6,10 +6,12 @@ Mode:
     fewshot-gpt -- GPT via the OpenAI API, single process
 
 The model is asked to produce a House-Diffusion JSON (``room_type`` / ``boxes``
-/ ``edges`` / ``ed_rm``) from an access graph. Eval samples are per-id
-``<id>.txt`` files of the form ``{"accessgraph": ..., "hypergraph": <hd_json_str>}``,
-where the access graph is the LLM-visible input and the ``hypergraph`` field
-holds the ground-truth HD JSON used for scoring.
+/ ``edges`` / ``ed_rm``) from an access graph. Eval samples are the canonical
+House-Diffusion ``<id>.json`` files (e.g. those under
+``dataset/rplan/dataset_housediffusion/test/``); the access graph the LLM
+sees as input is derived on the fly from each HD JSON via the inlined
+``extract_access_graph_from_hd`` helper. The same HD JSON is kept around as
+``ground_truth_hd`` and used post-generation for geometric scoring.
 
 Scoring is the SAME pipeline as ``benchmark/src/evaluate_housediffusion.py``
 (delta / room similarity, area-proportion error, spatial overlap, room-count
@@ -814,20 +816,51 @@ def score_against_accessgraph(
 # Sample loading & few-shot example loading (HD-aware)
 # ===================================================================
 
+# Glob pattern for the canonical House-Diffusion test dataset.
+# Each file is one HD JSON (``room_type`` / ``boxes`` / ``edges`` / ``ed_rm``);
+# the access graph used as the LLM-visible input is derived on the fly via
+# ``extract_access_graph_from_hd``, so no separate data-prep step is needed.
+_HD_GLOB = "*.json"
+
+
+def _load_hd_json_file(fpath: Path) -> Optional[dict]:
+    """Read one ``<id>.json`` HD file and return the parsed dict, or None on failure."""
+    try:
+        with fpath.open() as f:
+            hd = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Skipping %s: %s", fpath.name, e)
+        return None
+    if not _looks_like_hd_json(hd):
+        logger.warning("Skipping %s: not a House-Diffusion JSON (need %s)",
+                       fpath.name, ", ".join(_HD_REQUIRED_FIELDS))
+        return None
+    return hd
+
+
 def load_sample(fpath: Path) -> dict:
-    """Load one per-id ``<id>.txt`` eval file (``{"accessgraph": ..., "hypergraph": <hd_json_str>}``)."""
-    with fpath.open() as f:
-        data = json.load(f)
-    ag = data.get("accessgraph", {}) or {}
-    hg_raw = data.get("hypergraph")
-    if hg_raw is None or (isinstance(hg_raw, str) and not hg_raw.strip()):
-        gt_hd: Optional[dict] = None
-    else:
-        gt_hd = json.loads(hg_raw) if isinstance(hg_raw, str) else hg_raw
+    """Load one canonical House-Diffusion ``<id>.json`` file.
+
+    The access graph (the LLM's input) is derived on the fly from the HD
+    JSON itself via :func:`extract_access_graph_from_hd`. The HD JSON is
+    also kept around as ``ground_truth_hd`` for post-generation scoring.
+    """
+    hd = _load_hd_json_file(fpath)
+    if hd is None:
+        # Surface a stub so the caller can still see the filename in errors.
+        return {
+            "filename": fpath.name,
+            "accessgraph": {"nodes": {}, "edges": []},
+            "ground_truth_hd": None,
+            "num_nodes": 0,
+            "num_edges": 0,
+            "load_error": True,
+        }
+    ag = extract_access_graph_from_hd(hd)
     return {
         "filename": fpath.name,
         "accessgraph": ag,
-        "ground_truth_hd": gt_hd,
+        "ground_truth_hd": hd,
         "num_nodes": len(ag.get("nodes", {}) or {}),
         "num_edges": len(ag.get("edges", []) or []),
     }
@@ -840,19 +873,23 @@ def load_hd_examples(
     exclude_file: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> list[dict]:
-    """Load few-shot examples from the dataset dir, parsing the HD JSON payload.
+    """Load few-shot examples from the dataset dir.
 
-    Mirrors :func:`utils.data_loading.load_example_hypergraphs` but kept local
-    so this script does not depend on the BSP-specific module.
+    Each example is one canonical ``<id>.json`` House-Diffusion file; the
+    access graph the LLM sees as the example INPUT is derived from the HD
+    JSON itself via :func:`extract_access_graph_from_hd` so no separate
+    pre-built ``{accessgraph, hypergraph}`` records are needed.
     """
     if num_examples is None or num_examples <= 0:
         return []
 
-    files = sorted(examples_dir.glob("*.txt"), key=lambda p: p.name)
+    files = sorted(examples_dir.glob(_HD_GLOB), key=lambda p: p.name)
     if exclude_file:
         files = [f for f in files if f.name != exclude_file]
     if not files:
-        raise FileNotFoundError(f"No example .txt files in {examples_dir}")
+        raise FileNotFoundError(
+            f"No example {_HD_GLOB} files in {examples_dir}"
+        )
 
     if seed is not None:
         rng = random.Random(seed)
@@ -862,30 +899,21 @@ def load_hd_examples(
 
     examples: list[dict] = []
     for fp in chosen:
-        try:
-            with fp.open() as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Skipping example %s: %s", fp.name, e)
+        hd = _load_hd_json_file(fp)
+        if hd is None:
             continue
-        ag = data.get("accessgraph", {}) or {}
-        hg = data.get("hypergraph")
-        if isinstance(hg, str):
-            try:
-                hg = json.loads(hg)
-            except json.JSONDecodeError as e:
-                logger.warning("Skipping example %s: bad hypergraph JSON (%s)", fp.name, e)
-                continue
-        if not _looks_like_hd_json(hg):
-            logger.warning("Skipping example %s: hypergraph is not an HD JSON", fp.name)
+        ag = extract_access_graph_from_hd(hd)
+        if not ag.get("nodes"):
+            logger.warning("Skipping example %s: derived access graph has no nodes",
+                           fp.name)
             continue
-        examples.append({"filename": fp.name, "accessgraph": ag, "hypergraph": hg})
+        examples.append({"filename": fp.name, "accessgraph": ag, "hypergraph": hd})
 
     if not examples:
         raise ValueError(
             f"Could not load any HD examples from {examples_dir}; "
-            "expected per-id .txt files of shape "
-            '{"accessgraph": ..., "hypergraph": <hd_json_str>}.',
+            "expected House-Diffusion JSON files (room_type / boxes / "
+            "edges / ed_rm)."
         )
     return examples
 
@@ -1022,8 +1050,8 @@ class HdFewShotEvaluator(ABC):
 
         # Geometric metrics (delta, area-prop, overlap, room accuracies, GED
         # pair) -- the same pipeline as benchmark.src.evaluate_housediffusion.
-        # This requires the per-id .txt to carry the GT HD JSON in the
-        # ``hypergraph`` field; load_sample exposes it as ``ground_truth_hd``.
+        # The GT HD JSON comes straight from the input file (``load_sample``
+        # parses each <id>.json HD file and exposes it as ``ground_truth_hd``).
         sample_idx = self._next_sample_idx
         self._next_sample_idx += 1
         try:
@@ -1062,20 +1090,24 @@ class HdFewShotEvaluator(ABC):
         random.seed(args.seed)
 
         dataset_dir = Path(args.dataset_dir)
-        all_files = sorted(dataset_dir.glob("*.txt"), key=lambda p: p.name)
+        all_files = sorted(dataset_dir.glob(_HD_GLOB), key=lambda p: p.name)
         if not all_files:
-            logger.error("No .txt files found in %s", dataset_dir)
+            logger.error("No %s files found in %s", _HD_GLOB, dataset_dir)
             return 1
 
         if getattr(args, "max_rooms", None):
+            # Count rooms by reading the HD JSON's room_type list and
+            # excluding door entries (categories 15 / 17). This matches
+            # how the access graph is derived (door entries are NOT nodes),
+            # so the cap stays consistent with the LLM's view.
             kept: list[Path] = []
             for fp in all_files:
-                try:
-                    with fp.open() as f:
-                        n = len(json.load(f).get("accessgraph", {}).get("nodes", {}))
-                except (OSError, json.JSONDecodeError):
+                hd = _load_hd_json_file(fp)
+                if hd is None:
                     continue
-                if n <= args.max_rooms:
+                rt = hd.get("room_type") or []
+                n_rooms = sum(1 for c in rt if c not in _DOOR_CATS)
+                if n_rooms <= args.max_rooms:
                     kept.append(fp)
             logger.info("Room filter (max %d): kept %d/%d", args.max_rooms, len(kept), len(all_files))
             all_files = kept
@@ -1375,7 +1407,7 @@ class HdFewShotEvaluator(ABC):
             return None
         out_dir = HdFewShotEvaluator._per_sample_dir(args)
         out_dir.mkdir(parents=True, exist_ok=True)
-        sid = result["filename"].replace(".txt", "")
+        sid = Path(result["filename"]).stem
         target = out_dir / f"{sid}.json"
         tmp = target.with_suffix(".json.tmp")
         with open(tmp, "w") as f:
@@ -1489,7 +1521,7 @@ class HdFewShotEvaluator(ABC):
         for r in results:
             if r.get("generated_hd") is None:
                 continue
-            sid = r["filename"].replace(".txt", "")
+            sid = Path(r["filename"]).stem
             if not (per_sample_dir / f"{sid}.json").exists():
                 self._save_one_hd(args, r)
                 n_written += 1
@@ -1505,7 +1537,7 @@ class HdFewShotEvaluator(ABC):
             logger.warning(
                 "No samples were geometrically scored; skipping results.npz/results.txt. "
                 "Likely causes: every sample failed JSON extraction, or none of the "
-                "input .txt files carry a ground-truth HD JSON in their `hypergraph` field.",
+                "input HD JSON files were readable.",
             )
             return
 
@@ -1573,8 +1605,10 @@ def cli() -> int:
 
     parser.add_argument(
         "--dataset-dir", type=str, required=True,
-        help='Directory of per-id <id>.txt eval files of shape '
-             '{"accessgraph": ..., "hypergraph": <hd_json_str>}',
+        help="Directory of canonical House-Diffusion <id>.json files (each "
+             "containing room_type / boxes / edges / ed_rm), e.g. "
+             "dataset/rplan/dataset_housediffusion/test. The access graph "
+             "shown to the LLM is derived on the fly from each HD JSON.",
     )
     parser.add_argument(
         "--examples-dir", type=str, default=None,
