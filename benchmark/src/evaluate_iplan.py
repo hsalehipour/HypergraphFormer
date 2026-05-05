@@ -513,15 +513,24 @@ def run_iplan_one(mat_path_in: Path, models: dict,
     fully_ok, n_placed, n_target = _run_stage2(str(mat_path), models)
     t_stage2 = time.time() - t1
 
-    if n_placed == 0:
-        # Stage 2 produced no centers; Stage 3 cannot run. Return a record
-        # marked 'failed' so downstream metrics see an empty prediction
-        # (no pred polygons -> gap_ratio = 1.0, no matched rooms).
+    # Stage 2 must place at least the Living anchor (rTypes==0) AND one
+    # other room before Stage 3 can run. Stage 3's input loader
+    # (synth/floorplan/roompartition_fp.py) filters out the Living
+    # anchor with ``ind = self.rTypes == 0`` and then indexes
+    # ``self.rTypes[~ind]`` -- so it needs a non-Living center. Worse,
+    # iPLAN reads the .mat with ``squeeze_me=True``, so a length-1
+    # ``rTypes`` array (i.e. only the Living anchor) collapses to a
+    # Python int and the indexing crashes with
+    # ``TypeError: 'int' object is not subscriptable``. We bail out
+    # gracefully in BOTH cases (n_placed in {0, 1}), surfacing the
+    # status so the per-sample report still distinguishes them from
+    # full success.
+    if n_placed <= 1:
         rec = _read_iplan_mat_meta(str(mat_path))
         rec["layout"] = np.full((IPLAN_CANVAS_SIZE, IPLAN_CANVAS_SIZE), 13,
                                 dtype=np.int16).tolist()
         rec["__pp_status"] = "failed"
-        rec["__n_placed"] = 0
+        rec["__n_placed"] = int(n_placed)
         rec["__n_target"] = n_target
         return rec, "failed", {"stage2_s": t_stage2, "stage3_s": 0.0}
 
