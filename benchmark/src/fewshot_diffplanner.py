@@ -71,6 +71,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -84,9 +85,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 from tqdm import tqdm
 
 from scripts.generators import GPTGenerator
+
+# The few-shot script reuses the metric pipeline from the main DiffPlanner
+# benchmark so the per-sample numbers it reports (delta, area_proportion_error,
+# the boundary geometry triplet, the room-accuracy triplet, and the lost-room
+# counters) match ``evaluate_diffplanner.py`` byte-for-byte.
+from benchmark.src.evaluate_diffplanner import (
+    DP_CATEGORY_TO_MERGE_ID,
+    _add_diffplanner_to_path,
+    _aligned_polygons_from_record,
+    _build_report_kwargs,
+    _make_results_dict,
+    _post_process_record as _dp_post_process_record,
+    _visible_room_categories,
+    compute_boundary_geometry_metrics,
+)
+from benchmark.src.evaluate_diffplanner import evaluate_sample as _dp_evaluate_sample
+from utils.report_results import report_results
 
 logger = logging.getLogger(__name__)
 
@@ -530,132 +549,116 @@ def validate_dp_json(
 
 
 # ===================================================================
-# Per-category IoU scoring (mirrors DiffPlanner Coverage_GT_avg, Eq. 9)
+# Per-sample DiffPlanner scoring
+#
+# We deliberately reuse the *exact* metric pipeline from
+# ``benchmark/src/evaluate_diffplanner.py`` so the few-shot LLM run produces
+# the same per-sample arrays (and the same ``results.npz`` / ``results.txt``)
+# as the real DiffPlanner cascade evaluation. The only difference is the
+# source of the predicted record: instead of running the cascade, we take the
+# LLM's generated rooms and feed them through the same post-processing /
+# metric path the cascade output goes through.
+#
+# When ``--diffplanner_root`` is provided, ``post_processing.main`` is run on
+# each generated record (high-fidelity, identical to ``evaluate_diffplanner``).
+# When it isn't, we synthesize the ``r_boundary_aligned`` / ``box_aligned``
+# fields directly from the LLM's raw boxes and mark the record as
+# ``raw_fallback`` -- the same shape ``evaluate_diffplanner`` already uses
+# whenever post-processing fails.
 # ===================================================================
 
-def _per_category_iou(
-    pred_rooms: list[dict], gt_rooms: list[dict],
-) -> dict[int, float]:
-    """Per-category IoU between the union of predicted boxes and union of GT boxes.
+def _raw_fallback_record(record: dict) -> dict:
+    """Synthesize ``r_boundary_aligned`` / ``box_aligned`` from raw boxes.
 
-    For each of the 6 DiffPlanner categories we union all room polygons of that
-    category in the prediction and in the GT, then compute IoU between the two
-    unions. Categories absent from BOTH sides return 1.0; absent from one side
-    only return 0.0. This is the same shape as ``Coverage_GT_avg`` (Eq. 9) and
-    ``Diversity_avg`` (Eq. 8) in the paper.
+    Mirrors the ``raw_fallback`` branch of
+    :func:`evaluate_diffplanner._post_process_record` so that downstream metric
+    code (which expects ``r_boundary_aligned``) keeps working even when
+    DiffPlanner's ``output/post_processing.py`` is not on the import path.
     """
-    from shapely.geometry import box as shapely_box
-    from shapely.ops import unary_union
-
-    def _union_for_cat(rooms: list[dict], cat: int):
-        polys = [
-            shapely_box(r["box"][0], r["box"][1], r["box"][2], r["box"][3])
-            for r in rooms
-            if int(r.get("category", -1)) == cat
-            and _is_int_box(r.get("box"))
-        ]
-        if not polys:
-            return None
-        return unary_union(polys)
-
-    out: dict[int, float] = {}
-    for cat in DP_CATEGORY_TO_NAME:
-        a = _union_for_cat(pred_rooms, cat)
-        b = _union_for_cat(gt_rooms, cat)
-        if a is None and b is None:
-            out[cat] = 1.0
-            continue
-        if a is None or b is None:
-            out[cat] = 0.0
-            continue
-        inter = a.intersection(b).area
-        union = a.union(b).area
-        out[cat] = (inter / union) if union > 0 else 0.0
-    return out
+    fallback = copy.deepcopy(record)
+    for r in fallback.get("rooms", []):
+        box = r.get("box")
+        if box and len(box) == 4:
+            x0, y0, x1, y1 = box
+            r["box_aligned"] = [int(x0), int(y0), int(x1), int(y1)]
+            r["r_boundary_aligned"] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            r["order_aligned"] = int(r.get("id", 0)) + 1
+        else:
+            r["box_aligned"] = None
+            r["r_boundary_aligned"] = None
+            r["order_aligned"] = 0
+    fallback["adjacencies_aligned"] = list(fallback.get("adjacencies", []))
+    return fallback
 
 
-def _box_overlap_stats(rooms: list[dict]) -> dict[str, float]:
-    """Mean pairwise IoU and total overlap area across predicted boxes.
+def post_process_or_fallback(record: dict, *, dp_available: bool) -> tuple[dict, str]:
+    """Run DiffPlanner post-processing if available, else raw_fallback.
 
-    DiffPlanner explicitly tolerates small inter-room overlaps (its
-    post-processing closes the gaps), but the LLM may produce egregious
-    overlaps. These two scalars catch that without a hard pass/fail.
+    Returns ``(aligned_record, status)`` where ``status`` is one of
+    ``"aligned"`` / ``"raw_fallback"`` -- the same vocabulary
+    ``evaluate_diffplanner.py`` uses, so the ``raw_fallback_count`` in
+    ``run_results`` and ``results.txt`` is computed identically.
     """
-    from shapely.geometry import box as shapely_box
-
-    valid = [r for r in rooms if _is_int_box(r.get("box"))]
-    if len(valid) < 2:
-        return {"mean_pairwise_iou": 0.0, "total_overlap_area": 0.0}
-
-    polys = [shapely_box(r["box"][0], r["box"][1], r["box"][2], r["box"][3]) for r in valid]
-    n = len(polys)
-    iou_sum = 0.0
-    overlap_area = 0.0
-    pair_count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            inter = polys[i].intersection(polys[j]).area
-            if inter <= 0:
-                pair_count += 1
-                continue
-            union = polys[i].union(polys[j]).area
-            iou_sum += (inter / union) if union > 0 else 0.0
-            overlap_area += inter
-            pair_count += 1
-    mean_iou = iou_sum / pair_count if pair_count else 0.0
-    return {"mean_pairwise_iou": mean_iou, "total_overlap_area": overlap_area}
+    if dp_available:
+        try:
+            return _dp_post_process_record(record)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("post_processing.main raised %s; falling back to raw boxes", exc)
+    return _raw_fallback_record(record), "raw_fallback"
 
 
-def score_against_ground_truth(
-    sample: dict, dp: dict,
+def score_dp_sample(
+    gt_sample: dict,
+    generated_dp: dict,
+    *,
+    dp_available: bool,
+    run_results: dict,
 ) -> dict:
-    """Compare a generated DiffPlanner JSON against the ground-truth sample."""
-    gt_rooms = sample.get("rooms", []) or []
-    pred_rooms = dp.get("rooms", []) or []
+    """Score one LLM generation with the evaluate_diffplanner metric pipeline.
 
-    # Per-category IoU (DiffPlanner-style coverage metric).
-    try:
-        per_cat = _per_category_iou(pred_rooms, gt_rooms)
-    except Exception as e:  # pragma: no cover - defensive
+    Side-effects: appends per-sample arrays into ``run_results`` (the
+    aggregate dict returned by :func:`evaluate_diffplanner._make_results_dict`)
+    and returns a flat per-sample dict for the JSON log / progress logger.
+    """
+    full_record = assemble_diffplanner_sample(gt_sample, generated_dp)
+    aligned, pp_status = post_process_or_fallback(full_record, dp_available=dp_available)
+
+    pre_idx = len(run_results["similarity_scores"])
+    _dp_evaluate_sample(aligned, gt_sample, pp_status=pp_status, results=run_results)
+
+    if len(run_results["similarity_scores"]) != pre_idx + 1:
+        # _dp_evaluate_sample failed to append (e.g. shapely raised); surface a stub.
         return {
-            "scoring_error": str(e),
-            "coverage_gt_per_category": {},
-            "coverage_gt_avg": 0.0,
-            "boundary_coverage": 0.0,
-            "mean_pairwise_iou": 0.0,
-            "total_overlap_area": 0.0,
+            "delta": float("nan"),
+            "area_proportion_error": float("nan"),
+            "gap_ratio": float("nan"),
+            "outside_ratio": float("nan"),
+            "overlap_ratio": float("nan"),
+            "accuracy": 0.0,
+            "room_count_accuracy": 0.0,
+            "room_type_accuracy": 0.0,
+            "lost_rooms": 0,
+            "pp_status": pp_status,
+            "num_predicted_rooms_visible": 0,
+            "num_gt_rooms": len(gt_sample.get("rooms", []) or []),
+            "post_processed_dp": aligned,
         }
 
-    coverage_gt_avg = sum(per_cat.values()) / max(len(per_cat), 1)
-
-    # Coverage of the ground-truth boundary by the predicted box-union.
-    from shapely.geometry import box as shapely_box
-    from shapely.ops import unary_union
-
-    bpairs = _boundary_pairs(sample)
-    boundary_coverage = 0.0
-    if bpairs and pred_rooms:
-        try:
-            boundary_poly = _polygon_from_pairs(bpairs)
-            polys = [
-                shapely_box(r["box"][0], r["box"][1], r["box"][2], r["box"][3])
-                for r in pred_rooms if _is_int_box(r.get("box"))
-            ]
-            if polys and boundary_poly.area > 0:
-                union_poly = unary_union(polys)
-                boundary_coverage = union_poly.intersection(boundary_poly).area / boundary_poly.area
-        except Exception:
-            boundary_coverage = 0.0
-
-    overlap_stats = _box_overlap_stats(pred_rooms)
-
+    pred_visible_cats, _ = _visible_room_categories(aligned)
     return {
-        "coverage_gt_per_category": {DP_CATEGORY_TO_NAME[c]: round(v, 4) for c, v in per_cat.items()},
-        "coverage_gt_avg": coverage_gt_avg,
-        "boundary_coverage": boundary_coverage,
-        **overlap_stats,
-        "num_predicted_rooms": len(pred_rooms),
-        "num_gt_rooms": len(gt_rooms),
+        "delta": run_results["similarity_scores"][-1],
+        "area_proportion_error": run_results["area_proportion_errors"][-1],
+        "gap_ratio": run_results["gap_ratios"][-1],
+        "outside_ratio": run_results["outside_ratios"][-1],
+        "overlap_ratio": run_results["overlap_ratios"][-1],
+        "accuracy": run_results["accuracies"][-1],
+        "room_count_accuracy": run_results["room_count_accuracies"][-1],
+        "room_type_accuracy": run_results["room_type_accuracies"][-1],
+        "lost_rooms": run_results["lost_rooms_per_sample"][-1],
+        "pp_status": pp_status,
+        "num_predicted_rooms_visible": len(pred_visible_cats),
+        "num_gt_rooms": len(gt_sample.get("rooms", []) or []),
+        "post_processed_dp": aligned,
     }
 
 
@@ -768,6 +771,25 @@ class DpFewShotEvaluator(ABC):
         self.args = args
         self.dataset = dataset
         self.generator = None  # set in load_model
+        # Aggregate metric arrays in the same shape ``evaluate_diffplanner.py``
+        # uses, so we can pipe them through ``utils.report_results`` at the end
+        # of the run and produce identical ``results.npz`` / ``results.txt``.
+        self.run_results: dict = _make_results_dict()
+        # When --diffplanner_root is provided, expose DiffPlanner's
+        # ``output/post_processing.py`` on sys.path so we can run the same
+        # post-processing the cascade evaluator does.
+        self.dp_available: bool = False
+        dp_root = getattr(args, "diffplanner_root", None)
+        if dp_root is not None:
+            try:
+                _add_diffplanner_to_path(Path(dp_root))
+                self.dp_available = True
+                logger.info("DiffPlanner post-processing enabled (root=%s)", dp_root)
+            except Exception as exc:
+                logger.warning(
+                    "Could not enable DiffPlanner post-processing (%s); "
+                    "falling back to raw LLM boxes.", exc,
+                )
 
     # -- subclass hooks ----------------------------------------------------
 
@@ -862,7 +884,6 @@ class DpFewShotEvaluator(ABC):
         requested_cats = [int(r["category"]) for r in sample.get("rooms", []) or []]
         dp = normalize_generated_dp(dp_raw, requested_cats)
         result["generated_dp"] = dp
-        result["full_diffplanner_sample"] = assemble_diffplanner_sample(sample, dp)
 
         validation = validate_dp_json(
             dp,
@@ -875,14 +896,26 @@ class DpFewShotEvaluator(ABC):
             "failed_checks": validation.failed,
         }
 
-        scores = score_against_ground_truth(sample, dp)
+        # Score with the *exact* evaluate_diffplanner pipeline (post-process
+        # then compute delta / area-prop / boundary geometry / room accuracy),
+        # piping per-sample arrays into ``self.run_results`` so they can be
+        # passed to ``report_results`` at the end of the run.
+        scores = score_dp_sample(
+            sample, dp,
+            dp_available=self.dp_available,
+            run_results=self.run_results,
+        )
+        # Save the post-processed DP record on disk (this is the canonical
+        # shape ``benchmark/utils/visualize_diffplanner.py`` expects) and keep
+        # a flat copy of the metric values for the JSON log.
+        result["full_diffplanner_sample"] = scores.pop("post_processed_dp")
         result.update(scores)
 
-        # Coarse "success": passes structural validation AND has at least
-        # the requested room count.
+        # Coarse "success": passes structural validation AND keeps the
+        # requested room count after post-processing (i.e. no rooms lost).
         result["success"] = bool(
             validation.is_valid
-            and result.get("num_predicted_rooms", 0) == result["num_rooms_requested"],
+            and result.get("num_predicted_rooms_visible", 0) == result["num_rooms_requested"],
         )
         return result
 
@@ -928,8 +961,9 @@ class DpFewShotEvaluator(ABC):
 
             if result["success"]:
                 msg = (
-                    f"OK  | cov_gt={result.get('coverage_gt_avg', 0):.2f} "
-                    f"boundary_cov={result.get('boundary_coverage', 0):.2f}"
+                    f"OK  | delta={result.get('delta', float('nan')):.2f} "
+                    f"area_err={result.get('area_proportion_error', float('nan')):.3f} "
+                    f"gap={result.get('gap_ratio', float('nan')):.2f}"
                 )
             elif result.get("json_extracted"):
                 fails = result["validation"]["failed_checks"][:2]
@@ -961,27 +995,51 @@ class DpFewShotEvaluator(ABC):
     # -- aggregate stats ---------------------------------------------------
 
     def compute_statistics(self, results: list[dict]) -> dict:
+        """Aggregate the per-sample DiffPlanner metrics for the JSON log.
+
+        Mirrors the numbers ``evaluate_diffplanner.py`` writes to
+        ``results.txt`` so the JSON log + the NPZ + the TXT report all tell
+        the same story.
+        """
         n = len(results)
         json_ok = [r for r in results if r.get("json_extracted")]
         valid = [r for r in results if r.get("validation", {}).get("is_valid")]
         ok = [r for r in results if r.get("success")]
         timed_out = [r for r in results if r.get("timed_out")]
-
-        cov_gt = [r["coverage_gt_avg"] for r in results if "coverage_gt_avg" in r]
-        boundary_cov = [r["boundary_coverage"] for r in results if "boundary_coverage" in r]
-        mean_iou = [r["mean_pairwise_iou"] for r in results if "mean_pairwise_iou" in r]
-        overlap_area = [r["total_overlap_area"] for r in results if "total_overlap_area" in r]
         times = [r["generation_time"] for r in results if r.get("generation_time") is not None]
 
-        # Per-category IoU averages.
-        per_cat_lists: dict[str, list[float]] = {name: [] for name in DP_CATEGORY_TO_NAME.values()}
-        for r in results:
-            cats = r.get("coverage_gt_per_category") or {}
-            for name, v in cats.items():
-                per_cat_lists.setdefault(name, []).append(float(v))
+        # Pull per-sample metric arrays from the run aggregate (preferred --
+        # built by score_dp_sample) and fall back to the per-sample dicts in
+        # ``results`` so a JSON-checkpoint resume still shows the same fields.
+        rr = self.run_results
+        if rr["similarity_scores"]:
+            deltas = list(rr["similarity_scores"])
+            area_errs = list(rr["area_proportion_errors"])
+            gaps = list(rr["gap_ratios"])
+            outsides = list(rr["outside_ratios"])
+            overlaps = list(rr["overlap_ratios"])
+            accs = list(rr["accuracies"])
+            rcas = list(rr["room_count_accuracies"])
+            rtas = list(rr["room_type_accuracies"])
+            lost_total = int(rr["lost_room_count"])
+            samples_with_lost = int(rr["samples_with_lost_rooms"])
+            raw_fb = int(rr["raw_fallback_count"])
+        else:
+            deltas = [r["delta"] for r in results if "delta" in r]
+            area_errs = [r["area_proportion_error"] for r in results if "area_proportion_error" in r]
+            gaps = [r["gap_ratio"] for r in results if "gap_ratio" in r]
+            outsides = [r["outside_ratio"] for r in results if "outside_ratio" in r]
+            overlaps = [r["overlap_ratio"] for r in results if "overlap_ratio" in r]
+            accs = [r["accuracy"] for r in results if "accuracy" in r]
+            rcas = [r["room_count_accuracy"] for r in results if "room_count_accuracy" in r]
+            rtas = [r["room_type_accuracy"] for r in results if "room_type_accuracy" in r]
+            lost_total = sum(int(r.get("lost_rooms", 0)) for r in results)
+            samples_with_lost = sum(1 for r in results if int(r.get("lost_rooms", 0)) > 0)
+            raw_fb = sum(1 for r in results if r.get("pp_status") == "raw_fallback")
 
-        def _avg(xs):
-            return sum(xs) / len(xs) if xs else None
+        def _nan_avg(xs: list[float]) -> Optional[float]:
+            arr = np.array([x for x in xs if not (isinstance(x, float) and np.isnan(x))], dtype=float)
+            return float(arr.mean()) if arr.size else None
 
         return {
             "total": n,
@@ -990,13 +1048,19 @@ class DpFewShotEvaluator(ABC):
             "successful": len(ok),
             "timed_out": len(timed_out),
             "success_rate": (len(ok) / n) if n else 0.0,
-            "coverage_gt_avg": _avg(cov_gt),
-            "coverage_gt_per_category_avg": {name: _avg(v) for name, v in per_cat_lists.items()},
-            "boundary_coverage_avg": _avg(boundary_cov),
-            "mean_pairwise_iou_avg": _avg(mean_iou),
-            "total_overlap_area_avg": _avg(overlap_area),
+            "delta_avg": _nan_avg(deltas),
+            "area_proportion_error_avg": _nan_avg(area_errs),
+            "gap_ratio_avg": _nan_avg(gaps),
+            "outside_ratio_avg": _nan_avg(outsides),
+            "overlap_ratio_avg": _nan_avg(overlaps),
+            "room_accuracy_avg": _nan_avg(accs),
+            "room_count_accuracy_avg": _nan_avg(rcas),
+            "room_type_accuracy_avg": _nan_avg(rtas),
+            "lost_room_count": lost_total,
+            "samples_with_lost_rooms": samples_with_lost,
+            "raw_fallback_count": raw_fb,
             "inference_time": {
-                "average_seconds": _avg(times),
+                "average_seconds": (sum(times) / len(times)) if times else None,
                 "min_seconds": min(times) if times else None,
                 "max_seconds": max(times) if times else None,
                 "total_minutes": (sum(times) / 60.0) if times else None,
@@ -1005,8 +1069,11 @@ class DpFewShotEvaluator(ABC):
 
     # -- I/O helpers -------------------------------------------------------
 
-    @staticmethod
-    def _load_checkpoint(args) -> tuple[list[dict], set[str]]:
+    def _load_checkpoint(self, args) -> tuple[list[dict], set[str]]:
+        """Load the per-sample JSON checkpoint AND replay its metric arrays
+        into ``self.run_results`` so a resumed run can still write a complete
+        ``results.npz`` / ``results.txt`` that covers every completed sample.
+        """
         existing: list[dict] = []
         completed: set[str] = set()
         cp = getattr(args, "checkpoint", None)
@@ -1016,6 +1083,28 @@ class DpFewShotEvaluator(ABC):
             existing = data.get("results", []) or []
             completed = {r["filename"] for r in existing}
             logger.info("Loaded checkpoint: %d samples", len(completed))
+            for r in existing:
+                if "delta" not in r:
+                    continue  # incomplete record (json failed to parse, etc.)
+                rr = self.run_results
+                rr["similarity_scores"].append(float(r.get("delta", float("nan"))))
+                rr["area_proportion_errors"].append(float(r.get("area_proportion_error", float("nan"))))
+                rr["gap_ratios"].append(float(r.get("gap_ratio", float("nan"))))
+                rr["outside_ratios"].append(float(r.get("outside_ratio", float("nan"))))
+                rr["overlap_ratios"].append(float(r.get("overlap_ratio", float("nan"))))
+                rr["accuracies"].append(float(r.get("accuracy", 0.0)))
+                rr["room_count_accuracies"].append(float(r.get("room_count_accuracy", 0.0)))
+                rr["room_type_accuracies"].append(float(r.get("room_type_accuracy", 0.0)))
+                rr["per_sample_room_counts"].append(int(r.get("num_gt_rooms", 0)))
+                pp_status = str(r.get("pp_status", "raw_fallback"))
+                rr["pp_status"].append(pp_status)
+                lost = int(r.get("lost_rooms", 0))
+                rr["lost_rooms_per_sample"].append(lost)
+                rr["lost_room_count"] += lost
+                if lost > 0:
+                    rr["samples_with_lost_rooms"] += 1
+                if pp_status == "raw_fallback":
+                    rr["raw_fallback_count"] += 1
         return existing, completed
 
     @staticmethod
@@ -1068,6 +1157,7 @@ class DpFewShotEvaluator(ABC):
             "mode": getattr(args, "mode", "unknown"),
             "model": getattr(args, "model", None),
             "dataset_json": args.dataset_json,
+            "diffplanner_root": str(getattr(args, "diffplanner_root", None) or ""),
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "seed": args.seed,
@@ -1096,6 +1186,48 @@ class DpFewShotEvaluator(ABC):
             "Per-sample DiffPlanner JSONs in %s (%d total; %d written this finalize pass)",
             per_sample_dir, n_total_dp, n_written,
         )
+
+        # Drop a ``results.npz`` + ``results.txt`` next to ``--output`` using
+        # the *exact* aggregate format that ``evaluate_diffplanner.py``
+        # produces. This is the canonical benchmark report.
+        out_dir = self._results_dir(args)
+        if not self.run_results["similarity_scores"]:
+            logger.warning(
+                "No samples were scored -- skipping report_results NPZ/TXT.",
+            )
+            return
+        n = len(self.run_results["similarity_scores"])
+        rr = self.run_results
+        print(
+            f"\nScored {n} samples; raw_fallback (post-processing failed) "
+            f"on {rr['raw_fallback_count']} of them."
+        )
+        print(
+            f"Lost rooms: {rr['lost_room_count']:,} total across "
+            f"{rr['samples_with_lost_rooms']:,} of {n:,} samples "
+            f"({100.0 * rr['samples_with_lost_rooms'] / n:.1f}% of samples "
+            f"have at least one room dropped by post-processing)."
+        )
+        report_results(
+            str(out_dir),
+            num_variations=1,
+            checkpoint_path=None,
+            data_path=str(args.dataset_json),
+            **_build_report_kwargs(self.run_results),
+        )
+        print(f"\nWrote {out_dir / 'results.txt'} and {out_dir / 'results.npz'}")
+
+    @staticmethod
+    def _results_dir(args) -> Path:
+        """Where to drop ``results.npz`` / ``results.txt``."""
+        explicit = getattr(args, "out", None)
+        if explicit:
+            out_dir = Path(explicit)
+        else:
+            out = Path(args.output)
+            out_dir = out.with_name(f"{out.stem}_metrics")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
 
 
 # -------- GPT backend ----------------------------------------------------
@@ -1140,7 +1272,25 @@ def cli() -> int:
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="Aggregate eval report path (default: results_dp_<mode>_<model>_<seed>.json)",
+        help="Aggregate JSON eval log (default: results_dp_<mode>_<model>_<seed>.json).",
+    )
+    parser.add_argument(
+        "--out", type=str, default=None,
+        help=(
+            "Directory for ``results.npz`` and ``results.txt`` "
+            "(written via ``utils.report_results.report_results`` -- the same "
+            "shape ``benchmark/src/evaluate_diffplanner.py`` produces). "
+            "Default: ``<output stem>_metrics/`` next to --output."
+        ),
+    )
+    parser.add_argument(
+        "--diffplanner_root", type=Path, default=None,
+        help=(
+            "Path to the DiffPlanner repo. When provided, generated rooms are "
+            "fed through ``output/post_processing.py`` (high-fidelity, identical "
+            "to evaluate_diffplanner.py). When omitted, raw LLM boxes are used "
+            "and every sample is marked ``raw_fallback``."
+        ),
     )
     parser.add_argument(
         "--per-sample-dir", type=str, default=None,
