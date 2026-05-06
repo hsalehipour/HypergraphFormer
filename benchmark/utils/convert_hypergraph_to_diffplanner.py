@@ -691,6 +691,7 @@ def main():
     skipped_rooms = 0   # too many rooms -- broken out so the user sees it
     failed_ids: list[str] = []
     skipped_ids: list[str] = []
+    all_results: list[dict] = []  # accumulated for combined data_test.json
 
     for i, entry in enumerate(data):
         eid = entry.get("id", f"sample_{i}")
@@ -727,6 +728,7 @@ def main():
         out_path = output_dir / f"{eid}.json"
         with open(out_path, "w") as f:
             json.dump(result, f)
+        all_results.append(result)
         success += 1
 
         if (i + 1) % 100 == 0:
@@ -740,6 +742,13 @@ def main():
             if eid and eid not in excluded:
                 f.write(f"{eid}.json\n")
 
+    # Combined dataset file matching DiffPlanner's data_test.json schema
+    # (a single JSON array of all converted samples). Useful for tools
+    # that consume the dataset as one file rather than per-sample shards.
+    combined_path = output_dir / "data_test.json"
+    with open(combined_path, "w") as f:
+        json.dump(all_results, f)
+
     logger.info("")
     logger.info("=" * 60)
     logger.info("Converted:        %d / %d", success, len(data))
@@ -749,8 +758,9 @@ def main():
         logger.info("Skipped IDs (first 20): %s", skipped_ids[:20])
     if failed_ids:
         logger.info("Failed IDs (first 20):  %s", failed_ids[:20])
-    logger.info("Output:    %s", output_dir)
-    logger.info("List file: %s", list_path)
+    logger.info("Output:        %s", output_dir)
+    logger.info("List file:     %s", list_path)
+    logger.info("Combined file: %s", combined_path)
     logger.info("=" * 60)
 
     return 0 if failed == 0 else 1
