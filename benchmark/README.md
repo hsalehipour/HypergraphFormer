@@ -512,45 +512,6 @@ conda env** -- iPLAN's pinned torch / cv2 stack is not in the shared
   inside iPLAN's pinned env without dragging in the rest of the
   HypergraphFormer Python-3.10 stack
 
-### `src/fewshot_diffplanner.py`
-
-Few-shot LLM evaluator for the DiffPlanner JSON format. Asks an LLM
-(GPT via OpenAI API) to play the role of DiffPlanner under the
-`b+nc` setting (boundary + room **count** + room **categories** as
-input; the LLM invents room boxes and adjacencies are reconstructed
-from the resulting boxes).
-
-- Reads the monolithic `data_test.json` (DiffPlanner's 12K-sample
-  RPLAN test split); few-shot examples are drawn from the same file
-  with the target sample excluded
-- Validates the LLM's JSON against DiffPlanner's schema (room count,
-  category id range, box bounds, x0&lt;x1 / y0&lt;y1) and reports
-  parse/structure failure rates
-- Echoes `boundary` / `boundary_expand` / `entrance_expand` back into
-  the saved per-sample JSON so the LLM output is directly compatible
-  with `DiffPlanner/output/post_processing.py` and the
-  `benchmark/utils/visualize_diffplanner.py` panel renderer
-- Same I/O pattern as the diffusion evaluators: `results/run.json`
-  (aggregate), `results/run_partial.json` (incremental snapshot for
-  `--checkpoint`), and one `results/run_dp/&lt;name&gt;.json` per
-  successful generation
-
-### `src/fewshot_housediffusion.py`
-
-Few-shot LLM evaluator for the House-Diffusion JSON format. Single
-backend: `--mode fewshot-gpt` -- GPT via the OpenAI API, single
-process. The model is asked to produce a House-Diffusion JSON
-(`room_type` / `boxes` / `edges` / `ed_rm`) from an access graph.
-
-Scoring is HD-specific (no GED): structural validation on the
-generated HD JSON, plus reconstruction of an access graph from the
-generated HD via the same door-mediated convention used at data-prep
-time and a comparison with the input access graph (room count,
-room-type multiset, edge-set F1). Per-success outputs land in
-`results/run_hd/&lt;id&gt;.json` -- the same shape that
-`benchmark/utils/visualize_rplan_json.py` and
-`benchmark/utils/convert_json_to_pickle.py` expect.
-
 ---
 
 ## Utility Scripts
@@ -730,9 +691,7 @@ benchmark/
 │   ├── evaluate_houseganpp.py           # HouseGAN++ evaluation (WMR24)
 │   ├── evaluate_housediffusion.py       # House-Diffusion evaluation (WMR24)
 │   ├── evaluate_diffplanner.py          # DiffPlanner b+nc cascade evaluation (RPLAN)
-│   ├── evaluate_iplan.py                # iPLAN OurII cascade evaluation (RPLAN, runs in iplan conda env)
-│   ├── fewshot_diffplanner.py           # LLM few-shot eval in DiffPlanner JSON format (b+nc)
-│   └── fewshot_housediffusion.py        # LLM few-shot eval in House-Diffusion JSON format (GPT)
+│   └── evaluate_iplan.py                # iPLAN OurII cascade evaluation (RPLAN, runs in iplan conda env)
 │
 ├── utils/                               # Utility and conversion scripts
 │   ├── convert_hypergraph_to_housegan_json.py  # WMR24 JSON → HouseGAN++ JSON

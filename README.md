@@ -163,7 +163,6 @@ HypergraphFormer/
 │   └── generate_and_visualize_hypergraphs.ipynb
 │
 ├── prepare_rplan_hypergraph.sh     # End-to-end RPLAN pipeline (download, build, export)
-├── run_fewshot_experiments.sh      # Batch few-shot experiments + scoring
 ├── setup_hypergraph.sh             # Clone & build C# geometry library
 ├── pyproject.toml                  # Editable install config (pip install -e .)
 ├── requirements.txt
@@ -385,28 +384,6 @@ python scripts/evaluator.py --mode fewshot-qwen \
 # Few-shot GPT on one sample (requires OPENAI_API_KEY in .env)
 python scripts/evaluator.py --mode fewshot-gpt \
     --dataset-dir eval_format/train --max-samples 1
-```
-
-### 8. Run batch few-shot experiments
-
-`run_fewshot_experiments.sh` automates running `evaluator.py` across
-multiple shot counts and rounds, with optional post-run scoring:
-
-```bash
-# GPT: 1/2/3-shot, 5 rounds each, then score with GED
-bash run_fewshot_experiments.sh --backend gpt \
-    --examples-dir eval_format/train \
-    --score --test-dir dataset/hypergraph/test --metrics ged
-
-# Qwen: custom shots and rounds
-bash run_fewshot_experiments.sh --backend qwen \
-    --shots 1 3 5 --rounds 3 \
-    --examples-dir eval_format/train
-
-# Score existing results only (no generation)
-bash run_fewshot_experiments.sh --score-only \
-    --output-dir fewshot_results \
-    --test-dir dataset/hypergraph/test --metrics ged accuracy
 ```
 
 ---
