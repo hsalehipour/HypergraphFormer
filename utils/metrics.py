@@ -182,8 +182,17 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=20000, upper_bound=40, timeo
         computation times out without improvement.
     """
     import networkx as nx
+    import threading
 
-    result_holder = [upper_bound]
+    # ``result_holder`` carries (best_dist_so_far, num_gt_nodes_or_None,
+    # finished_normally). The worker thread updates it in place; the caller
+    # reads it after either a normal join or a timed-out join.
+    result_holder = {
+        "best": upper_bound,
+        "n_true": None,
+        "done": False,
+        "error": None,
+    }
 
     def _inner():
         try:
@@ -192,31 +201,45 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=20000, upper_bound=40, timeo
                 node_match=lambda n1, n2: n1.get('label') == n2.get('label'),
                 upper_bound=upper_bound,
             ):
-                result_holder[0] = dist
-            return result_holder[0], len(G_true.nodes())
+                result_holder["best"] = dist
+            result_holder["n_true"] = len(G_true.nodes())
+            result_holder["done"] = True
         except Exception as e:
-            print(f"⚠️  Error computing GED for sample {_id}: {e}")
-            return None, None
+            result_holder["error"] = e
 
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+    # Daemon thread: when the parent script finishes, Python will exit even
+    # if this thread is still grinding on a non-cancellable C/Python loop
+    # inside ``nx.optimize_graph_edit_distance``. The previous implementation
+    # used a ThreadPoolExecutor whose workers default to non-daemon, so a
+    # timed-out GED job would keep the interpreter alive for many minutes
+    # after the rest of the run had completed (see fewshot_diffplanner
+    # parallel runs hanging in teardown).
+    worker = threading.Thread(
+        target=_inner,
+        name=f"ged-{_id}",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=timeout / 1000.0)
 
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_inner)
-    try:
-        return future.result(timeout=timeout / 1000.0)
-    except FuturesTimeoutError:
-        if not timeout_capture_best:
-            print(f'⚠️  GED timed out for sample {_id}, returning None')
-            return None, None
-        best_value = result_holder[0]
-        if best_value < upper_bound:
-            print(f'⚠️  GED timed out for sample {_id}, returning best found: {best_value:.1f}')
-            return best_value, len(G_true.nodes())
-        else:
-            print(f'⚠️  GED timed out for sample {_id}, no improvement found')
-            return None, None
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    if result_holder["error"] is not None:
+        print(f"⚠️  Error computing GED for sample {_id}: {result_holder['error']}")
+        return None, None
+
+    if result_holder["done"]:
+        return result_holder["best"], result_holder["n_true"]
+
+    # Timed out. The worker thread is still running but is daemonized, so
+    # interpreter shutdown will not block on it.
+    if not timeout_capture_best:
+        print(f'⚠️  GED timed out for sample {_id}, returning None')
+        return None, None
+    best_value = result_holder["best"]
+    if best_value < upper_bound:
+        print(f'⚠️  GED timed out for sample {_id}, returning best found: {best_value:.1f}')
+        return best_value, len(G_true.nodes())
+    print(f'⚠️  GED timed out for sample {_id}, no improvement found')
+    return None, None
 
 
 def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=20000,
