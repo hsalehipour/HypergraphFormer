@@ -248,6 +248,17 @@ class Evaluator(ABC):
         hg = self.extract_hypergraph(res.text)
 
         if hg is None:
+            # Optional second LLM call to recover from a JSON parse failure.
+            # OFF by default: at the high concurrencies we run these scripts at
+            # the marginal recovery rate doesn't justify the ~2x cost on
+            # retried samples (and retries tend to cluster, which amplifies
+            # rate-limit pressure). Pass --retry-on-json-fail to opt in.
+            # The error string still contains "Failed to extract JSON" so
+            # downstream summary code that filters on that substring keeps
+            # working unchanged in either branch.
+            if not getattr(self.args, "retry_on_json_fail", False):
+                result["error"] = "Failed to extract JSON from response"
+                return
             logger.warning(f"JSON extraction failed for {sample['filename']}, retrying...")
             res2 = self.generator.generate(
                 prompt,
@@ -1292,6 +1303,14 @@ def cli():
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--nccl-timeout", type=int, default=7200)
+    parser.add_argument(
+        "--retry-on-json-fail",
+        action="store_true",
+        help=("Issue a second LLM call when JSON extraction fails on the "
+              "first response. OFF by default: at the concurrencies we run "
+              "these scripts at the marginal recovery rate doesn't justify "
+              "the ~2x cost on retried samples."),
+    )
 
     # Few-shot (set --num-examples 0 for zero-shot prompting)
     parser.add_argument(

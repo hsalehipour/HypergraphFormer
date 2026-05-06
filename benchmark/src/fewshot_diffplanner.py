@@ -879,6 +879,14 @@ class DpFewShotEvaluator(ABC):
 
         dp_raw = self.extract_dp(res.text or "")
         if dp_raw is None:
+            # Optional second LLM call to recover from a JSON parse failure.
+            # OFF by default: at the high concurrencies we run this script at
+            # the marginal recovery rate doesn't justify the ~2x cost on
+            # retried samples (and retries tend to cluster, which amplifies
+            # rate-limit pressure). Pass --retry-on-json-fail to opt in.
+            if not getattr(self.args, "retry_on_json_fail", False):
+                result["error"] = "Failed to extract DiffPlanner JSON from response"
+                return result
             logger.info("JSON extraction failed for %s, retrying once...", sample.get("name"))
             try:
                 res2 = self.generator.generate(
@@ -1403,6 +1411,14 @@ def cli() -> int:
     parser.add_argument("--max-rooms", type=int, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--retry-on-json-fail",
+        action="store_true",
+        help=("Issue a second LLM call when JSON extraction fails on the "
+              "first response. OFF by default: at the concurrencies we run "
+              "this script at the marginal recovery rate doesn't justify "
+              "the ~2x cost on retried samples."),
+    )
     parser.add_argument(
         "--num-examples", type=int, default=3,
         help="In-context examples for fewshot-* modes. Use 0 for zero-shot.",
