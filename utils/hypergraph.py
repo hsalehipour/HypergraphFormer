@@ -1405,7 +1405,7 @@ class HypergraphPlotter:
         'Stairs': '#72246c',
         'Storeroom': '#5254a3',
         'Bathroom': '#6b6ecf',
-        'Balcony': '#2ca02c',
+        'Balcony': '#BEBEBE',
         # Lowercase (Hypergraph Dataset format)
         'bed': '#5B448C',
         'living': '#ED6D87',
@@ -1416,7 +1416,7 @@ class HypergraphPlotter:
         'dining': '#fdae6b',
         'corridor': '#fdd0a2',
         'bathroom': '#FFE953',
-        'balcony': '#2ca02c',
+        'balcony': '#BEBEBE',
         'storage': '#5254a3',
         'storeroom': '#5254a3',
         'stairs': '#72246c',
@@ -2302,11 +2302,140 @@ class HypergraphPlotter:
         c4 = A + outer_t_cut * n_out
         return SPolygon([c1, c2, c3, c4])
 
+    @staticmethod
+    def _draw_entry_door_at_segment(ax, apt_polygon_pts, door_segment, *,
+                                    inset, outer_pad, bg_zorder=3,
+                                    fg_zorder=4, jamb_lw=1.2,
+                                    door_w=None, corner_margin=None):
+        """Punch an entry door at an explicit apartment-boundary segment.
+
+        This is used when a benchmark source (e.g. DiffPlanner/RPLAN) already
+        declares the entrance as a boundary segment. Unlike
+        :meth:`_draw_entry_door`, it does not infer the entrance room from the
+        hypergraph's ``outside`` edge.
+        """
+        import numpy as np
+        from shapely.geometry import Point as SPoint
+        from shapely.geometry import Polygon as SPolygon
+
+        try:
+            apt = SPolygon(apt_polygon_pts)
+            if not apt.is_valid:
+                apt = apt.buffer(0)
+        except Exception:
+            return None
+        if apt.is_empty:
+            return None
+
+        try:
+            p0, p1 = door_segment
+            seg_a = np.array([float(p0[0]), float(p0[1])], dtype=float)
+            seg_b = np.array([float(p1[0]), float(p1[1])], dtype=float)
+        except Exception:
+            return None
+
+        seg_d = seg_b - seg_a
+        seg_L = float(np.linalg.norm(seg_d))
+        if seg_L < 1e-9:
+            return None
+        seg_center = 0.5 * (seg_a + seg_b)
+
+        # DiffPlanner's entrance segment can be a short door span rather than
+        # the full boundary edge. Find the containing apartment edge, use the
+        # DP segment only as the desired center, then draw our normal-width
+        # door along that full edge.
+        boundary = [np.array([float(p[0]), float(p[1])], dtype=float)
+                    for p in apt_polygon_pts]
+        best = None
+        tol = max(2.0 * float(inset), 1e-3)
+        for i in range(len(boundary)):
+            E0 = boundary[i]
+            E1 = boundary[(i + 1) % len(boundary)]
+            ed = E1 - E0
+            edge_L = float(np.linalg.norm(ed))
+            if edge_L < 1e-9:
+                continue
+            u = ed / edge_L
+            rel = seg_center - E0
+            t = float(np.dot(rel, u))
+            proj = E0 + min(max(t, 0.0), edge_L) * u
+            dist = float(np.linalg.norm(seg_center - proj))
+            # Prefer an edge with similar direction and near-collinear center.
+            align = abs(float(np.dot(seg_d / seg_L, u)))
+            if dist <= tol and align > 0.80:
+                score = (dist, -align)
+                if best is None or score < best[0]:
+                    best = (score, E0, u, edge_L, t)
+
+        if best is not None:
+            _, edge_start, d, L, center_t = best
+            center_t = min(max(float(center_t), 0.0), L)
+        else:
+            # Fallback: use the provided segment as the edge if no containing
+            # boundary segment can be identified.
+            edge_start = seg_a
+            d = seg_d / seg_L
+            L = seg_L
+            center_t = 0.5 * L
+
+        # Keep a fixed-width door, but slide its center along the containing
+        # boundary edge when the jambs would otherwise collide with corners.
+        if corner_margin is None:
+            corner_margin = 2.0 * float(inset)
+        desired_half_w = 0.5 * float(door_w if door_w is not None else L)
+        # If the boundary edge is too short to fit the requested door plus
+        # margins, reduce only as a last resort; otherwise preserve width.
+        max_half_w = max(0.0, 0.5 * L - float(corner_margin))
+        half_w = min(desired_half_w, max_half_w) if max_half_w > 0 else min(desired_half_w, 0.5 * L)
+        lo = float(corner_margin) + half_w
+        hi = L - float(corner_margin) - half_w
+        if lo <= hi:
+            center_t = min(max(center_t, lo), hi)
+        center = edge_start + center_t * d
+        A = center - half_w * d
+        B = center + half_w * d
+
+        n_cand = np.array([-d[1], d[0]])
+        M = 0.5 * (A + B)
+        probe = M + max(float(inset), 1e-3) * n_cand
+        try:
+            # The outward normal is the side that is not inside the apartment.
+            n_out = -n_cand if apt.contains(SPoint(probe[0], probe[1])) else n_cand
+        except Exception:
+            n_out = n_cand
+
+        inner_t_white = -1.0 * float(inset)
+        outer_t_white = float(outer_pad)
+
+        p1 = A + inner_t_white * n_out
+        p2 = B + inner_t_white * n_out
+        p3 = B + outer_t_white * n_out
+        p4 = A + outer_t_white * n_out
+        ax.fill([p1[0], p2[0], p3[0], p4[0], p1[0]],
+                [p1[1], p2[1], p3[1], p4[1], p1[1]],
+                color='white', edgecolor='none', zorder=bg_zorder,
+                antialiased=False)
+
+        for end in (A, B):
+            ja = end + inner_t_white * n_out
+            jb = end + outer_t_white * n_out
+            ax.plot([ja[0], jb[0]], [ja[1], jb[1]], '-',
+                    color='black', linewidth=jamb_lw, zorder=fg_zorder)
+
+        inner_t_cut = -1.20 * float(inset)
+        outer_t_cut = float(outer_pad) + 0.20 * float(inset)
+        c1 = A + inner_t_cut * n_out
+        c2 = B + inner_t_cut * n_out
+        c3 = B + outer_t_cut * n_out
+        c4 = A + outer_t_cut * n_out
+        return SPolygon([c1, c2, c3, c4])
+
     def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
                           title="Floor Plan", face_labels=None,
                           show_title=True, show_area=True, show_frame=True,
                           wall_inset=None, door_pairs=None,
-                          entry_door_face_idx=None):
+                          entry_door_face_idx=None,
+                          entry_door_segment=None):
         """Plot a generated mesh on a specific *ax* (for subplots).
 
         Renders rooms as colored polygons surrounded by a white wall strip with
@@ -2338,6 +2467,9 @@ class HypergraphPlotter:
                 :meth:`Hypergraph.mesh_entry_door_face_idx`) marking the room
                 connected to ``"outside"``.  An entry-door symbol is punched
                 through the apartment outer wall on that face's exterior edge.
+            entry_door_segment: Optional explicit ``[(x0, y0), (x1, y1)]``
+                apartment-boundary segment for the entry door.  When provided,
+                this is used instead of ``entry_door_face_idx``.
         """
         import math
 
@@ -2605,7 +2737,21 @@ class HypergraphPlotter:
                 if cut is not None:
                     door_cuts.append(cut)
 
-        if (use_walls and entry_door_face_idx is not None
+        if (use_walls and entry_door_segment is not None
+                and boundary_polygon and outer_pad > 0):
+            cut = self._draw_entry_door_at_segment(
+                ax, boundary_polygon, entry_door_segment,
+                inset=float(wall_inset),
+                outer_pad=float(outer_pad),
+                bg_zorder=3,
+                fg_zorder=4,
+                jamb_lw=1.5,
+                door_w=door_w,
+                corner_margin=2.0 * float(wall_inset),
+            )
+            if cut is not None:
+                door_cuts.append(cut)
+        elif (use_walls and entry_door_face_idx is not None
                 and boundary_polygon and outer_pad > 0):
             ei = int(entry_door_face_idx)
             if 0 <= ei < len(polys) and polys[ei] is not None:
