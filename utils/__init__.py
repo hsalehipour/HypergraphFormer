@@ -18,7 +18,6 @@ from .metrics import (
     accessgraph_dict_to_nx,
     ged_between_graphs,
     compute_ged_from_hypergraph,
-    compute_adjacency_ged,
     compute_room_similarity_score,
     compute_room_area_proportion_error,
     room_type_accuracy,

@@ -156,8 +156,7 @@ def repair_bsp_tree_names(hypergraph: dict) -> dict:
 #
 # Shared by ``Hypergraph.correct_accessgraph`` (intersection of declared edges
 # with mesh adjacency) and ``Hypergraph.adjacency_graph`` /
-# ``adjacency_graph_from_polygons`` (full mesh-adjacency graph used by the
-# AdjacencyGED metric in ``scripts/score_results.py``).
+# ``adjacency_graph_from_polygons`` (full mesh-adjacency graph).
 #
 # Geometry rules (kept identical to the original
 # ``correct_accessgraph._polygons_adjacent`` so behaviour is unchanged):
@@ -1035,10 +1034,10 @@ class Hypergraph:
         wall — without filtering by the predicted access graph and without the
         connectivity-bridge logic.
 
-        This is the natural ground for **AdjacencyGED**: which rooms physically
-        touch in the mesh, regardless of what was declared in the access
-        graph. Complement of :meth:`correct_accessgraph`, which is the
-        intersection of declared edges with mesh adjacency (plus bridges).
+        Which rooms physically touch in the mesh, regardless of what was
+        declared in the access graph. Complement of :meth:`correct_accessgraph`,
+        which is the intersection of declared edges with mesh adjacency (plus
+        bridges).
 
         Args:
             bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
