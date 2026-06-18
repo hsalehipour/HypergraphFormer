@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Procedural BSP edits: add/delete/resize/swap, ``reorient``, ``change_entrance``, and
-``change <room> <left|right|top|bottom>``.
-
-``change_entrance <left|right|top|bottom>`` finds the leaf connected to ``outside`` (entrance),
-checks via the mesh that it touches the footprint exterior, classifies the **axis-aligned**
-AABB side it sits on, then applies the minimal ``0/90/180/270``° CCW BSP rotation so that
-entrance is on the requested side. Requires **bounds.corners** (same as ``add`` / meshing).
-"""
+"""Procedural BSP edits: add/delete/resize/swap, ``reorient``."""
 from __future__ import annotations
 
 import argparse
@@ -36,16 +28,9 @@ from scripts.zero_shot_edits import (
     render_input_output_pair,
     render_single_mesh,
 )
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
-from shapely.ops import unary_union
-
 from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
-
-# CCW in world X/Y (Y up) around footprint center: +X=right, +Y=top, -X=left, -Y=bottom
-_ENTRANCE_SIDES: tuple[str, ...] = ("right", "top", "left", "bottom")
-_ENTRANCE_SIDE_TO_I: dict[str, int] = {s: i for i, s in enumerate(_ENTRANCE_SIDES)}
 
 ROOM_ALIASES = {
     "bath": "bathroom",
@@ -235,7 +220,7 @@ def _normalize_cardinal_angle(rad: float) -> float:
 
 def parse_reflect_mode_to_code(reflect_mode: str) -> str | None:
     """
-    Map CLI-style reflect labels (same as :func:`rotate_boundary`) to ``None`` / ``"x"`` / ``"y"``.
+    Map CLI-style reflect labels to ``None`` / ``"x"`` / ``"y"``.
     ``None`` means no mirror; ``"x"`` and ``"y"`` are flips in the centroid frame used by
     :func:`transform_bounds_polygon`.
     """
@@ -292,85 +277,12 @@ def _apply_bsp_orientation_inplace(root: dict, degrees_ccw: float, reflect: str 
     _apply_bsp_rotation_inplace(root, math.radians(float(degrees_ccw)))
 
 
-def _wrap_angle_two_pi(rad: float) -> float:
-    """Wrap *rad* to ``[0, 2π)`` without snapping to cardinal directions."""
-    two_pi = 2 * math.pi
-    a = float(rad) % two_pi
-    if a < 0:
-        a += two_pi
-    return a
-
-
-def _apply_bsp_rotation_free_inplace(node: dict, delta_rad: float) -> None:
-    """Rotate every internal split ``angle`` by *delta_rad* without snapping to cardinal."""
-    if "angle" in node:
-        node["angle"] = _wrap_angle_two_pi(float(node["angle"]) + float(delta_rad))
-    for c in node.get("children", []):
-        _apply_bsp_rotation_free_inplace(c, delta_rad)
-
-
-def _apply_bsp_reflect_x_free_inplace(node: dict) -> None:
-    """Mirror the BSP about the x-axis (``angle' = π - angle``) without cardinal snap."""
-    if not node.get("final", False):
-        ch = node.get("children") or []
-        if len(ch) == 2:
-            ch[0], ch[1] = ch[1], ch[0]
-    if "angle" in node:
-        node["angle"] = _wrap_angle_two_pi(math.pi - float(node.get("angle", 0.0)))
-    for c in node.get("children", []):
-        _apply_bsp_reflect_x_free_inplace(c)
-
-
-def _apply_bsp_reflect_y_free_inplace(node: dict) -> None:
-    """Mirror the BSP about the y-axis (``angle' = -angle``) without cardinal snap."""
-    if not node.get("final", False):
-        ch = node.get("children") or []
-        if len(ch) == 2:
-            ch[0], ch[1] = ch[1], ch[0]
-    if "angle" in node:
-        node["angle"] = _wrap_angle_two_pi(-float(node.get("angle", 0.0)))
-    for c in node.get("children", []):
-        _apply_bsp_reflect_y_free_inplace(c)
-
-
-def _apply_bsp_orientation_free_inplace(root: dict, degrees_ccw: float, reflect: str | None) -> None:
-    """Rigid orientation of BSP split angles **without** snapping to cardinal directions.
-
-    Same reflect-then-rotate ordering as :func:`_apply_bsp_orientation_inplace`. Suitable
-    for arbitrary rotation angles when used together with a matching bounds rotation
-    (i.e. the **whole apartment is rotated as a rigid body**).
-    """
-    if reflect == "x":
-        _apply_bsp_reflect_x_free_inplace(root)
-    elif reflect == "y":
-        _apply_bsp_reflect_y_free_inplace(root)
-    _apply_bsp_rotation_free_inplace(root, math.radians(float(degrees_ccw)))
-
-
-def rotate_hypergraph_rigid(hypergraph: dict, deg_ccw: float, reflect_mode: str) -> dict:
-    """
-    Rotate the BSP split angles by *deg_ccw* (and optional reflect) **without snapping to
-    cardinal directions**.
-
-    Unlike :func:`reorient_hypergraph_bsp`, this preserves arbitrary angles such as 45°
-    so the BSP cuts stay diagonal/oblique. Pair with :func:`transform_bounds_polygon`
-    if you also want to rotate the footprint to match.
-
-    Returns a deep copy with rotated split angles. Areas are recomputed.
-    """
-    out = copy.deepcopy(hypergraph)
-    code = parse_reflect_mode_to_code(reflect_mode)
-    _apply_bsp_orientation_free_inplace(out, float(deg_ccw), code)
-    recompute_areas(out)
-    return out
-
 
 def reorient_hypergraph_bsp(hypergraph: dict, deg_ccw: float, reflect_mode: str) -> dict:
     """
     Apply a **rigid** orientation of the **BSP** (child swaps + split *angle* updates) in the
     same *reflect-then-rotate* order as :func:`transform_bounds_polygon` uses for the
-    footprint polygon. This is the complement to bounds-only ``transform_bounds_polygon`` in
-    :func:`rotate_boundary` (where the tree is left unchanged). Returns a **deep copy**; *hypergraph*
+    footprint polygon.     Returns a **deep copy**; *hypergraph*
     is not modified.
 
     *reflect_mode* uses the same spellings as :func:`parse_reflect_mode_to_code` (e.g. ``normal``,
@@ -489,24 +401,6 @@ def transform_bounds_polygon(
     out["corners"] = [{"X": px, "Y": py} for px, py in out_pts]
     return out
 
-
-def rotate_boundary(
-    angle_deg: float,
-    reflect_mode: str,
-    hypergraph: dict,
-    bounds: dict,
-) -> Any:
-    """Return ``to_mesh`` for *hypergraph* using transformed bounds from :func:`transform_bounds_polygon` only. *hypergraph* is not reoriented."""
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        raise ValueError("rotate_boundary: bounds with non-empty 'corners' is required for meshing")
-
-    try:
-        reflect_code = parse_reflect_mode_to_code(reflect_mode)
-    except ValueError as e:
-        raise ValueError("rotate_boundary: " + str(e)) from e
-
-    bounds_t = transform_bounds_polygon(bounds, reflect_code, float(angle_deg))
-    return Hypergraph(copy.deepcopy(hypergraph)).to_mesh(bounds=bounds_t)
 
 
 def _split_leaf_for_add_impl(
@@ -852,317 +746,6 @@ def swap_rooms(root: dict, room1: str, room2: str) -> tuple[str, str, float, flo
     return leaf1.get("name", ""), leaf2.get("name", ""), new_area1, new_area2, factor1, factor2
 
 
-def find_entrance_leaf(hypergraph: dict) -> dict | None:
-    """
-    Return the **largest-area** final leaf that lists ``outside`` in ``connected``
-    (case-insensitive), or ``None`` if no such leaf exists.
-    """
-    leaves = [n for n in iter_nodes(hypergraph) if n.get("final")]
-    candidates: list[dict] = []
-    for leaf in leaves:
-        for c in leaf.get("connected") or []:
-            if str(c).strip().lower() == "outside":
-                candidates.append(leaf)
-                break
-    if not candidates:
-        return None
-    return max(candidates, key=lambda L: float(L.get("area", 0.0)))
-
-
-def _geom_to_lines(geom) -> list[LineString]:
-    """Flatten to *LineString* parts for length/ops."""
-    if geom is None or geom.is_empty:
-        return []
-    gt = geom.geom_type
-    if gt == "LineString":
-        return [geom]
-    if gt == "MultiLineString":
-        return list(geom.geoms)
-    if gt == "GeometryCollection":
-        out: list[LineString] = []
-        for g in geom.geoms:
-            out.extend(_geom_to_lines(g))
-        return out
-    return []
-
-
-def _room_polygon_from_mesh(mesh, leaf_name: str) -> Polygon:
-    """Merge all mesh faces whose ``unique_id`` matches *leaf_name* (BSP leaf name)."""
-    n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    polys: list[Polygon] = []
-    for i in range(n_faces):
-        face = mesh.faceList[i]
-        uid = getattr(face, "unique_id", "") or ""
-        if uid != leaf_name:
-            continue
-        pts = face.getPoints()
-        npt = int(getattr(pts, "Count", 0) or 0)
-        corners = [(float(pts[j].X), float(pts[j].Y)) for j in range(npt)]
-        if len(corners) >= 3:
-            polys.append(Polygon(corners))
-    if not polys:
-        return Polygon()
-    u = unary_union(polys)
-    if isinstance(u, Polygon):
-        return u
-    if u.geom_type == "MultiPolygon":
-        return max(u.geoms, key=lambda p: p.area)
-    return Polygon()
-
-
-def _footprint_polygon(bounds: dict) -> Polygon:
-    corners = bounds.get("corners") or []
-    pts = [(float(c["X"]), float(c["Y"])) for c in corners]
-    if len(pts) < 3:
-        return Polygon()
-    poly = Polygon(pts)
-    if not poly.is_valid:
-        poly = poly.buffer(0)
-    return poly
-
-
-def _primary_entry_side_aabb(footprint: Polygon, room_poly: Polygon) -> str:
-    """
-    Classify which **axis-aligned** side of ``footprint.bounds`` the entry room
-    primarily meets the exterior on, using overlap length along each AABB side segment.
-    """
-    if room_poly.is_empty or footprint.is_empty:
-        return "right"
-    common = room_poly.boundary.intersection(footprint.exterior)
-    if common.is_empty:
-        common = room_poly.exterior.intersection(footprint.exterior)
-    minx, miny, maxx, maxy = footprint.bounds
-    lines = {
-        "left": LineString([(minx, miny), (minx, maxy)]),
-        "right": LineString([(maxx, miny), (maxx, maxy)]),
-        "bottom": LineString([(minx, miny), (maxx, miny)]),
-        "top": LineString([(minx, maxy), (maxx, maxy)]),
-    }
-    buf = 1e-4
-    lengths: dict[str, float] = {}
-    for name, line in lines.items():
-        hit = common.intersection(line.buffer(buf))
-        ln = 0.0
-        for seg in _geom_to_lines(hit):
-            ln += float(seg.length)
-        lengths[name] = ln
-    best = max(lengths, key=lengths.get)
-    if lengths[best] >= 1e-3:
-        return best
-    # Corner or tiny overlap: project a point on the boundary (or room centroid) to nearest AABB side
-    try:
-        if common.is_empty:
-            raise ValueError
-        pt = common.representative_point()
-        if isinstance(pt, Point) and not pt.is_empty:
-            x, y = float(pt.x), float(pt.y)
-        else:
-            raise ValueError
-    except Exception:
-        cen = room_poly.centroid
-        x, y = float(cen.x), float(cen.y)
-    dl, dr, db, dt = x - minx, maxx - x, y - miny, maxy - y
-    m = min(dl, dr, db, dt)
-    if m == dl:
-        return "left"
-    if m == dr:
-        return "right"
-    if m == db:
-        return "bottom"
-    return "top"
-
-
-def change_entrance(
-    hypergraph: dict,
-    desired_side: str,
-    bounds: dict,
-) -> tuple[dict, str]:
-    """
-    Rotate the BSP so the **entrance** leaf (room connected to ``outside``) sits against
-    the desired **axis-aligned** side of the footprint AABB: *left* / *right* / *top* / *bottom*
-    in world *X* / *Y* (Y upward in mesh coordinates).
-
-    Requires *bounds* with ``corners`` for meshing. Uses the same
-    *reflect-then-rotate* BSP path as :func:`reorient_hypergraph_bsp` with
-    *reflect_mode* ``normal``; angle is one of ``0, 90, 180, 270``.
-
-    Returns:
-        ``(edited_hypergraph, summary)`` or raises *ValueError* with a user-facing message.
-    """
-    side = (desired_side or "").strip().lower()
-    if side not in _ENTRANCE_SIDE_TO_I:
-        raise ValueError(
-            f"change_entrance: unknown side {desired_side!r}; use one of: "
-            + ", ".join(_ENTRANCE_SIDES)
-        )
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        raise ValueError(
-            "change_entrance: bounds with non-empty 'corners' is required to mesh the plan"
-        )
-
-    ent = find_entrance_leaf(hypergraph)
-    if ent is None:
-        raise ValueError("No room connected to outside")
-
-    foot = _footprint_polygon(bounds)
-    if foot.is_empty:
-        raise ValueError("change_entrance: invalid footprint from bounds.corners")
-
-    leaf_name = str(ent.get("name", ""))
-    if not leaf_name:
-        raise ValueError("Entrance leaf has no BSP name")
-
-    hg_model = Hypergraph(copy.deepcopy(hypergraph))
-    mesh = hg_model.to_mesh(bounds=bounds)
-    room_poly = _room_polygon_from_mesh(mesh, leaf_name)
-    if room_poly.is_empty or room_poly.area <= 0.0:
-        raise ValueError("Could not recover entry room from mesh (empty geometry)")
-
-    d_wall = float(room_poly.boundary.distance(foot.exterior))
-    # Mesh vs footprint can have a small mm-scale gap; keep strict but not brittle.
-    if d_wall > 0.15:
-        raise ValueError("Entry room does not touch the boundary")
-
-    current = _primary_entry_side_aabb(foot, room_poly)
-    desired = side
-    if current == desired:
-        out = copy.deepcopy(hypergraph)
-        return (
-            out,
-            f"Entrance (leaf {leaf_name}) already on the {desired} (footprint AABB); no rotation",
-        )
-
-    ci = _ENTRANCE_SIDE_TO_I[current]
-    di = _ENTRANCE_SIDE_TO_I[desired]
-    # Step count for reorient: use (current - desired) so the mesh/BSP line up with
-    # ``reorient <k*90>`` under the same convention as explore_rotation (was inverted vs AABB).
-    k = (ci - di) % 4
-    deg = float(k * 90.0)
-    out = reorient_hypergraph_bsp(hypergraph, deg, "normal")
-    summary = (
-        f"change_entrance: entry leaf {leaf_name!r} was on the {current} of the footprint; "
-        f"rotated BSP {deg:.0f}° CCW to target {desired} (reorient, reflect=normal)"
-    )
-    return out, summary
-
-
-def change_room_side(
-    hypergraph: dict,
-    room_phrase: str,
-    desired_side: str,
-    bounds: dict,
-) -> tuple[dict, str]:
-    """
-    Rotate the BSP (same convention as :func:`change_entrance`) so that one **perimeter**
-    leaf matching *room_phrase* sits on the desired footprint AABB side.
-
-    Only leaves that touch the apartment boundary (same mesh threshold as the entrance check)
-    are considered; among those, the largest-area match is used.
-    """
-    room_key = (room_phrase or "").strip()
-    if not room_key:
-        raise ValueError("change <room> <side>: missing room name")
-
-    side = (desired_side or "").strip().lower()
-    if side not in _ENTRANCE_SIDE_TO_I:
-        raise ValueError(
-            f"change {room_key}: unknown side {desired_side!r}; use one of: "
-            + ", ".join(_ENTRANCE_SIDES)
-        )
-    if not (isinstance(bounds, dict) and bounds.get("corners")):
-        raise ValueError(
-            "change <room> <side>: bounds with non-empty 'corners' is required to mesh the plan"
-        )
-
-    matches = collect_matching_leaves(hypergraph, room_key)
-    if not matches:
-        raise ValueError(f"No leaf found with room type matching {room_key!r}")
-
-    foot = _footprint_polygon(bounds)
-    if foot.is_empty:
-        raise ValueError("change <room> <side>: invalid footprint from bounds.corners")
-
-    hg_model = Hypergraph(copy.deepcopy(hypergraph))
-    mesh = hg_model.to_mesh(bounds=bounds)
-
-    def touches_exterior(leaf: dict) -> bool:
-        ln = str(leaf.get("name", "")).strip()
-        if not ln:
-            return False
-        room_poly = _room_polygon_from_mesh(mesh, ln)
-        if room_poly.is_empty or room_poly.area <= 0.0:
-            return False
-        d_wall = float(room_poly.boundary.distance(foot.exterior))
-        return d_wall <= 0.15
-
-    boundary_hits = [m for m in matches if touches_exterior(m)]
-    if not boundary_hits:
-        raise ValueError(
-            f"change {room_key}: no matching room touches the apartment footprint exterior "
-            "(only perimeter rooms can be aligned to left/right/top/bottom this way)"
-        )
-
-    leaf = max(boundary_hits, key=lambda L: float(L.get("area", 0.0)))
-    leaf_name = str(leaf.get("name", ""))
-    room_poly = _room_polygon_from_mesh(mesh, leaf_name)
-    current = _primary_entry_side_aabb(foot, room_poly)
-    desired = side
-    if current == desired:
-        out = copy.deepcopy(hypergraph)
-        return (
-            out,
-            f"change {room_key}: leaf {leaf_name!r} already on the {desired}; no rotation",
-        )
-
-    ci = _ENTRANCE_SIDE_TO_I[current]
-    di = _ENTRANCE_SIDE_TO_I[desired]
-    k = (ci - di) % 4
-    deg = float(k * 90.0)
-    out = reorient_hypergraph_bsp(hypergraph, deg, "normal")
-    summary = (
-        f"change {room_key}: leaf {leaf_name!r} was on the {current} of the footprint; "
-        f"rotated BSP {deg:.0f}° CCW to target {desired} (reorient, reflect=normal)"
-    )
-    return out, summary
-
-
-_ROTATE_COMMAND_RE = re.compile(
-    r"rotate\s+([+-]?\d+(?:\.\d+)?)(?:\s+([a-zA-Z0-9_-]+))?\s*",
-    flags=re.IGNORECASE,
-)
-
-
-def _parse_rotate_command(command: str) -> tuple[float, str] | None:
-    """Parse ``rotate <deg> [reflect_mode]``; return ``(deg, mode)`` or ``None``.
-
-    Reflect is optional and defaults to ``"normal"``. Used both by :func:`apply_command`
-    (to transform the BSP) and :func:`maybe_transform_bounds_for_command` (to transform
-    the matching bounds polygon).
-    """
-    m = _ROTATE_COMMAND_RE.fullmatch((command or "").strip())
-    if m is None:
-        return None
-    deg = float(m.group(1))
-    mode = (m.group(2) or "normal").strip()
-    return deg, mode
-
-
-def maybe_transform_bounds_for_command(command: str, bounds: dict | None) -> dict | None:
-    """Return bounds rotated to match a ``rotate <deg> [reflect]`` command, else *bounds*.
-
-    For non-rotate commands (or when *bounds* is ``None``), the input is returned
-    unchanged. For ``rotate`` commands, the bounds polygon is transformed via
-    :func:`transform_bounds_polygon` using the same reflect-then-rotate order as the
-    BSP transform performed by :func:`rotate_hypergraph_rigid`.
-    """
-    if bounds is None:
-        return None
-    parsed = _parse_rotate_command(command or "")
-    if parsed is None:
-        return bounds
-    deg, mode = parsed
-    code = parse_reflect_mode_to_code(mode)
-    return transform_bounds_polygon(bounds, code, deg)
 
 
 def apply_command(
@@ -1259,59 +842,11 @@ def apply_command(
         summary = f"Reoriented BSP: CCW {deg}°, reflect mode {mode!r} (reflect, then rotate; same order as bounds transform_bounds_polygon)"
         return edited, summary
 
-    rotate_match = _parse_rotate_command(command)
-    if rotate_match is not None:
-        deg, mode = rotate_match
-        try:
-            edited = rotate_hypergraph_rigid(hypergraph, deg, mode)
-        except ValueError as e:
-            raise ValueError(f"rotate: {e}") from e
-        reflect_label = "" if mode.lower() in ("normal", "none") else f", reflect mode {mode!r}"
-        summary = (
-            f"Rotated BSP cuts by CCW {deg}°{reflect_label} (free rotation, no "
-            "cardinal snap); footprint left unchanged. Use 'reorient' for cardinal-"
-            "snapped variants, or pair with transform_bounds_polygon to also rotate "
-            "the bounds."
-        )
-        return edited, summary
-
-    ce_match = re.fullmatch(
-        r"change_entrance\s+(left|right|top|bottom)\s*",
-        command,
-        flags=re.IGNORECASE,
-    )
-    if ce_match:
-        if bounds is None:
-            raise ValueError(
-                "change_entrance requires dataset bounds with corners (pass bounds= to apply_command)"
-            )
-        want = ce_match.group(1).strip().lower()
-        edited, summary = change_entrance(hypergraph, want, bounds)
-        return edited, summary
-
-    crs_match = re.fullmatch(
-        r"change\s+(.+?)\s+(left|right|top|bottom)\s*",
-        command,
-        flags=re.IGNORECASE,
-    )
-    if crs_match:
-        if bounds is None:
-            raise ValueError(
-                "change <room> <side> requires dataset bounds with corners (pass bounds= to apply_command)"
-            )
-        room_phrase = crs_match.group(1).strip()
-        want_side = crs_match.group(2).strip().lower()
-        edited, summary = change_room_side(hypergraph, room_phrase, want_side, bounds)
-        return edited, summary
-
     raise ValueError(
-        f"Unsupported command {command!r}. Currently supported: "
+        f"Unsupported command {command!r}. Supported: "
         f"'increase <room>', 'reduce <room>', 'delete <room>', 'add <room2> by <room1>', "
         f"'swap <room1> and <room2>', "
-        f"'reorient <deg_ccw> <reflect_mode>' (e.g. reorient 90 normal, reorient 0 flip_x), "
-        f"'rotate <deg_ccw> [reflect_mode]' (rigid rotation incl. bounds; supports any angle, e.g. rotate 45), "
-        f"'change_entrance <left|right|top|bottom>', and "
-        f"'change <room> <left|right|top|bottom>' (perimeter room only; requires bounds with corners)"
+        f"'reorient <deg_ccw> <reflect_mode>' (e.g. reorient 90 normal, reorient 0 flip_x)"
     )
 
 
@@ -1367,10 +902,7 @@ def _run_one_cli(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run a single procedural command on one or all samples. "
-            "Use 'change_entrance <side>' or 'change <room> <side>' with dataset bounds (test .txt)."
-        )
+        description="Run a single procedural command on one or all samples."
     )
     parser.add_argument("--hypergraphs-file", type=Path, required=True)
     parser.add_argument(

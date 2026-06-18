@@ -446,139 +446,6 @@ def complete_add_command_for_procedural(
     return f"add {new_room} by {anchor_mergeid}", "fallback_largest_leaf"
 
 
-def _access_graph_room_mergeid_counter(ag: dict | None) -> Counter[str]:
-    """Multiset of room-type labels (accessgraph ``nodes`` values), lowercased."""
-    c: Counter[str] = Counter()
-    for t in (ag or {}).get("nodes", {}).values():
-        c[str(t).strip().lower()] += 1
-    return c
-
-
-def _access_graph_canonical_room_multiset(
-    ag: dict | None,
-) -> Counter[str]:
-    """Like :func:`room_type_multiset` — mergeids normalized via ``canonical_room_name``."""
-    from scripts.procedural_edits import canonical_room_name
-
-    c: Counter[str] = Counter()
-    nodes = (ag or {}).get("nodes") or {}
-    if not isinstance(nodes, dict):
-        return c
-    for v in nodes.values():
-        lab = canonical_room_name(str(v).strip())
-        if not lab or lab in _SKIP_NODE_TYPES:
-            continue
-        c[lab] += 1
-    return c
-
-
-def _access_graph_canonical_adjacency_counter(
-    ag: dict | None,
-) -> Counter[tuple[str, str]]:
-    """Undirected multiset of canonical room-type pairs for each corrected edge."""
-    from scripts.procedural_edits import canonical_room_name
-
-    c: Counter[tuple[str, str]] = Counter()
-    nodes_raw = (ag or {}).get("nodes") or {}
-    if not isinstance(nodes_raw, dict):
-        return c
-    id_to_lab = {str(k): canonical_room_name(str(v).strip()) for k, v in nodes_raw.items()}
-    for e in (ag or {}).get("edges") or []:
-        if not isinstance(e, (list, tuple)) or len(e) < 2:
-            continue
-        u, v = str(e[0]), str(e[1])
-        a, b = id_to_lab.get(u, ""), id_to_lab.get(v, "")
-        if not a or not b:
-            continue
-        if a in _SKIP_NODE_TYPES or b in _SKIP_NODE_TYPES:
-            continue
-        if a > b:
-            a, b = b, a
-        c[(a, b)] += 1
-    return c
-
-
-def _access_graph_room_adjacency_counter(
-    ag: dict | None,
-) -> Counter[tuple[str, str]]:
-    """Multiset of edges as unordered ``(mergeid_i, mergeid_j)`` with ``i <= j`` lexically."""
-    c: Counter[tuple[str, str]] = Counter()
-    nodes = {k: str(v).strip().lower() for k, v in (ag or {}).get("nodes", {}).items()}
-    for e in (ag or {}).get("edges") or []:
-        if not isinstance(e, (list, tuple)) or len(e) < 2:
-            continue
-        u, v = str(e[0]), str(e[1])
-        a, b = nodes.get(u, ""), nodes.get(v, "")
-        if not a or not b:
-            continue
-        if a > b:
-            a, b = b, a
-        c[(a, b)] += 1
-    return c
-
-
-def corrected_accessgraphs_equivalent_orientation(
-    hg_ref: dict[str, Any],
-    ag_ref: dict[str, Any] | None,
-    hg_pred: dict[str, Any],
-    ag_pred: dict[str, Any] | None,
-) -> bool:
-    """
-    Same corrected plan in **canonical room-name** sense: multiset of room types
-    (``canonical_room_name`` on each node, same as parametric multiset) and multiset of
-    undirected edges as pairs of canonical types. Ignores access-graph numeric ids and
-    normalizes mergeid spellings (e.g. ``bed`` / ``bedroom``). The ``hg_*`` arguments are unused
-    (kept so callers always pass hypergraphs symmetrically).
-
-    **Orientation** mode no longer uses this function; it uses
-    :func:`orientation_variant_passes_ref_accessgraph` (mesh vs input ``correct_accessgraph`` edges).
-    """
-    if ag_ref is None or ag_pred is None:
-        return False
-    _ = (hg_ref, hg_pred)
-    return (
-        _access_graph_canonical_room_multiset(ag_ref)
-        == _access_graph_canonical_room_multiset(ag_pred)
-        and _access_graph_canonical_adjacency_counter(ag_ref)
-        == _access_graph_canonical_adjacency_counter(ag_pred)
-    )
-
-
-def corrected_accessgraphs_equivalent_by_room_names(
-    ag_a: dict[str, Any] | None,
-    ag_b: dict[str, Any] | None,
-) -> bool:
-    """
-    **Typed** equality (mergeid multisets + ``(mergeid, mergeid)`` edge multisets), as in
-    ``access_graph_light_distance``. Orientation filtering uses
-    :func:`orientation_variant_passes_ref_accessgraph` instead (parametric-style mesh edges).
-    """
-    return (
-        _access_graph_room_mergeid_counter(ag_a) == _access_graph_room_mergeid_counter(ag_b)
-        and _access_graph_room_adjacency_counter(ag_a)
-        == _access_graph_room_adjacency_counter(ag_b)
-    )
-
-
-def access_graph_light_distance(ag_pred: dict, ag_gt: dict) -> int:
-    """
-    Fast surrogate for GED: L1 on room-type node multisets plus L1 on the multiset
-    of undirected ``(type_i, type_j)`` pairs (``i <= j`` lexicographically) for edges.
-    O(|nodes| + |edges|). Lower is better.
-    """
-    np, ng = _access_graph_room_mergeid_counter(ag_pred), _access_graph_room_mergeid_counter(
-        ag_gt
-    )
-    ep, eg = _access_graph_room_adjacency_counter(ag_pred), _access_graph_room_adjacency_counter(
-        ag_gt
-    )
-    keys_n = set(np) | set(ng)
-    keys_e = set(ep) | set(eg)
-    node_loss = sum(abs(np.get(k, 0) - ng.get(k, 0)) for k in keys_n)
-    edge_loss = sum(abs(ep.get(k, 0) - eg.get(k, 0)) for k in keys_e)
-    return int(node_loss + edge_loss)
-
-
 def multiset_command_to_procedural(
     command: str,
     hypergraph: dict,
@@ -877,7 +744,6 @@ def process_sample(
     gt_accessgraph: dict,
     bounds: dict,
     *,
-    include_accessgraphs: bool,
     two_step: bool,
     multiset_plan_max: int = 0,
     add_only: bool = False,
@@ -890,15 +756,7 @@ def process_sample(
         corrected_ag = hg.correct_accessgraph(bounds)
     except Exception as exc:
         logger.warning("correct_accessgraph failed for %s: %s", sample_id, exc)
-        err: dict[str, Any] = {
-            "command": None,
-            "error": f"correct_accessgraph: {exc}",
-        }
-        if include_accessgraphs:
-            err["input_accessgraph"] = input_ag
-            err["corrected_accessgraph"] = None
-            err["gt_accessgraph"] = gt_accessgraph
-        return err
+        return {"command": None, "error": f"correct_accessgraph: {exc}"}
 
     cmd1, detail, cmd2, two_step_info = compare_accessgraphs(
         input_ag,
@@ -924,10 +782,6 @@ def process_sample(
         row["command_step2"] = cmd2
         row["needs_second_modification"] = two_step_info["needs_second_modification"]
         row["two_step"] = two_step_info
-    if include_accessgraphs:
-        row["input_accessgraph"] = input_ag
-        row["corrected_accessgraph"] = corrected_ag
-        row["gt_accessgraph"] = gt_accessgraph
     return row
 
 
@@ -1305,11 +1159,6 @@ def main() -> int:
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
-        "--include-accessgraphs",
-        action="store_true",
-        help="Store full input/corrected/GT access graphs per id (large JSON).",
-    )
-    parser.add_argument(
         "--no-two-step",
         action="store_true",
         help="Disable second-step simulation (only command / step1).",
@@ -1534,7 +1383,6 @@ def main() -> int:
                 results[sid],
                 rec["accessgraph"],
                 rec["bounds"],
-                include_accessgraphs=args.include_accessgraphs,
                 two_step=two_step,
                 multiset_plan_max=multiset_plan_max,
                 add_only=args.add_only,
