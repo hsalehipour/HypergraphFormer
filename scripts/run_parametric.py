@@ -77,9 +77,7 @@ from utils_parametric import (  # noqa: E402
     load_ground_truth_txt,
     parse_args,
     save_batch_results,
-    save_metric_progress_plot,
-    save_metrics_report,
-    save_single_apt_artifacts,
+    save_metric_progress_csv,
     validate_leaf_area_floor,
     _to_jsonable,
 )
@@ -107,7 +105,7 @@ def _fd_grad(
     x = np.asarray(x, dtype=float)
     h = max(float(eps), 1e-10)
     g = np.zeros_like(x, dtype=float)
-    fx_cached: float | None = None  # only paid for if a one-sided fallback fires
+    fx_cached: float | None = None
     for i in range(int(x.size)):
         up_ok = x[i] + h <= hi - 1e-15
         dn_ok = x[i] - h >= lo + 1e-15
@@ -147,14 +145,14 @@ def optimize_hypergraph(
     apt_id: str,
     config: OptimConfig,
     *,
-    artifacts_dir: Path,
     grpo_file_path: Path | None = None,
     preloaded_hg: dict | None = None,
 ):
     """Run GD on one apartment.
 
     Returns ``(optimized_hg, best_metric, original_metric, gt_hg,
-    metrics_original, metrics_optimized, bedroom_group, expected_counts, ag_report)``.
+    metrics_original, metrics_optimized, bedroom_group, expected_counts,
+    ag_report, metric_trace, best_trace)``.
     """
     apt_id = _validate_apt_id(apt_id)
     objective = str(config.objective).strip().lower()
@@ -182,7 +180,6 @@ def optimize_hypergraph(
     bounds, gt_hg, accessgraph, room_polygons = load_ground_truth_txt(test_dir, apt_id)
     gt_hg = copy.deepcopy(gt_hg)
 
-    # Access graph used for compliance penalty (corrected → raw → file).
     ag_target = access_graph_from_prediction(
         original_hg,
         bounds=bounds,
@@ -190,7 +187,6 @@ def optimize_hypergraph(
     )
     print(f"Accessgraph edge penalty: {len(ag_target.get('edges') or [])} edges")
 
-    # Bedroom group + expected per-type leaf counts (only types in the HG).
     if isinstance(ag_target, dict) and (ag_target.get("nodes") or ag_target.get("edges")):
         bedroom_group = _bedroom_group_from_accessgraph(ag_target)
     else:
@@ -234,7 +230,6 @@ def optimize_hypergraph(
         f"ε(ref)={orig_eps_ref:.6f}  ε(GT)={orig_eps_gt:.6f}"
     )
 
-    # δ_sq scale so δ and ε contribute equally at the entry point of δ+ε.
     delta_scale: float = 1.0
     if objective == "delta":
         original_metric = float(orig_delta_sq)
@@ -260,7 +255,6 @@ def optimize_hypergraph(
     ag_fail_evals_sample: list[int] = []
 
     def _eval(splits_vec: np.ndarray) -> tuple[float, dict]:
-        """Returns (loss, current_hg). Loss = 1.0 on any failure."""
         nonlocal ag_eval_counter, ag_fail_count, ag_first_fail_eval
         ag_eval_counter += 1
         hg = copy.deepcopy(original_hg)
@@ -273,9 +267,6 @@ def optimize_hypergraph(
             if {r[0] for r in room_list} != gt_room_names:
                 return 1.0, hg
 
-            # Binary penalty: ``ACCESSGRAPH_VIOLATION_WEIGHT`` per failed edge.
-            # Discrete but matches the post-hoc compliance metric exactly.
-            # Disable with ``--no-accessgraph`` for ablation runs.
             penalty = 0.0
             if (
                 config.with_accessgraph_penalty
@@ -314,15 +305,11 @@ def optimize_hypergraph(
     lr = float(config.gd_lr) if config.gd_lr is not None else 0.1 * width
     if lr <= 0:
         raise ValueError("gd_lr must be > 0")
-    # Smaller h than the historical 0.10*width: centered FD has O(h^2) error,
-    # so we can shrink h to reduce sensitivity to mesh-topology kinks without
-    # losing precision (h=0.014 in the [0.15, 0.85] box).
     fd_eps = max(1e-4, 0.02 * width)
     n_steps = int(config.maxiter)
     if n_steps < 0:
         raise ValueError("maxiter must be >= 0")
     ftol = float(config.ftol)
-    # Default patience scales with budget; user can disable with --patience 0.
     patience = (
         max(10, n_steps // 5) if config.patience is None else max(0, int(config.patience))
     )
@@ -373,13 +360,6 @@ def optimize_hypergraph(
         _, best_hg = _eval(best["x"])
         leaf_stats = validate_leaf_area_floor(best_hg)[1]
 
-        save_metric_progress_plot(
-            metric_trace,
-            best_trace,
-            Path(artifacts_dir) / f"{apt_id}_metric_progress.png",
-            title=f"{apt_id}  objective={objective}  steps={len(metric_trace)}",
-        )
-
     print(f"Leaf-area floor: min_observed={leaf_stats.get('min_observed_leaf_frac', 0):.4f}")
 
     # ── Final metrics on the best hypergraph ─────────────────────────────
@@ -403,14 +383,12 @@ def optimize_hypergraph(
         "epsilon_metric_ref": float(orig_eps_ref),
     }
 
-    # If optimization changed the room set we revert to the original (defensive
-    # fallback — the gd loop already returns 1.0 on mismatch).
     if best_room_names != gt_room_names:
-        save_metrics_report(Path(artifacts_dir), apt_id, metrics_original, dict(metrics_original))
         return (
             original_hg, float(original_metric), float(original_metric), gt_hg,
             metrics_original, dict(metrics_original),
             bedroom_group, expected_counts, ag_report,
+            metric_trace, best_trace,
         )
 
     best_delta_gt = compute_delta_metric_soft_from_room_lists(
@@ -435,7 +413,6 @@ def optimize_hypergraph(
         "epsilon_metric": float(best_eps_gt),
         "epsilon_metric_ref": float(best_eps_ref),
     }
-    save_metrics_report(Path(artifacts_dir), apt_id, metrics_original, metrics_optimized)
 
     print("\n=== Metrics (lower is better) ===")
     for k, label in (
@@ -453,6 +430,7 @@ def optimize_hypergraph(
         best_hg, float(best_metric), float(original_metric), gt_hg,
         metrics_original, metrics_optimized,
         bedroom_group, expected_counts, ag_report,
+        metric_trace, best_trace,
     )
 
 
@@ -461,7 +439,6 @@ def optimize_hypergraph(
 # ---------------------------------------------------------------------------
 
 
-# Per-process RGL initialised by ``_pool_init`` (one mesh runtime per worker).
 _POOL_RGL: tuple[object, object] = (None, None)
 
 
@@ -481,11 +458,13 @@ def _process_one_apt(
     config: OptimConfig,
     preloaded_hg: dict,
     grpo_file_path: Path,
-    batch_root: Path,
     rgl,
     collections,
-) -> tuple[dict, dict | None]:
-    """Optimize a single apartment for batch mode. Returns (csv_row, optimized_hg|None)."""
+) -> tuple[dict, dict | None, list[float], list[float]]:
+    """Optimize a single apartment for batch mode.
+
+    Returns ``(csv_row, optimized_hg|None, metric_trace, best_trace)``.
+    """
     row: dict = {
         "id": apt_id,
         "objective": config.objective,
@@ -493,37 +472,23 @@ def _process_one_apt(
         "error": "",
     }
     try:
-        artifacts_dir = batch_root / "outputs" / apt_id
         (
             optimized_hg,
             optimized_metric,
             original_metric,
-            gt_hg,
+            _gt_hg,
             metrics_original,
             metrics_optimized,
             _bedroom_group,
             _expected_counts,
             ag_report,
+            metric_trace,
+            best_trace,
         ) = optimize_hypergraph(
             apt_id,
             config,
             grpo_file_path=grpo_file_path,
-            artifacts_dir=artifacts_dir,
             preloaded_hg=preloaded_hg,
-        )
-
-        original_hg0 = repair_bsp_tree_names(copy.deepcopy(preloaded_hg))
-        test_path = _resolve_under_repo(REPO_ROOT, str(config.test_dir))
-        bounds, _gt_unused, accessgraph0, _rp = load_ground_truth_txt(test_path, apt_id)
-        save_single_apt_artifacts(
-            artifacts_dir,
-            original_hg0,
-            optimized_hg,
-            gt_hg,
-            bounds,
-            apt_id,
-            metrics_original,
-            metrics_optimized,
         )
 
         row.update({
@@ -542,6 +507,10 @@ def _process_one_apt(
             "ag_check_first_fail_eval": ag_report.get("first_fail_eval"),
         })
 
+        test_path = _resolve_under_repo(REPO_ROOT, str(config.test_dir))
+        bounds, _gt_unused, accessgraph0, _rp = load_ground_truth_txt(test_path, apt_id)
+        original_hg0 = repair_bsp_tree_names(copy.deepcopy(preloaded_hg))
+
         if isinstance(accessgraph0, dict) and accessgraph0.get("edges") and rgl is not None:
             try:
                 mesh_orig = hypergraph_bounds_to_mesh(
@@ -558,12 +527,12 @@ def _process_one_apt(
             except Exception:
                 pass
 
-        return row, copy.deepcopy(optimized_hg)
+        return row, copy.deepcopy(optimized_hg), metric_trace, best_trace
     except Exception as e:
         print(f"ERROR {apt_id}: {type(e).__name__}: {e}", flush=True)
         row["status"] = "error"
         row["error"] = f"{type(e).__name__}: {e}"
-        return row, None
+        return row, None, [], []
 
 
 def _pool_entry(pack):
@@ -571,7 +540,7 @@ def _pool_entry(pack):
     apt_id, config, preloaded_hg, grpo_s, batch_root_s = pack
     rgl, col = _POOL_RGL
     return _process_one_apt(
-        apt_id, config, preloaded_hg, Path(grpo_s), Path(batch_root_s), rgl, col,
+        apt_id, config, preloaded_hg, Path(grpo_s), rgl, col,
     )
 
 
@@ -605,8 +574,8 @@ def _run_batch(config: OptimConfig) -> None:
             / f"{config.dataset}_{config.objective}"
         )
     batch_root.mkdir(parents=True, exist_ok=True)
-    (batch_root / "outputs").mkdir(parents=True, exist_ok=True)
     batch_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}.csv"
+    progress_csv = batch_root / "metric_progress.csv"
 
     with open(grpo_file_path, encoding="utf-8") as f:
         results = json.load(f)
@@ -626,6 +595,7 @@ def _run_batch(config: OptimConfig) -> None:
 
     rows: list[dict] = []
     merged: dict[str, dict] = {}
+    all_traces: list[tuple[str, list[float], list[float]]] = []
 
     if workers == 1:
         try:
@@ -634,26 +604,34 @@ def _run_batch(config: OptimConfig) -> None:
             rgl, col = None, None
         for k, _id in enumerate(ids, start=1):
             print(f"\n[{k}/{len(ids)}] {_id}")
-            row, mhg = _process_one_apt(
-                _id, config, results[_id], grpo_file_path, batch_root, rgl, col,
+            row, mhg, mt, bt = _process_one_apt(
+                _id, config, results[_id], grpo_file_path, rgl, col,
             )
             rows.append(row)
             if mhg is not None:
                 merged[_id] = mhg
+            if mt:
+                all_traces.append((_id, mt, bt))
     else:
         tasks = [
             (_id, config, results[_id], str(grpo_file_path), str(batch_root))
             for _id in ids
         ]
         with ProcessPoolExecutor(max_workers=workers, initializer=_pool_init) as ex:
-            for k, (row, mhg) in enumerate(ex.map(_pool_entry, tasks), start=1):
+            for k, (row, mhg, mt, bt) in enumerate(ex.map(_pool_entry, tasks), start=1):
                 _id = str(row.get("id", ""))
                 print(f"\n[{k}/{len(ids)}] done {_id} status={row.get('status', '')}", flush=True)
                 rows.append(row)
                 if mhg is not None and _id:
                     merged[_id] = mhg
+                if mt and _id:
+                    all_traces.append((_id, mt, bt))
 
     save_batch_results(batch_root, batch_csv, rows, config.objective, grpo_file_path)
+
+    if all_traces:
+        save_metric_progress_csv(progress_csv, all_traces)
+        print(f"Saved metric progress CSV ({len(all_traces)} apts) → {progress_csv}")
 
     if config.merged_hypergraphs_json:
         merged_path = _resolve_under_repo(REPO_ROOT, str(config.merged_hypergraphs_json))
@@ -670,24 +648,18 @@ def _run_batch(config: OptimConfig) -> None:
 
 def _run_single(config: OptimConfig, apt_id: str) -> None:
     grpo_file_path = _resolve_grpo_file(config)
-    artifacts_dir = SCRIPTS_DIR / "output_parametric" / "outputs" / apt_id
     (
-        optimized_hg, _opt_metric, _orig_metric,
-        gt_hg, metrics_original, metrics_optimized,
+        _optimized_hg, _opt_metric, _orig_metric,
+        _gt_hg, _metrics_orig, _metrics_opt,
         _bedroom, _counts, _ag_report,
-    ) = optimize_hypergraph(
-        apt_id, config, grpo_file_path=grpo_file_path, artifacts_dir=artifacts_dir,
-    )
+        metric_trace, best_trace,
+    ) = optimize_hypergraph(apt_id, config, grpo_file_path=grpo_file_path)
 
-    with open(grpo_file_path, encoding="utf-8") as f:
-        grpo_results = json.load(f)
-    original_hg = repair_bsp_tree_names(copy.deepcopy(grpo_results[apt_id]))
-    test_path = _resolve_under_repo(REPO_ROOT, str(config.test_dir))
-    bounds, _gt, _ag, _rp = load_ground_truth_txt(test_path, apt_id)
-    save_single_apt_artifacts(
-        artifacts_dir, original_hg, optimized_hg, gt_hg, bounds, apt_id,
-        metrics_original, metrics_optimized,
-    )
+    if metric_trace:
+        out_dir = SCRIPTS_DIR / "output_parametric"
+        trace_csv = out_dir / f"{apt_id}_metric_trace.csv"
+        save_metric_progress_csv(trace_csv, [(apt_id, metric_trace, best_trace)])
+        print(f"Saved metric trace → {trace_csv}")
 
 
 def main() -> None:

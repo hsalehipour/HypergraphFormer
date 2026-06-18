@@ -22,10 +22,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import Polygon
 
@@ -33,16 +29,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.mesh_pair_viz import render_input_output_pair  # noqa: E402
-from utils.hypergraph import Hypergraph, HypergraphPlotter  # noqa: E402
+from utils.hypergraph import Hypergraph  # noqa: E402
 from utils.metrics import (  # noqa: E402
     compute_room_area_proportion_error,
     compute_room_similarity_score,
     produce_room_area_list,
     produce_room_list,
 )
-
-PLOTTER = HypergraphPlotter()
 
 # ---------------------------------------------------------------------------
 # Hard-coded knobs (intentionally not configurable via CLI).
@@ -52,9 +45,6 @@ MAX_SPLIT: float = 0.85
 MIN_LEAF_FRAC: float = 0.03
 MIN_AREA: float = 1e-9
 # Per-failed-edge weight added to the GD objective for accessgraph violations.
-# Picked to be comparable to the typical δ_epsilon scale (~0.1) so the penalty
-# steers GD without dominating the geometric signal. Set to 0 (or pass
-# ``--no-accessgraph``) to drop the term entirely.
 ACCESSGRAPH_VIOLATION_WEIGHT: float = 0.05
 
 OBJECTIVES: tuple[str, ...] = ("delta", "delta_epsilon", "epsilon")
@@ -103,12 +93,8 @@ class OptimConfig:
     limit: int | None = None
     skip_ids_file: str | None = None
     gd_lr: float | None = None  # default: 0.1 * (MAX_SPLIT - MIN_SPLIT)
-    # Early-stop: terminate GD once best_seen has improved by less than ftol
-    # for `patience` consecutive steps. patience=None auto-derives from maxiter.
     patience: int | None = None
     ftol: float = 1e-5
-    # Whether to add the binary +1-per-failed-edge accessgraph penalty inside
-    # the GD objective. Disable with ``--no-accessgraph`` for diagnostic runs.
     with_accessgraph_penalty: bool = True
     batch_workers: int = 1
     batch_output_dir: str | None = None
@@ -144,51 +130,31 @@ class OptimConfig:
             "--dataset",
             choices=("auto", "wmr24", "rplan"),
             default="auto",
-            help="Dataset label (only affects logging — ε refs are shared). 'auto' infers from --test-dir.",
+            help="Dataset label (only affects logging). 'auto' infers from --test-dir.",
         )
         p.add_argument("--limit", type=int, default=None)
         p.add_argument("--skip-ids-file", default=None)
         p.add_argument(
-            "--gd-lr",
-            "--gd_lr",
-            dest="gd_lr",
-            type=float,
-            default=None,
-            help=f"GD step size (default: 0.1*(MAX_SPLIT-MIN_SPLIT)={0.1 * (MAX_SPLIT - MIN_SPLIT):.3f}).",
+            "--gd-lr", "--gd_lr", dest="gd_lr", type=float, default=None,
+            help=f"GD step size (default: 0.1*(MAX_SPLIT-MIN_SPLIT)={0.1*(MAX_SPLIT-MIN_SPLIT):.3f}).",
         )
         p.add_argument(
-            "--patience",
-            type=int,
-            default=None,
+            "--patience", type=int, default=None,
             help="Stop GD when best_seen hasn't improved by >ftol for N consecutive steps "
             "(default: max(10, maxiter//5)). Use 0 to disable.",
         )
+        p.add_argument("--ftol", type=float, default=1e-5,
+                       help="Improvement threshold for early-stop (default: 1e-5).")
         p.add_argument(
-            "--ftol",
-            type=float,
-            default=1e-5,
-            help="Improvement threshold for early-stop (default: 1e-5).",
+            "--no-accessgraph", dest="no_accessgraph", action="store_true",
+            help="Disable the binary +1-per-failed-edge accessgraph penalty in the GD objective.",
         )
-        p.add_argument(
-            "--no-accessgraph",
-            dest="no_accessgraph",
-            action="store_true",
-            help="Disable the binary +1-per-failed-edge accessgraph penalty in "
-            "the GD objective (diagnostic only — optimizer becomes free to "
-            "violate required adjacencies).",
-        )
-        p.add_argument(
-            "--batch-workers",
-            type=int,
-            default=1,
-            help="Parallel processes for --all (1 = sequential).",
-        )
+        p.add_argument("--batch-workers", type=int, default=1,
+                       help="Parallel processes for --all (1 = sequential).")
         p.add_argument("--batch-output-dir", default=None)
         p.add_argument(
-            "--merged-hypergraphs-json",
-            dest="merged_hypergraphs_json",
-            default=None,
-            help="--all only: path for merged optimized hypergraphs (default: <batch-output-dir>/<input_stem>_optimized.json).",
+            "--merged-hypergraphs-json", dest="merged_hypergraphs_json", default=None,
+            help="--all only: path for merged optimized hypergraphs.",
         )
         ns = p.parse_args(argv)
 
@@ -522,123 +488,6 @@ def check_accessgraph_edges_against_mesh(
     return out
 
 
-def accessgraph_smooth_penalty(
-    mesh,
-    accessgraph: dict,
-    *,
-    scale_factor: float = 1.05,
-) -> tuple[float, int]:
-    """Smooth ``[0, ∞)`` replacement for the binary ``+1`` accessgraph penalty.
-
-    For each required edge ``(u, v)`` with types ``(tu, tv)``:
-
-    * find the closest pair of mesh faces of types ``(tu, tv)`` after the same
-      ``scale_factor`` expansion as :func:`check_accessgraph_edges_against_mesh`;
-    * the per-edge term is ``min(distance, diag) / diag`` where ``diag`` is the
-      mesh bounding-box diagonal — exactly ``0`` when the scaled polygons
-      overlap (i.e. the discrete check passes), continuous as they pull apart.
-
-    Returns ``(penalty, n_failed_edges)`` where ``penalty`` is the **sum** over
-    edges (so worst-case ≈ ``n_required_edges``, comparable to the legacy
-    ``+1`` magnitude) and ``n_failed_edges`` counts edges with a strictly
-    positive contribution (used for the post-hoc fail-count report).
-    """
-    from shapely.affinity import scale as _scale
-
-    n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    if n <= 0:
-        return 0.0, 0
-
-    face_types: list[str] = []
-    polys: list[Polygon] = []
-    for i in range(n):
-        face = mesh.faceList[i]
-        face_types.append(str(getattr(face, "merge_id", "unknown")).strip().lower())
-        pts = face.getPoints()
-        corners = [(float(pts[j].X), float(pts[j].Y)) for j in range(int(getattr(pts, "Count", 0) or 0))]
-        polys.append(Polygon(corners) if len(corners) >= 3 else Polygon())
-
-    polys_scaled: list[Polygon] = []
-    xs: list[float] = []
-    ys: list[float] = []
-    for p in polys:
-        if p.is_empty:
-            polys_scaled.append(p)
-            continue
-        try:
-            polys_scaled.append(_scale(p, xfact=scale_factor, yfact=scale_factor, origin="centroid"))
-        except Exception:
-            polys_scaled.append(p)
-        minx, miny, maxx, maxy = p.bounds
-        xs.extend([minx, maxx])
-        ys.extend([miny, maxy])
-
-    if not xs:
-        return 0.0, 0
-    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-    if not (math.isfinite(diag) and diag > 0):
-        return 0.0, 0
-
-    faces_by_type: dict[str, list[int]] = {}
-    for i, t in enumerate(face_types):
-        faces_by_type.setdefault(t, []).append(i)
-
-    nodes = (accessgraph or {}).get("nodes", {}) or {}
-    edges = (accessgraph or {}).get("edges") or []
-    if not edges:
-        return 0.0, 0
-
-    total = 0.0
-    n_failed = 0
-    for e in edges:
-        if not isinstance(e, (list, tuple)) or len(e) != 2:
-            continue
-        u, v = str(e[0]), str(e[1])
-        tu = str(nodes.get(u, "unknown")).strip().lower()
-        tv = str(nodes.get(v, "unknown")).strip().lower()
-        idx_u = faces_by_type.get(tu, [])
-        idx_v = faces_by_type.get(tv, [])
-        if not idx_u or not idx_v:
-            total += 1.0
-            n_failed += 1
-            continue
-
-        # Closest scaled-polygon pair across all faces of those types.
-        # Same self-pair handling as the discrete check (i != j skipped via
-        # the iteration structure: we only compare distinct face indices).
-        min_dist = float("inf")
-        for i in idx_u:
-            pi = polys_scaled[i]
-            if pi.is_empty:
-                continue
-            for j in idx_v:
-                if i == j:
-                    continue
-                pj = polys_scaled[j]
-                if pj.is_empty:
-                    continue
-                try:
-                    d = 0.0 if pi.intersects(pj) else float(pi.distance(pj))
-                except Exception:
-                    d = float("inf")
-                if d < min_dist:
-                    min_dist = d
-                if min_dist == 0.0:
-                    break
-            if min_dist == 0.0:
-                break
-
-        if not math.isfinite(min_dist):
-            term = 1.0
-        else:
-            term = min(1.0, float(min_dist) / float(diag))
-        if term > 0.0:
-            n_failed += 1
-        total += term
-
-    return float(total), int(n_failed)
-
-
 # ---------------------------------------------------------------------------
 # Splits: annotate / collect / apply
 # ---------------------------------------------------------------------------
@@ -724,19 +573,6 @@ def apply_area_splits(hg: dict, splits) -> dict:
     return hg
 
 
-def export_area_split_csv(hg_before: dict, hg_after: dict, out_csv: Path) -> None:
-    """Two-row CSV (before / after) with one column per split."""
-    _, sb = collect_area_splits(hg_before)
-    _, sa = collect_area_splits(hg_after)
-    if len(sb) != len(sa):
-        raise RuntimeError("area_split length mismatch between before/after")
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["before", *(float(v) for v in sb)])
-        w.writerow(["after", *(float(v) for v in sa)])
-
-
 def _collect_leaves(hg: dict) -> list[dict]:
     leaves: list[dict] = []
     stack = [hg]
@@ -774,7 +610,7 @@ def validate_leaf_area_floor(hg: dict) -> tuple[bool, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Output / artifacts
+# Output
 # ---------------------------------------------------------------------------
 
 
@@ -792,142 +628,29 @@ def _to_jsonable(obj):
     return obj
 
 
-def save_hypergraph_json(path: Path, hg: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(_to_jsonable(hg), f, indent=2, sort_keys=True)
-
-
-def save_metrics_report(artifacts_dir: Path, apt_id: str, metrics_original: dict, metrics_optimized: dict) -> None:
-    Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-    try:
-        with open(Path(artifacts_dir) / "metrics_report.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {"id": str(apt_id), "original": dict(metrics_original), "optimized": dict(metrics_optimized)},
-                f, indent=2, sort_keys=True,
-            )
-    except OSError as e:
-        print(f"⚠️  Could not save metrics_report.json: {type(e).__name__}: {e}")
-
-
-def save_metric_progress_plot(metric_trace: list[float], best_trace: list[float], out_path: Path, *, title: str) -> None:
-    if not metric_trace:
-        return
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    xs = np.arange(len(metric_trace), dtype=float)
-    fig, ax = plt.subplots(figsize=(7.5, 3.8))
-    ax.plot(xs, metric_trace, lw=1.4, label="objective")
-    if best_trace and len(best_trace) == len(metric_trace):
-        ax.plot(xs, best_trace, lw=1.8, label="best-so-far")
-    ax.set_title(title)
-    ax.set_xlabel("step")
-    ax.set_ylabel("objective")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    try:
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    except OSError as e:
-        print(f"⚠️  Could not save metric progress plot: {type(e).__name__}: {e}")
-    plt.close(fig)
-
-
-def visualize_results(
-    original_hg: dict,
-    optimized_hg: dict,
-    gt_hg: dict,
-    bounds: dict,
-    apt_id: str,
-    *,
-    metrics_original: dict[str, float],
-    metrics_optimized: dict[str, float],
-    output_dir: Path,
+def save_metric_progress_csv(
+    out_csv: Path,
+    traces: list[tuple[str, list[float], list[float]]],
 ) -> None:
-    """Render GT / Original / Optimized side-by-side with metrics overlay."""
-    RGL, Collections = init_rgl()
+    """Append per-step metric traces to a long-format CSV.
 
-    def _block(label: str, m: dict[str, float]) -> str:
-        def f(k: str) -> str:
-            v = float(m.get(k, float("nan")))
-            return format(v, ".2g") if math.isfinite(v) else "nan"
-
-        return (
-            f"{label}\n"
-            f"delta (GT, soft): {f('delta_metric')}\n"
-            f"delta (ref, δ_sq): {f('delta_metric_square')}\n"
-            f"epsilon (GT): {f('epsilon_metric')}\n"
-            f"epsilon (ref): {f('epsilon_metric_ref')}"
-        )
-
-    fig, axes = plt.subplots(1, 3, figsize=(17.0, 6.2))
-    titles = [
-        "Ground Truth",
-        _block("Original", metrics_original),
-        _block("Optimized", metrics_optimized),
-    ]
-    for ax, hg, title in zip(axes, [gt_hg, original_hg, optimized_hg], titles):
-        try:
-            mesh = hypergraph_bounds_to_mesh(copy.deepcopy(hg), bounds, RGL=RGL, Collections=Collections)
-            for i in range(mesh.faceList.Count):
-                face = mesh.faceList[i]
-                room_type = str(getattr(face, "merge_id", "unknown"))
-                pts = face.getPoints()
-                corners = [(pts[j].X, pts[j].Y) for j in range(pts.Count)]
-                if len(corners) >= 3:
-                    x, y = Polygon(corners).exterior.xy
-                    ax.fill(x, y, color=PLOTTER.color_map.get(room_type, "#D3D3D3"),
-                            edgecolor="black", linewidth=0.5)
-        except Exception:
-            corners = bounds.get("corners", [])
-            poly = Polygon([(c["X"], c["Y"]) for c in corners]) if corners else Polygon()
-            if not poly.is_empty:
-                x, y = poly.exterior.xy
-                ax.plot(x, y, "k-", lw=0.8)
-        ax.set_title(title)
-        ax.set_aspect("equal")
-        ax.axis("off")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"optimized_{apt_id}.png"
+    Each entry in ``traces`` is ``(apt_id, objective_trace, best_so_far_trace)``.
+    Columns: id, step, objective, best_so_far.
+    File is created if it does not exist; existing rows are preserved.
+    """
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not out_csv.exists()
     try:
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        print(f"Saved visualization to: {out_path}")
+        with open(out_csv, "a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["id", "step", "objective", "best_so_far"])
+            for apt_id, obj_trace, best_trace in traces:
+                for step, (obj, best) in enumerate(zip(obj_trace, best_trace)):
+                    w.writerow([apt_id, step, obj, best])
     except OSError as e:
-        print(f"⚠️  Could not save visualization to {out_path}: {type(e).__name__}: {e}")
-    plt.close(fig)
-
-
-def save_single_apt_artifacts(
-    output_dir: Path,
-    original_hg: dict,
-    optimized_hg: dict,
-    gt_hg: dict,
-    bounds: dict,
-    apt_id: str,
-    metrics_original: dict,
-    metrics_optimized: dict,
-) -> None:
-    """before/after JSON + area_splits.csv + viz + input/output mesh pair."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    annotate_area_splits(original_hg)
-    save_hypergraph_json(output_dir / "before.json", original_hg)
-    save_hypergraph_json(output_dir / "after.json", optimized_hg)
-    save_hypergraph_json(output_dir / "optimized.json", optimized_hg)
-    export_area_split_csv(original_hg, optimized_hg, output_dir / "area_splits.csv")
-    visualize_results(
-        original_hg, optimized_hg, gt_hg, bounds, apt_id,
-        metrics_original=metrics_original,
-        metrics_optimized=metrics_optimized,
-        output_dir=output_dir,
-    )
-    pair_path = output_dir / f"{apt_id}_input_output.png"
-    try:
-        render_input_output_pair(original_hg, optimized_hg, bounds, pair_path)
-    except Exception as e:
-        print(f"⚠️  Could not render input/output mesh pair: {type(e).__name__}: {e}")
-    else:
-        if pair_path.exists():
-            print(f"Saved input/output mesh pair to: {pair_path}")
+        print(f"⚠️  Could not write metric progress CSV {out_csv}: {type(e).__name__}: {e}")
 
 
 # Columns produced by the per-apt batch row builder in run_parametric.py.
