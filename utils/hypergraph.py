@@ -1958,477 +1958,6 @@ class HypergraphPlotter:
         plt.show()
         return fig, ax
 
-    @staticmethod
-    def _plot_geom_lines(ax, geom, **kwargs):
-        """Plot any Shapely line-like geometry on *ax* with ``ax.plot(**kwargs)``.
-
-        Accepts ``LineString``, ``LinearRing``, ``MultiLineString``, or
-        ``GeometryCollection`` (in which case each line-like child is plotted).
-        Empty geometries are silently ignored.
-        """
-        if geom is None:
-            return
-        try:
-            if geom.is_empty:
-                return
-        except Exception:
-            return
-        gt = getattr(geom, 'geom_type', None)
-        if gt in ('LineString', 'LinearRing'):
-            try:
-                xs, ys = geom.xy
-            except Exception:
-                return
-            ax.plot(list(xs), list(ys), **kwargs)
-        elif gt == 'MultiLineString':
-            for g in geom.geoms:
-                HypergraphPlotter._plot_geom_lines(ax, g, **kwargs)
-        elif gt == 'GeometryCollection':
-            for g in geom.geoms:
-                if getattr(g, 'geom_type', None) in (
-                    'LineString', 'LinearRing', 'MultiLineString',
-                ):
-                    HypergraphPlotter._plot_geom_lines(ax, g, **kwargs)
-
-    @staticmethod
-    def _shrink_polygon_for_walls(poly, inset):
-        """Return *poly* shrunk inward by *inset* (drops to original on degenerate result)."""
-        if inset is None or inset <= 0:
-            return poly
-        try:
-            sh = poly.buffer(-float(inset), join_style=2, mitre_limit=3.0)
-        except Exception:
-            return poly
-        if sh.is_empty or getattr(sh, 'area', 0.0) <= 1e-12:
-            return poly
-        if sh.geom_type == 'MultiPolygon':
-            sh = max(sh.geoms, key=lambda g: g.area)
-        return sh
-
-    @staticmethod
-    def _shared_wall_line(poly_a, poly_b, *, inset):
-        """Recover the shared-wall LineString between two adjacent room polygons.
-
-        First tries an exact ``boundary.intersection``; if that collapses to a
-        point or empty (typical floating-point misalignment along a shared
-        edge between two BSP-meshed rectangles), falls back to a tiny mutual
-        buffer and uses the longer side of the resulting strip's
-        minimum-rotated rectangle as the wall direction.
-
-        Returns a Shapely ``LineString`` aligned along the wall, or ``None``.
-        """
-        from shapely.geometry import LineString
-
-        try:
-            inter = poly_a.boundary.intersection(poly_b.boundary)
-        except Exception:
-            inter = None
-
-        flat = []
-        if inter is not None and not inter.is_empty:
-            gt = inter.geom_type
-            if gt == 'LineString':
-                flat = [inter]
-            elif gt == 'MultiLineString':
-                flat = list(inter.geoms)
-            elif gt == 'GeometryCollection':
-                for g in inter.geoms:
-                    if g.geom_type == 'LineString':
-                        flat.append(g)
-                    elif g.geom_type == 'MultiLineString':
-                        flat.extend(g.geoms)
-        if flat:
-            best = max(flat, key=lambda l: float(l.length))
-            if float(best.length) >= max(2.0 * float(inset), 1e-6):
-                return best
-
-        eps = max(0.05 * float(inset), 1e-6)
-
-        # Fallback A: parts of ``poly_a``'s boundary that lie within ``eps``
-        # of ``poly_b``'s boundary.  Works for both adjacent rooms (with FP
-        # misalignment along their shared edge) AND for entry doors where
-        # ``poly_a`` is wholly inside ``poly_b`` (the room sits inside the
-        # apartment).  In the entry-door case the 2D overlap of the
-        # buffered polygons would just be the room itself, whose MRR axis
-        # runs through the room's center -- so we MUST use this
-        # boundary-based fallback before resorting to the MRR fallback.
-        try:
-            near_b = poly_b.boundary.buffer(
-                eps, join_style=2, mitre_limit=4.0,
-            )
-            shared_segs = poly_a.boundary.intersection(near_b)
-        except Exception:
-            shared_segs = None
-
-        flat_b: list = []
-        if shared_segs is not None and not shared_segs.is_empty:
-            gt_b = shared_segs.geom_type
-            if gt_b == 'LineString':
-                flat_b = [shared_segs]
-            elif gt_b == 'MultiLineString':
-                flat_b = list(shared_segs.geoms)
-            elif gt_b == 'GeometryCollection':
-                for g in shared_segs.geoms:
-                    if g.geom_type == 'LineString':
-                        flat_b.append(g)
-                    elif g.geom_type == 'MultiLineString':
-                        flat_b.extend(g.geoms)
-        if flat_b:
-            best_b = max(flat_b, key=lambda l: float(l.length))
-            if float(best_b.length) >= max(2.0 * float(inset), 1e-6):
-                return best_b
-
-        # Fallback B (last resort): MRR of the buffered 2D overlap.  This
-        # is only useful for the room-vs-room case where the polygons are
-        # FP-offset by more than ``eps`` (so neither boundary intersection
-        # nor boundary-near-boundary catches their shared edge).  We skip
-        # this entirely when ``poly_a`` is essentially inside ``poly_b``
-        # (entry-door case) because the MRR of the room would point at
-        # the room's interior, not its perimeter.
-        try:
-            inside_frac = float(poly_a.intersection(poly_b).area) / max(
-                float(poly_a.area), 1e-12,
-            )
-        except Exception:
-            inside_frac = 0.0
-        if inside_frac > 0.5:
-            return None
-
-        try:
-            ba = poly_a.buffer(eps, join_style=2, mitre_limit=4.0)
-            bb = poly_b.buffer(eps, join_style=2, mitre_limit=4.0)
-            overlap = ba.intersection(bb)
-        except Exception:
-            return None
-        if overlap.is_empty:
-            return None
-        if overlap.geom_type == 'MultiPolygon':
-            overlap = max(overlap.geoms, key=lambda g: g.area)
-        elif overlap.geom_type == 'GeometryCollection':
-            sub = [g for g in overlap.geoms if g.geom_type == 'Polygon']
-            if not sub:
-                return None
-            overlap = max(sub, key=lambda g: g.area)
-        if overlap.geom_type != 'Polygon' or overlap.area <= 0:
-            return None
-        try:
-            mrr = overlap.minimum_rotated_rectangle
-        except Exception:
-            return None
-        coords = list(getattr(mrr, 'exterior', mrr).coords)
-        if len(coords) < 5:
-            return None
-        edges = [(coords[i], coords[i + 1]) for i in range(4)]
-        lens = [
-            ((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2) ** 0.5
-            for p0, p1 in edges
-        ]
-        idx = max(range(4), key=lambda i: lens[i])
-        if lens[idx] < max(2.0 * float(inset), 1e-6):
-            return None
-        # Build a line through the rectangle's center oriented along the long edge,
-        # so it lies inside the wall corridor (not on its long boundary).
-        p0, p1 = edges[idx]
-        opp_p0, opp_p1 = edges[(idx + 2) % 4]
-        c0 = ((p0[0] + opp_p1[0]) / 2.0, (p0[1] + opp_p1[1]) / 2.0)
-        c1 = ((p1[0] + opp_p0[0]) / 2.0, (p1[1] + opp_p0[1]) / 2.0)
-        return LineString([c0, c1])
-
-    @staticmethod
-    def _draw_door_between(ax, poly_a, poly_b, *, inset, door_w,
-                           bg_zorder=3, fg_zorder=4, jamb_lw=1.2):
-        """Draw an architectural door symbol through the wall between two rooms.
-
-        Centered on the longest shared boundary segment of *poly_a* / *poly_b*
-        (full-extent, non-inset polygons) the symbol consists of:
-
-        * A white rectangle filling the wall corridor only (no bleed into
-          either room's color) so the door reads as a clean opening.
-        * Two short perpendicular black jambs marking each end of the opening.
-
-        Returns
-        -------
-        shapely.geometry.Polygon or None
-            A cut rectangle that callers should subtract from the room contour
-            ``LineString``s to break them cleanly at the door span.  Slightly
-            wider than the white fill so it reliably catches the contour
-            polylines (which sit on the shrunk-room polygon edges).
-        """
-        import numpy as np
-        from shapely.geometry import Polygon as SPolygon
-
-        line = HypergraphPlotter._shared_wall_line(
-            poly_a, poly_b, inset=float(inset),
-        )
-        if line is None:
-            return None
-        L = float(line.length)
-        if L < max(2.0 * float(inset), 1e-6):
-            return None
-
-        half_w = min(0.5 * float(door_w), 0.45 * L)
-        if half_w <= 0:
-            return None
-        p_a = line.interpolate(0.5 * L - half_w)
-        p_b = line.interpolate(0.5 * L + half_w)
-        A = np.array([p_a.x, p_a.y])
-        B = np.array([p_b.x, p_b.y])
-        d = B - A
-        L_d = float(np.linalg.norm(d))
-        if L_d < 1e-9:
-            return None
-        d /= L_d
-        n = np.array([-d[1], d[0]])
-
-        # White door fill: span only the wall corridor (between the two
-        # shrunk-room polygon edges at +/-inset). Stops exactly at the
-        # polygon edges so it never bleeds into the colored room interior.
-        half_n_white = 1.0 * float(inset)
-        p1 = A - half_n_white * n
-        p2 = B - half_n_white * n
-        p3 = B + half_n_white * n
-        p4 = A + half_n_white * n
-        ax.fill([p1[0], p2[0], p3[0], p4[0], p1[0]],
-                [p1[1], p2[1], p3[1], p4[1], p1[1]],
-                color='white', edgecolor='none', zorder=bg_zorder,
-                antialiased=False)
-
-        for end in (A, B):
-            ja = end - 1.0 * float(inset) * n
-            jb = end + 1.0 * float(inset) * n
-            ax.plot([ja[0], jb[0]], [ja[1], jb[1]], '-',
-                    color='black', linewidth=jamb_lw, zorder=fg_zorder)
-
-        # Cut polygon: a hair wider than the white fill in the normal
-        # direction so the room contour LineStrings (which lie at +/-inset)
-        # are reliably caught and cleanly broken at the door span.
-        half_n_cut = 1.20 * float(inset)
-        c1 = A - half_n_cut * n
-        c2 = B - half_n_cut * n
-        c3 = B + half_n_cut * n
-        c4 = A + half_n_cut * n
-        return SPolygon([c1, c2, c3, c4])
-
-    @staticmethod
-    def _draw_entry_door(ax, room_poly, apt_polygon_pts, *, inset, outer_pad,
-                         door_w, bg_zorder=3, fg_zorder=4, jamb_lw=1.2):
-        """Punch an entry door through the apartment exterior wall of *room_poly*.
-
-        The door symbol is centered on the longest segment where ``room_poly``
-        meets the apartment perimeter (``apt_polygon_pts``); the white fill
-        spans only the outer-wall corridor (from the inner room contour out
-        to the outer apartment line), with two perpendicular black jambs at
-        its ends.
-
-        Returns
-        -------
-        shapely.geometry.Polygon or None
-            A cut rectangle that callers should subtract from the room and
-            apartment-outline contour ``LineString``s so they break cleanly
-            at the door span.
-        """
-        import numpy as np
-        from shapely.geometry import Point as SPoint
-        from shapely.geometry import Polygon as SPolygon
-
-        try:
-            apt = SPolygon(apt_polygon_pts)
-            if not apt.is_valid:
-                apt = apt.buffer(0)
-        except Exception:
-            return None
-        if apt.is_empty:
-            return None
-
-        line = HypergraphPlotter._shared_wall_line(
-            room_poly, apt, inset=float(inset),
-        )
-        if line is None:
-            return None
-        L = float(line.length)
-        if L < max(2.0 * float(inset), 1e-6):
-            return None
-
-        half_w = min(0.5 * float(door_w), 0.45 * L)
-        if half_w <= 0:
-            return None
-        p_a = line.interpolate(0.5 * L - half_w)
-        p_b = line.interpolate(0.5 * L + half_w)
-        A = np.array([p_a.x, p_a.y])
-        B = np.array([p_b.x, p_b.y])
-        d = B - A
-        L_d = float(np.linalg.norm(d))
-        if L_d < 1e-9:
-            return None
-        d /= L_d
-        n_cand = np.array([-d[1], d[0]])
-        M = 0.5 * (A + B)
-        # Pick the outward normal: the side that's NOT inside the room.
-        probe = M + 0.25 * float(inset) * n_cand
-        try:
-            inside = room_poly.contains(SPoint(probe[0], probe[1]))
-        except Exception:
-            inside = False
-        n_out = -n_cand if inside else n_cand
-
-        # White fill: span only the wall corridor between the inner room
-        # polygon edge (-inset) and the outer apartment line (+outer_pad).
-        # Stops exactly at those edges so it never bleeds past either contour.
-        inner_t_white = -1.0 * float(inset)
-        outer_t_white = float(outer_pad)
-
-        p1 = A + inner_t_white * n_out
-        p2 = B + inner_t_white * n_out
-        p3 = B + outer_t_white * n_out
-        p4 = A + outer_t_white * n_out
-        ax.fill([p1[0], p2[0], p3[0], p4[0], p1[0]],
-                [p1[1], p2[1], p3[1], p4[1], p1[1]],
-                color='white', edgecolor='none', zorder=bg_zorder,
-                antialiased=False)
-
-        for end in (A, B):
-            ja = end + inner_t_white * n_out
-            jb = end + outer_t_white * n_out
-            ax.plot([ja[0], jb[0]], [ja[1], jb[1]], '-',
-                    color='black', linewidth=jamb_lw, zorder=fg_zorder)
-
-        # Cut polygon: a hair past each contour line so they break cleanly.
-        inner_t_cut = -1.20 * float(inset)
-        outer_t_cut = float(outer_pad) + 0.20 * float(inset)
-        c1 = A + inner_t_cut * n_out
-        c2 = B + inner_t_cut * n_out
-        c3 = B + outer_t_cut * n_out
-        c4 = A + outer_t_cut * n_out
-        return SPolygon([c1, c2, c3, c4])
-
-    @staticmethod
-    def _draw_entry_door_at_segment(ax, apt_polygon_pts, door_segment, *,
-                                    inset, outer_pad, bg_zorder=3,
-                                    fg_zorder=4, jamb_lw=1.2,
-                                    door_w=None, corner_margin=None):
-        """Punch an entry door at an explicit apartment-boundary segment.
-
-        This is used when a benchmark source (e.g. DiffPlanner/RPLAN) already
-        declares the entrance as a boundary segment. Unlike
-        :meth:`_draw_entry_door`, it does not infer the entrance room from the
-        hypergraph's ``outside`` edge.
-        """
-        import numpy as np
-        from shapely.geometry import Point as SPoint
-        from shapely.geometry import Polygon as SPolygon
-
-        try:
-            apt = SPolygon(apt_polygon_pts)
-            if not apt.is_valid:
-                apt = apt.buffer(0)
-        except Exception:
-            return None
-        if apt.is_empty:
-            return None
-
-        try:
-            p0, p1 = door_segment
-            seg_a = np.array([float(p0[0]), float(p0[1])], dtype=float)
-            seg_b = np.array([float(p1[0]), float(p1[1])], dtype=float)
-        except Exception:
-            return None
-
-        seg_d = seg_b - seg_a
-        seg_L = float(np.linalg.norm(seg_d))
-        if seg_L < 1e-9:
-            return None
-        seg_center = 0.5 * (seg_a + seg_b)
-
-        # DiffPlanner's entrance segment can be a short door span rather than
-        # the full boundary edge. Find the containing apartment edge, use the
-        # DP segment only as the desired center, then draw our normal-width
-        # door along that full edge.
-        boundary = [np.array([float(p[0]), float(p[1])], dtype=float)
-                    for p in apt_polygon_pts]
-        best = None
-        tol = max(2.0 * float(inset), 1e-3)
-        for i in range(len(boundary)):
-            E0 = boundary[i]
-            E1 = boundary[(i + 1) % len(boundary)]
-            ed = E1 - E0
-            edge_L = float(np.linalg.norm(ed))
-            if edge_L < 1e-9:
-                continue
-            u = ed / edge_L
-            rel = seg_center - E0
-            t = float(np.dot(rel, u))
-            proj = E0 + min(max(t, 0.0), edge_L) * u
-            dist = float(np.linalg.norm(seg_center - proj))
-            # Prefer an edge with similar direction and near-collinear center.
-            align = abs(float(np.dot(seg_d / seg_L, u)))
-            if dist <= tol and align > 0.80:
-                score = (dist, -align)
-                if best is None or score < best[0]:
-                    best = (score, E0, u, edge_L, t)
-
-        if best is not None:
-            _, edge_start, d, L, center_t = best
-            center_t = min(max(float(center_t), 0.0), L)
-        else:
-            # Fallback: use the provided segment as the edge if no containing
-            # boundary segment can be identified.
-            edge_start = seg_a
-            d = seg_d / seg_L
-            L = seg_L
-            center_t = 0.5 * L
-
-        # Keep a fixed-width door, but slide its center along the containing
-        # boundary edge when the jambs would otherwise collide with corners.
-        if corner_margin is None:
-            corner_margin = 2.0 * float(inset)
-        desired_half_w = 0.5 * float(door_w if door_w is not None else L)
-        # If the boundary edge is too short to fit the requested door plus
-        # margins, reduce only as a last resort; otherwise preserve width.
-        max_half_w = max(0.0, 0.5 * L - float(corner_margin))
-        half_w = min(desired_half_w, max_half_w) if max_half_w > 0 else min(desired_half_w, 0.5 * L)
-        lo = float(corner_margin) + half_w
-        hi = L - float(corner_margin) - half_w
-        if lo <= hi:
-            center_t = min(max(center_t, lo), hi)
-        center = edge_start + center_t * d
-        A = center - half_w * d
-        B = center + half_w * d
-
-        n_cand = np.array([-d[1], d[0]])
-        M = 0.5 * (A + B)
-        probe = M + max(float(inset), 1e-3) * n_cand
-        try:
-            # The outward normal is the side that is not inside the apartment.
-            n_out = -n_cand if apt.contains(SPoint(probe[0], probe[1])) else n_cand
-        except Exception:
-            n_out = n_cand
-
-        inner_t_white = -1.0 * float(inset)
-        outer_t_white = float(outer_pad)
-
-        p1 = A + inner_t_white * n_out
-        p2 = B + inner_t_white * n_out
-        p3 = B + outer_t_white * n_out
-        p4 = A + outer_t_white * n_out
-        ax.fill([p1[0], p2[0], p3[0], p4[0], p1[0]],
-                [p1[1], p2[1], p3[1], p4[1], p1[1]],
-                color='white', edgecolor='none', zorder=bg_zorder,
-                antialiased=False)
-
-        for end in (A, B):
-            ja = end + inner_t_white * n_out
-            jb = end + outer_t_white * n_out
-            ax.plot([ja[0], jb[0]], [ja[1], jb[1]], '-',
-                    color='black', linewidth=jamb_lw, zorder=fg_zorder)
-
-        inner_t_cut = -1.20 * float(inset)
-        outer_t_cut = float(outer_pad) + 0.20 * float(inset)
-        c1 = A + inner_t_cut * n_out
-        c2 = B + inner_t_cut * n_out
-        c3 = B + outer_t_cut * n_out
-        c4 = A + outer_t_cut * n_out
-        return SPolygon([c1, c2, c3, c4])
-
     def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
                           title="Floor Plan", face_labels=None,
                           show_title=True, show_area=True, show_frame=True,
@@ -2474,6 +2003,10 @@ class HypergraphPlotter:
 
         import numpy as np
         from shapely.geometry import Polygon
+        from utils.visualization_helpers import (  # noqa: PLC0415
+            _draw_door_between, _draw_entry_door, _draw_entry_door_at_segment,
+            _plot_geom_lines, _shared_wall_line, _shrink_polygon,
+        )
 
         min_area = self._mesh_min_area(mesh.faceList)
 
@@ -2522,7 +2055,7 @@ class HypergraphPlotter:
             if p is None:
                 shrunk.append(None)
             elif use_walls:
-                shrunk.append(self._shrink_polygon_for_walls(p, wall_inset))
+                shrunk.append(_shrink_polygon(p, wall_inset))
             else:
                 shrunk.append(p)
 
@@ -2562,7 +2095,7 @@ class HypergraphPlotter:
                     if (frozenset({face_types[i], face_types[j]})
                             not in self.OPEN_ZONE_TYPE_PAIRS):
                         continue
-                    line = self._shared_wall_line(
+                    line = _shared_wall_line(
                         polys[i], polys[j], inset=float(wall_inset),
                     )
                     if line is None:
@@ -2613,7 +2146,7 @@ class HypergraphPlotter:
                     continue
                 if union_poly.geom_type == 'MultiPolygon':
                     union_poly = max(union_poly.geoms, key=lambda g: g.area)
-                zone_shrunk[root] = self._shrink_polygon_for_walls(
+                zone_shrunk[root] = _shrink_polygon(
                     union_poly, wall_inset,
                 )
 
@@ -2725,7 +2258,7 @@ class HypergraphPlotter:
                 # space, with no wall to put a door through.
                 if _uf_find(a) == _uf_find(b):
                     continue
-                cut = self._draw_door_between(
+                cut = _draw_door_between(
                     ax, polys[a], polys[b],
                     inset=float(wall_inset),
                     door_w=door_w,
@@ -2738,7 +2271,7 @@ class HypergraphPlotter:
 
         if (use_walls and entry_door_segment is not None
                 and boundary_polygon and outer_pad > 0):
-            cut = self._draw_entry_door_at_segment(
+            cut = _draw_entry_door_at_segment(
                 ax, boundary_polygon, entry_door_segment,
                 inset=float(wall_inset),
                 outer_pad=float(outer_pad),
@@ -2754,7 +2287,7 @@ class HypergraphPlotter:
                 and boundary_polygon and outer_pad > 0):
             ei = int(entry_door_face_idx)
             if 0 <= ei < len(polys) and polys[ei] is not None:
-                cut = self._draw_entry_door(
+                cut = _draw_entry_door(
                     ax, polys[ei], boundary_polygon,
                     inset=float(wall_inset),
                     outer_pad=float(outer_pad),
@@ -2786,7 +2319,7 @@ class HypergraphPlotter:
                             contour = contour.difference(cut)
                     except Exception:
                         continue
-                self._plot_geom_lines(
+                _plot_geom_lines(
                     ax, contour, color='black',
                     linewidth=2.0, zorder=4,
                 )
@@ -2801,7 +2334,7 @@ class HypergraphPlotter:
                         for jj in range(ii + 1, len(members)):
                             a = members[ii]
                             b = members[jj]
-                            line = self._shared_wall_line(
+                            line = _shared_wall_line(
                                 polys[a], polys[b],
                                 inset=float(wall_inset),
                             )
@@ -2813,7 +2346,7 @@ class HypergraphPlotter:
                                 inside = None
                             if inside is None or inside.is_empty:
                                 continue
-                            self._plot_geom_lines(
+                            _plot_geom_lines(
                                 ax, inside, color='black',
                                 linewidth=0.8, zorder=4,
                             )
@@ -2833,7 +2366,7 @@ class HypergraphPlotter:
                             outer_geom = outer_geom.difference(cut)
                     except Exception:
                         continue
-                self._plot_geom_lines(
+                _plot_geom_lines(
                     ax, outer_geom, color='black',
                     linewidth=3.0, zorder=4,
                 )
