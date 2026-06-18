@@ -32,7 +32,6 @@ if str(REPO_ROOT) not in sys.path:
 from utils.hypergraph import Hypergraph  # noqa: E402
 from utils.metrics import (  # noqa: E402
     compute_room_area_proportion_error,
-    compute_room_similarity_score,
     produce_room_area_list,
     produce_room_list,
 )
@@ -53,8 +52,6 @@ DEFAULT_OBJECTIVE: str = "delta"
 DEFAULT_WMR24_RESULTS = (
     REPO_ROOT / "inference_8700_on_wmr24_inference_vllm_64" / "results_hypergraphs.json"
 )
-DEFAULT_WMR24_TEST_DIR = REPO_ROOT / "dataset" / "wmr24" / "test"
-
 # Per-room ε reference fractions (shared between WMR24 and RPLAN).
 AREA_REF_FRACTIONS: dict[str, dict[str, float]] = {
     "studio": {
@@ -187,10 +184,6 @@ class OptimConfig:
         return cfg, apt_id, bool(ns.all)
 
 
-def parse_args(argv: list[str] | None = None) -> tuple[OptimConfig, str | None, bool]:
-    return OptimConfig.from_args(argv)
-
-
 def _infer_dataset(test_dir: str) -> str:
     s = str(test_dir).replace("\\", "/").lower()
     if "wmr24" in s:
@@ -237,39 +230,31 @@ def hypergraph_bounds_to_mesh(hg: dict, bounds: dict, *, RGL=None, Collections=N
     return Hypergraph(copy.deepcopy(hg)).to_mesh(bounds=bounds, RGL=RGL, Collections=Collections)
 
 
-def _parse_jsonish(val) -> object:
-    if isinstance(val, str):
-        s = val.strip()
-        return json.loads(s) if s else {}
-    return val if val is not None else {}
-
-
 def load_ground_truth_txt(test_dir: Path, sample_id: str) -> tuple[dict, dict, dict, list | None]:
     """Load ``<test_dir>/<id>.txt`` → ``(bounds, hypergraph, accessgraph, room_polygons|None)``."""
+    def _j(val):
+        if isinstance(val, str):
+            s = val.strip()
+            return json.loads(s) if s else {}
+        return val if val is not None else {}
+
     with open(test_dir / f"{sample_id}.txt", encoding="utf-8") as f:
         raw = json.load(f)
 
-    bounds = _parse_jsonish(raw.get("bounds", "{}"))
+    bounds = _j(raw.get("bounds", "{}"))
     if not isinstance(bounds, dict):
         bounds = {}
 
-    hg = raw.get("hypergraph")
-    if isinstance(hg, str):
-        hg = json.loads(hg)
+    hg = _j(raw.get("hypergraph"))
     if not isinstance(hg, dict):
         hg = {}
 
-    ag = raw.get("accessgraph") or {}
-    if isinstance(ag, str):
-        ag = json.loads(ag) if ag else {}
+    ag = _j(raw.get("accessgraph") or {})
     if not isinstance(ag, dict):
         ag = {}
 
     rp = raw.get("room_polygons")
-    if not isinstance(rp, list):
-        rp = None
-
-    return bounds, hg, ag, rp
+    return bounds, hg, ag, (rp if isinstance(rp, list) else None)
 
 
 def access_graph_from_prediction(
@@ -350,24 +335,6 @@ def _leaf_type_counts_from_hypergraph(hg: dict) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
-
-
-def compute_delta_metric_soft_from_room_lists(
-    room_list_a, room_list_b, *, area_sorting: bool = True
-) -> float:
-    """Soft δ vs reference, identical to non-strict :func:`compute_room_similarity_score`."""
-    return float(
-        compute_room_similarity_score(room_list_a, room_list_b, strict=False, area_sorting=area_sorting)
-    )
-
-
-def compute_epsilon_metric_vs_gt(pred_mesh, gt_mesh) -> float:
-    """Mean area-proportion error vs GT (per-room)."""
-    pred_area = produce_room_area_list(pred_mesh)
-    gt_area = produce_room_area_list(gt_mesh)
-    return float(
-        compute_room_area_proportion_error(pred_area, gt_area, aggregate=False)["area_proportion_error"]
-    )
 
 
 def _delta_metric_square_from_room_list(room_list) -> float:
@@ -573,26 +540,20 @@ def apply_area_splits(hg: dict, splits) -> dict:
     return hg
 
 
-def _collect_leaves(hg: dict) -> list[dict]:
-    leaves: list[dict] = []
-    stack = [hg]
-    while stack:
-        n = stack.pop()
-        if not isinstance(n, dict):
-            continue
-        children = n.get("children") or []
-        if children:
-            stack.extend(children)
-        else:
-            leaves.append(n)
-    return leaves
-
-
 def validate_leaf_area_floor(hg: dict) -> tuple[bool, dict]:
     """All leaves ≥ ``MIN_LEAF_FRAC`` of root area? Returns (ok, stats)."""
     root_area = max(MIN_AREA, float(hg.get("area", 0.0) or 0.0))
     floor_area = MIN_LEAF_FRAC * root_area
-    leaves = _collect_leaves(hg)
+    stack, leaves = [hg], []
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, dict):
+            continue
+        ch = n.get("children") or []
+        if ch:
+            stack.extend(ch)
+        else:
+            leaves.append(n)
     min_frac = float("inf")
     n_offenders = 0
     for lf in leaves:

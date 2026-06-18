@@ -86,32 +86,10 @@ SYSTEM_PROMPT = (
 )
 
 
-def _format_nodes_block(nodes: dict[str, str]) -> str:
-    """Render the ``accessgraph.nodes`` mapping as the same indented JSON we
-    showed the model in the one-shot example, so the input distribution at
-    inference matches what the example primes the model with.
-    """
-    return json.dumps(nodes, indent=2)
-
-
-def _format_edges_block(edges: list[list[str]]) -> str:
-    """Same indented-JSON formatting as ``accessgraph.edges`` in the eval_test
-    files, so the example response visually matches the source file format
-    the model was trained on.
-    """
-    return json.dumps(edges, indent=2)
-
-
 def _build_prompt(example_nodes: dict[str, str],
                   example_edges: list[list[str]],
                   query_nodes: dict[str, str]) -> list[dict]:
-    """Return a chat-template-ready ``messages`` list with one one-shot
-    example (sample 0's GT) followed by the new query (just the room set).
-
-    The user-facing instructions describe the access graph definition once
-    and pin the response format ("only a JSON array of edges, like the
-    example") so the parser downstream has a predictable target.
-    """
+    """One-shot messages list: example (sample 0 GT) then the new query."""
     user_intro = (
         "Based on your understanding of apartment layouts and typical room "
         "connections, build a valid and realistic access graph for the "
@@ -128,21 +106,18 @@ def _build_prompt(example_nodes: dict[str, str],
         "wrap in another object, do not add commentary. Format exactly like "
         "the example below."
     )
-    example_user = (
-        f"{user_intro}\n\n"
-        f"Example input nodes:\n```json\n{_format_nodes_block(example_nodes)}\n```\n\n"
-        "Now respond with the edges for this example."
-    )
-    example_assistant = f"```json\n{_format_edges_block(example_edges)}\n```"
-    query_user = (
-        f"Now produce the edges for these new nodes (same format, same rules):\n"
-        f"```json\n{_format_nodes_block(query_nodes)}\n```"
-    )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": example_user},
-        {"role": "assistant", "content": example_assistant},
-        {"role": "user", "content": query_user},
+        {"role": "user", "content": (
+            f"{user_intro}\n\n"
+            f"Example input nodes:\n```json\n{json.dumps(example_nodes, indent=2)}\n```\n\n"
+            "Now respond with the edges for this example."
+        )},
+        {"role": "assistant", "content": f"```json\n{json.dumps(example_edges, indent=2)}\n```"},
+        {"role": "user", "content": (
+            f"Now produce the edges for these new nodes (same format, same rules):\n"
+            f"```json\n{json.dumps(query_nodes, indent=2)}\n```"
+        )},
     ]
 
 
@@ -230,24 +205,8 @@ def _normalise_edges(parsed: list, valid_ids: set[str]) -> tuple[list[list[str]]
 # IO + sharding helpers
 # ----------------------------------------------------------------------
 
-def _load_eval_test_entry(path: Path) -> dict:
-    """Read one eval_test JSON file with ``bounds`` un-stringified into a dict
-    if needed. We DON'T modify ``bounds`` for the output (we just round-trip
-    it back as a string), but we want easy access to ``accessgraph.nodes``.
-    """
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _emit_output(in_path: Path, out_path: Path,
-                 new_edges: list[list[str]]) -> None:
-    """Write the predicted-edges variant of *in_path* to *out_path*.
-
-    We re-load the source verbatim and ONLY replace ``accessgraph.edges`` so
-    no other field (``bounds`` string, ``room_polygons``, key order) is
-    perturbed. ``json.dump(..., indent=2)`` mirrors how the original
-    eval_test files are formatted.
-    """
+def _emit_output(in_path: Path, out_path: Path, new_edges: list[list[str]]) -> None:
+    """Re-load *in_path* verbatim, replace only ``accessgraph.edges``, and write to *out_path*."""
     with open(in_path, encoding="utf-8") as f:
         raw = json.load(f)
     ag = raw.get("accessgraph") or {}
@@ -305,7 +264,7 @@ _TORCHRUN_ENV_KEYS = (
 def _strip_torchrun_env(log) -> None:
     """Remove torchrun-injected env vars so each rank looks single-process to
     vLLM. Must be called after rank/world have been read into Python vars
-    and BEFORE the vLLM imports inside ``_build_engine`` happen.
+    and BEFORE vLLM is imported (inside ``main``).
     """
     removed = {k: os.environ.pop(k) for k in _TORCHRUN_ENV_KEYS if k in os.environ}
     if removed:
@@ -326,74 +285,6 @@ def _bind_rank_to_gpu(local_rank: int, log) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
     log.info("bound rank to CUDA_VISIBLE_DEVICES=%s", local_rank)
 
-
-# ----------------------------------------------------------------------
-# vLLM glue
-# ----------------------------------------------------------------------
-
-def _build_engine(checkpoint: Path, base_model: str | None,
-                  max_model_len: int, gpu_memory_util: float,
-                  log) -> tuple:
-    """Return ``(llm, sampling_params, tokenizer, lora_request)``.
-
-    Reads ``checkpoint/adapter_config.json`` to (a) discover the base model
-    and (b) pick ``max_lora_rank`` automatically. This is the same logic
-    ``scripts/generators.py::VllmQwenGenerator`` uses; we inline it here so
-    the script doesn't need the full repo's generator machinery.
-    """
-    # Lazy imports so the bind-to-GPU step above runs first.
-    from vllm import LLM, SamplingParams  # type: ignore[import-not-found]
-    from vllm.lora.request import LoRARequest  # type: ignore[import-not-found]
-    from transformers import AutoTokenizer  # type: ignore[import-not-found]
-
-    adapter_cfg_path = checkpoint / "adapter_config.json"
-    if not adapter_cfg_path.is_file():
-        raise FileNotFoundError(
-            f"adapter_config.json missing in checkpoint: {adapter_cfg_path}"
-        )
-    with open(adapter_cfg_path) as f:
-        adapter_cfg = json.load(f)
-    discovered_base = adapter_cfg.get("base_model_name_or_path")
-    base_model = base_model or discovered_base
-    if not base_model:
-        raise ValueError("base model unknown; pass --base-model or fix adapter_config.json")
-    max_lora_rank = int(adapter_cfg.get("r", 64))
-    log.info("vLLM init: base=%s, lora=%s, max_lora_rank=%d, max_model_len=%d, gpu_mem=%.2f",
-             base_model, checkpoint, max_lora_rank, max_model_len, gpu_memory_util)
-
-    llm = LLM(
-        model=base_model,
-        tokenizer=base_model,
-        enable_lora=True,
-        max_lora_rank=max_lora_rank,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_memory_util,
-        # Eager mode avoids CUDA-graph capture OOM on 40 GB cards with long
-        # max_model_len -- same default as evaluator.py.
-        enforce_eager=True,
-        dtype="bfloat16",
-    )
-    sampling_params = SamplingParams(
-        temperature=0.0,            # deterministic decoding by default
-        top_p=1.0,
-        max_tokens=768,
-        stop=None,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), trust_remote_code=True)
-    lora_request = LoRARequest(
-        lora_name=checkpoint.name,
-        lora_int_id=hash(str(checkpoint)) % (2**31),
-        lora_path=str(checkpoint),
-    )
-    return llm, sampling_params, tokenizer, lora_request
-
-
-def _render_prompt(messages: list[dict], tokenizer) -> str:
-    """Apply the chat template and add the generation prompt header so the
-    model writes the assistant turn next."""
-    return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
 
 
 # ----------------------------------------------------------------------
@@ -465,7 +356,8 @@ def main(argv=None) -> int:
     example_path = args.eval_test_dir / f"{args.example_id}.txt"
     if not example_path.is_file():
         sys.exit(f"--example-id {args.example_id} not found at {example_path}")
-    example_entry = _load_eval_test_entry(example_path)
+    with open(example_path, encoding="utf-8") as f:
+        example_entry = json.load(f)
     example_ag = example_entry.get("accessgraph") or {}
     example_nodes = example_ag.get("nodes") or {}
     example_edges = example_ag.get("edges") or []
@@ -494,13 +386,19 @@ def main(argv=None) -> int:
         log.info("nothing to do for this rank")
         return 0
 
-    llm, sampling_params, tokenizer, lora_request = _build_engine(
-        args.checkpoint, args.base_model,
-        args.max_model_len, args.gpu_memory_utilization, log,
-    )
-    # Apply CLI-level overrides on top of the static SamplingParams object
-    # (vLLM ignores unset fields when re-created, so we just rebuild).
+    # Lazy import after GPU is bound and torchrun env is stripped, so each
+    # rank initialises its own vLLM engine on its assigned card.
+    from scripts.generators import VllmQwenGenerator
     from vllm import SamplingParams  # type: ignore[import-not-found]
+    gen = VllmQwenGenerator(
+        model_name=args.base_model or "Qwen/Qwen3-4B-Instruct-2507",
+        lora_path=args.checkpoint,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        enforce_eager=True,
+    )
+    tokenizer = gen._tokenizer
+    lora_request = gen._lora_request()
     sampling_params = SamplingParams(
         temperature=float(args.temperature),
         top_p=1.0 if args.temperature == 0 else 0.95,
@@ -519,7 +417,8 @@ def main(argv=None) -> int:
         nodes_per_sample: list[dict[str, str]] = []
         for fp in batch_paths:
             try:
-                entry = _load_eval_test_entry(fp)
+                with open(fp, encoding="utf-8") as _f:
+                    entry = json.load(_f)
             except Exception as exc:
                 log.warning("[%s] failed to read: %s", fp.stem, exc)
                 prompts.append(""); node_sets.append(set()); nodes_per_sample.append({})
@@ -531,7 +430,7 @@ def main(argv=None) -> int:
                 prompts.append(""); node_sets.append(set()); nodes_per_sample.append({})
                 continue
             messages = _build_prompt(example_nodes, example_edges, nodes)
-            prompts.append(_render_prompt(messages, tokenizer))
+            prompts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
             node_sets.append({str(k) for k in nodes})
             nodes_per_sample.append(nodes)
 
@@ -540,7 +439,7 @@ def main(argv=None) -> int:
         if not live_indices:
             continue
         live_prompts = [prompts[j] for j in live_indices]
-        outputs = llm.generate(
+        outputs = gen._llm.generate(
             live_prompts, sampling_params,
             lora_request=lora_request, use_tqdm=False,
         )

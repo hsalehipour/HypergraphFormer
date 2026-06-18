@@ -44,19 +44,19 @@ for _p in (REPO_ROOT, SCRIPTS_DIR):
 from utils.hypergraph import repair_bsp_tree_names  # noqa: E402
 from utils.metrics import (  # noqa: E402
     compute_room_area_proportion_error,
+    compute_room_similarity_score,
     produce_room_area_list,
     produce_room_area_list_from_polygons,
     produce_room_list,
     produce_room_list_from_polygons,
 )
 
+MIN_SPLIT, MAX_SPLIT = 0.15, 0.85
+ACCESSGRAPH_VIOLATION_WEIGHT = 0.05
+OBJECTIVES = ("delta", "delta_epsilon", "epsilon")
+DEFAULT_WMR24_RESULTS = REPO_ROOT / "inference_8700_on_wmr24_inference_vllm_64" / "results_hypergraphs.json"
+
 from utils_parametric import (  # noqa: E402
-    ACCESSGRAPH_VIOLATION_WEIGHT,
-    BATCH_CSV_FIELDS,
-    DEFAULT_WMR24_RESULTS,
-    MAX_SPLIT,
-    MIN_SPLIT,
-    OBJECTIVES,
     OptimConfig,
     _delta_metric_square_from_room_list,
     _bedroom_group_from_accessgraph,
@@ -69,13 +69,10 @@ from utils_parametric import (  # noqa: E402
     apply_area_splits,
     check_accessgraph_edges_against_mesh,
     collect_area_splits,
-    compute_delta_metric_soft_from_room_lists,
-    compute_epsilon_metric_vs_gt,
     compute_epsilon_metric_vs_ref,
     hypergraph_bounds_to_mesh,
     init_rgl,
     load_ground_truth_txt,
-    parse_args,
     save_batch_results,
     save_metric_progress_csv,
     validate_leaf_area_floor,
@@ -133,12 +130,9 @@ def _fd_grad(
 
 def _epsilon_vs_gt_or_polygons(mesh, gt_mesh, room_polygons) -> float:
     """ε vs GT mesh when available, else fall back to polygon-only GT."""
-    if gt_mesh is not None:
-        return float(compute_epsilon_metric_vs_gt(mesh, gt_mesh))
     pred_a = produce_room_area_list(mesh)
-    gt_a = produce_room_area_list_from_polygons(room_polygons or [])
-    d = compute_room_area_proportion_error(pred_a, gt_a, aggregate=False)
-    return float(d.get("area_proportion_error", float("nan")))
+    gt_a = produce_room_area_list(gt_mesh) if gt_mesh is not None else produce_room_area_list_from_polygons(room_polygons or [])
+    return float(compute_room_area_proportion_error(pred_a, gt_a, aggregate=False).get("area_proportion_error", float("nan")))
 
 
 def optimize_hypergraph(
@@ -152,7 +146,7 @@ def optimize_hypergraph(
 
     Returns ``(optimized_hg, best_metric, original_metric, gt_hg,
     metrics_original, metrics_optimized, bedroom_group, expected_counts,
-    ag_report, metric_trace, best_trace)``.
+    ag_report, metric_trace, best_trace, bounds, accessgraph)``.
     """
     apt_id = _validate_apt_id(apt_id)
     objective = str(config.objective).strip().lower()
@@ -217,9 +211,9 @@ def optimize_hypergraph(
         copy.deepcopy(original_hg), bounds, RGL=RGL, Collections=Collections
     )
     original_room_list = produce_room_list(original_mesh)
-    orig_delta_gt = compute_delta_metric_soft_from_room_lists(
-        original_room_list, gt_room_list, area_sorting=True
-    )
+    orig_delta_gt = float(compute_room_similarity_score(
+        original_room_list, gt_room_list, strict=False, area_sorting=True
+    ))
     orig_delta_sq = _delta_metric_square_from_room_list(original_room_list)
     orig_eps_ref = compute_epsilon_metric_vs_ref(
         original_mesh, group=bedroom_group, expected_counts=expected_counts,
@@ -369,31 +363,22 @@ def optimize_hypergraph(
     best_room_list = produce_room_list(best_mesh)
     best_room_names = {r[0] for r in best_room_list}
 
-    ag_report = {
-        "n_evals": int(ag_eval_counter),
-        "n_fails": int(ag_fail_count),
-        "first_fail_eval": int(ag_first_fail_eval) if ag_first_fail_eval is not None else None,
-        "fail_evals_sample": list(ag_fail_evals_sample),
-    }
-
-    metrics_original = {
-        "delta_metric": float(orig_delta_gt),
-        "delta_metric_square": float(orig_delta_sq),
-        "epsilon_metric": float(orig_eps_gt),
-        "epsilon_metric_ref": float(orig_eps_ref),
-    }
+    ag_report = {"n_evals": ag_eval_counter, "n_fails": ag_fail_count,
+                 "first_fail_eval": ag_first_fail_eval, "fail_evals_sample": ag_fail_evals_sample}
+    metrics_original = {"delta_metric": orig_delta_gt, "delta_metric_square": orig_delta_sq,
+                        "epsilon_metric": orig_eps_gt, "epsilon_metric_ref": orig_eps_ref}
 
     if best_room_names != gt_room_names:
         return (
             original_hg, float(original_metric), float(original_metric), gt_hg,
             metrics_original, dict(metrics_original),
             bedroom_group, expected_counts, ag_report,
-            metric_trace, best_trace,
+            metric_trace, best_trace, bounds, accessgraph,
         )
 
-    best_delta_gt = compute_delta_metric_soft_from_room_lists(
-        best_room_list, gt_room_list, area_sorting=True
-    )
+    best_delta_gt = float(compute_room_similarity_score(
+        best_room_list, gt_room_list, strict=False, area_sorting=True
+    ))
     best_delta_sq = _delta_metric_square_from_room_list(best_room_list)
     best_eps_ref = compute_epsilon_metric_vs_ref(
         best_mesh, group=bedroom_group, expected_counts=expected_counts,
@@ -414,23 +399,19 @@ def optimize_hypergraph(
         "epsilon_metric_ref": float(best_eps_ref),
     }
 
+    fmt = lambda v: format(v, ".2g") if math.isfinite(v) else "nan"  # noqa: E731
     print("\n=== Metrics (lower is better) ===")
-    for k, label in (
-        ("delta_metric", "delta (GT, soft)"),
-        ("delta_metric_square", "delta_sq"),
-        ("epsilon_metric", "epsilon (GT)"),
-        ("epsilon_metric_ref", "epsilon (ref)"),
-    ):
+    for k, lbl in (("delta_metric", "soft_δ(GT)"), ("delta_metric_square", "δ_sq"),
+                   ("epsilon_metric", "ε(GT)"), ("epsilon_metric_ref", "ε(ref)")):
         o, n = metrics_original[k], metrics_optimized[k]
-        fmt = lambda v: format(v, ".2g") if math.isfinite(v) else "nan"  # noqa: E731
-        print(f"  {label:<20}  orig={fmt(o)}  opt={fmt(n)}  Δ={fmt(n - o)}")
-    print(f"\nObjective {objective}: best={best_metric:.6f} (Δ {best_metric - original_metric:+.6f})")
+        print(f"  {lbl:<14}  orig={fmt(o)}  opt={fmt(n)}  Δ={fmt(n - o)}")
+    print(f"Objective {objective}: best={best_metric:.6f} (Δ {best_metric - original_metric:+.6f})")
 
     return (
         best_hg, float(best_metric), float(original_metric), gt_hg,
         metrics_original, metrics_optimized,
         bedroom_group, expected_counts, ag_report,
-        metric_trace, best_trace,
+        metric_trace, best_trace, bounds, accessgraph,
     )
 
 
@@ -484,6 +465,8 @@ def _process_one_apt(
             ag_report,
             metric_trace,
             best_trace,
+            bounds,
+            accessgraph0,
         ) = optimize_hypergraph(
             apt_id,
             config,
@@ -491,39 +474,23 @@ def _process_one_apt(
             preloaded_hg=preloaded_hg,
         )
 
-        row.update({
-            "original_objective": float(original_metric),
-            "optimized_objective": float(optimized_metric),
-            "delta_metric_orig": float(metrics_original.get("delta_metric", float("nan"))),
-            "delta_metric_opt": float(metrics_optimized.get("delta_metric", float("nan"))),
-            "delta_metric_square_orig": float(metrics_original.get("delta_metric_square", float("nan"))),
-            "delta_metric_square_opt": float(metrics_optimized.get("delta_metric_square", float("nan"))),
-            "epsilon_metric_orig": float(metrics_original.get("epsilon_metric", float("nan"))),
-            "epsilon_metric_opt": float(metrics_optimized.get("epsilon_metric", float("nan"))),
-            "epsilon_metric_ref_orig": float(metrics_original.get("epsilon_metric_ref", float("nan"))),
-            "epsilon_metric_ref_opt": float(metrics_optimized.get("epsilon_metric_ref", float("nan"))),
-            "ag_check_evals": int(ag_report.get("n_evals", 0) or 0),
-            "ag_check_fails": int(ag_report.get("n_fails", 0) or 0),
-            "ag_check_first_fail_eval": ag_report.get("first_fail_eval"),
-        })
-
-        test_path = _resolve_under_repo(REPO_ROOT, str(config.test_dir))
-        bounds, _gt_unused, accessgraph0, _rp = load_ground_truth_txt(test_path, apt_id)
-        original_hg0 = repair_bsp_tree_names(copy.deepcopy(preloaded_hg))
+        nan = float("nan")
+        row.update({"original_objective": float(original_metric), "optimized_objective": float(optimized_metric),
+                    "ag_check_evals": int(ag_report.get("n_evals", 0) or 0),
+                    "ag_check_fails": int(ag_report.get("n_fails", 0) or 0),
+                    "ag_check_first_fail_eval": ag_report.get("first_fail_eval")})
+        for k in ("delta_metric", "delta_metric_square", "epsilon_metric", "epsilon_metric_ref"):
+            row[f"{k}_orig"] = float(metrics_original.get(k, nan))
+            row[f"{k}_opt"] = float(metrics_optimized.get(k, nan))
 
         if isinstance(accessgraph0, dict) and accessgraph0.get("edges") and rgl is not None:
             try:
-                mesh_orig = hypergraph_bounds_to_mesh(
-                    copy.deepcopy(original_hg0), bounds, RGL=rgl, Collections=collections,
-                )
-                mesh_opt = hypergraph_bounds_to_mesh(
-                    copy.deepcopy(optimized_hg), bounds, RGL=rgl, Collections=collections,
-                )
-                c0 = check_accessgraph_edges_against_mesh(mesh_orig, accessgraph0)
-                c1 = check_accessgraph_edges_against_mesh(mesh_opt, accessgraph0)
-                row["ag_edges_total"] = int(len(c0))
-                row["ag_edges_ok_orig"] = int(sum(1 for c in c0 if c.get("ok")))
-                row["ag_edges_ok_opt"] = int(sum(1 for c in c1 if c.get("ok")))
+                hg0 = repair_bsp_tree_names(copy.deepcopy(preloaded_hg))
+                m0 = hypergraph_bounds_to_mesh(copy.deepcopy(hg0), bounds, RGL=rgl, Collections=collections)
+                m1 = hypergraph_bounds_to_mesh(copy.deepcopy(optimized_hg), bounds, RGL=rgl, Collections=collections)
+                c0, c1 = (check_accessgraph_edges_against_mesh(m, accessgraph0) for m in (m0, m1))
+                row.update({"ag_edges_total": len(c0), "ag_edges_ok_orig": sum(1 for c in c0 if c.get("ok")),
+                            "ag_edges_ok_opt": sum(1 for c in c1 if c.get("ok"))})
             except Exception:
                 pass
 
@@ -536,124 +503,90 @@ def _process_one_apt(
 
 
 def _pool_entry(pack):
-    """Picklable entry: unpack and use pool-local RGL."""
-    apt_id, config, preloaded_hg, grpo_s, batch_root_s = pack
+    apt_id, config, preloaded_hg, grpo_s, _batch_s = pack
     rgl, col = _POOL_RGL
-    return _process_one_apt(
-        apt_id, config, preloaded_hg, Path(grpo_s), rgl, col,
-    )
-
-
-def _resolve_grpo_file(config: OptimConfig) -> Path:
-    if config.grpo_file:
-        return _resolve_under_repo(REPO_ROOT, str(config.grpo_file))
-    return DEFAULT_WMR24_RESULTS
-
-
-def _read_skip_ids(path_str: str) -> set[str]:
-    try:
-        skip_path = _resolve_under_repo(REPO_ROOT, path_str)
-        return {
-            line.strip()
-            for line in skip_path.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        }
-    except Exception as e:
-        print(f"⚠️  Could not read --skip-ids-file: {type(e).__name__}: {e}")
-        return set()
+    return _process_one_apt(apt_id, config, preloaded_hg, Path(grpo_s), rgl, col)
 
 
 def _run_batch(config: OptimConfig) -> None:
-    grpo_file_path = _resolve_grpo_file(config)
-
-    if config.batch_output_dir:
-        batch_root = Path(config.batch_output_dir).expanduser().resolve()
-    else:
-        batch_root = (
-            REPO_ROOT / "parametric_optimization" / "output_parametric"
-            / f"{config.dataset}_{config.objective}"
-        )
+    grpo_file_path = (
+        _resolve_under_repo(REPO_ROOT, str(config.grpo_file)) if config.grpo_file
+        else DEFAULT_WMR24_RESULTS
+    )
+    batch_root = (
+        Path(config.batch_output_dir).expanduser().resolve() if config.batch_output_dir
+        else REPO_ROOT / "parametric_optimization" / "output_parametric" / f"{config.dataset}_{config.objective}"
+    )
     batch_root.mkdir(parents=True, exist_ok=True)
-    batch_csv = batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}.csv"
-    progress_csv = batch_root / "metric_progress.csv"
 
     with open(grpo_file_path, encoding="utf-8") as f:
         results = json.load(f)
     ids = sorted(results.keys())
     if config.skip_ids_file:
-        skip = _read_skip_ids(str(config.skip_ids_file))
-        if skip:
+        try:
+            skip = {l.strip() for l in _resolve_under_repo(REPO_ROOT, str(config.skip_ids_file))
+                    .read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#")}
             ids = [i for i in ids if i not in skip]
+        except Exception as e:
+            print(f"⚠️  Could not read --skip-ids-file: {e}")
     if config.limit and config.limit > 0:
         ids = ids[: config.limit]
 
     workers = max(1, int(config.batch_workers))
-    print(
-        f"Batch optimize: n={len(ids)} objective={config.objective} "
-        f"grpo_file={grpo_file_path} batch_workers={workers}"
-    )
+    print(f"Batch optimize: n={len(ids)} objective={config.objective} grpo_file={grpo_file_path} workers={workers}")
 
     rows: list[dict] = []
     merged: dict[str, dict] = {}
     all_traces: list[tuple[str, list[float], list[float]]] = []
 
+    def _accumulate(row, mhg, mt, bt):
+        _id = str(row.get("id", ""))
+        rows.append(row)
+        if mhg is not None:
+            merged[_id] = mhg
+        if mt:
+            all_traces.append((_id, mt, bt))
+
     if workers == 1:
-        try:
-            rgl, col = init_rgl()
-        except Exception:
-            rgl, col = None, None
+        rgl, col = init_rgl() if True else (None, None)
         for k, _id in enumerate(ids, start=1):
             print(f"\n[{k}/{len(ids)}] {_id}")
-            row, mhg, mt, bt = _process_one_apt(
-                _id, config, results[_id], grpo_file_path, rgl, col,
-            )
-            rows.append(row)
-            if mhg is not None:
-                merged[_id] = mhg
-            if mt:
-                all_traces.append((_id, mt, bt))
+            _accumulate(*_process_one_apt(_id, config, results[_id], grpo_file_path, rgl, col))
     else:
-        tasks = [
-            (_id, config, results[_id], str(grpo_file_path), str(batch_root))
-            for _id in ids
-        ]
+        tasks = [(_id, config, results[_id], str(grpo_file_path), str(batch_root)) for _id in ids]
         with ProcessPoolExecutor(max_workers=workers, initializer=_pool_init) as ex:
-            for k, (row, mhg, mt, bt) in enumerate(ex.map(_pool_entry, tasks), start=1):
-                _id = str(row.get("id", ""))
-                print(f"\n[{k}/{len(ids)}] done {_id} status={row.get('status', '')}", flush=True)
-                rows.append(row)
-                if mhg is not None and _id:
-                    merged[_id] = mhg
-                if mt and _id:
-                    all_traces.append((_id, mt, bt))
+            for k, result in enumerate(ex.map(_pool_entry, tasks), start=1):
+                print(f"\n[{k}/{len(ids)}] done {result[0].get('id','')} status={result[0].get('status','')}", flush=True)
+                _accumulate(*result)
 
-    save_batch_results(batch_root, batch_csv, rows, config.objective, grpo_file_path)
-
+    save_batch_results(batch_root, batch_root / f"batch_{Path(grpo_file_path).stem}_{config.objective}.csv",
+                       rows, config.objective, grpo_file_path)
     if all_traces:
+        progress_csv = batch_root / "metric_progress.csv"
         save_metric_progress_csv(progress_csv, all_traces)
         print(f"Saved metric progress CSV ({len(all_traces)} apts) → {progress_csv}")
 
-    if config.merged_hypergraphs_json:
-        merged_path = _resolve_under_repo(REPO_ROOT, str(config.merged_hypergraphs_json))
-    else:
-        merged_path = batch_root / f"{Path(grpo_file_path).stem}_optimized.json"
+    merged_path = (
+        _resolve_under_repo(REPO_ROOT, str(config.merged_hypergraphs_json)) if config.merged_hypergraphs_json
+        else batch_root / f"{Path(grpo_file_path).stem}_optimized.json"
+    )
     try:
         merged_path.parent.mkdir(parents=True, exist_ok=True)
         with open(merged_path, "w", encoding="utf-8") as f:
             json.dump(_to_jsonable(merged), f, indent=2, sort_keys=True)
         print(f"Saved merged hypergraphs ({len(merged)} ids) → {merged_path}")
     except OSError as e:
-        print(f"⚠️  Could not write merged hypergraphs {merged_path}: {type(e).__name__}: {e}")
+        print(f"⚠️  Could not write merged hypergraphs: {e}")
 
 
 def _run_single(config: OptimConfig, apt_id: str) -> None:
-    grpo_file_path = _resolve_grpo_file(config)
-    (
-        _optimized_hg, _opt_metric, _orig_metric,
-        _gt_hg, _metrics_orig, _metrics_opt,
-        _bedroom, _counts, _ag_report,
-        metric_trace, best_trace,
-    ) = optimize_hypergraph(apt_id, config, grpo_file_path=grpo_file_path)
+    grpo_file_path = (
+        _resolve_under_repo(REPO_ROOT, str(config.grpo_file)) if config.grpo_file
+        else DEFAULT_WMR24_RESULTS
+    )
+    *_, metric_trace, best_trace, _bounds, _ag = optimize_hypergraph(
+        apt_id, config, grpo_file_path=grpo_file_path
+    )
 
     if metric_trace:
         out_dir = SCRIPTS_DIR / "output_parametric"
@@ -663,7 +596,7 @@ def _run_single(config: OptimConfig, apt_id: str) -> None:
 
 
 def main() -> None:
-    config, apt_id, run_all = parse_args()
+    config, apt_id, run_all = OptimConfig.from_args()
     if run_all:
         _run_batch(config)
     elif apt_id:

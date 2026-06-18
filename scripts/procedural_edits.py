@@ -12,22 +12,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.zero_shot_edits import (
-    load_bounds,
-    load_hypergraph,
-    render_comparison,
-    render_input_output_pair,
-    render_single_mesh,
-)
+from scripts.zero_shot_edits import load_bounds, load_hypergraph
 from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
@@ -850,118 +839,58 @@ def apply_command(
     )
 
 
-def _run_one_cli(
-    sample_id: str,
+def _apply_one(
     input_hg: dict,
     bounds: dict,
     command: str,
     increase_factor: float,
-    tag: str,
-    output_dir: Path,
-) -> tuple[Path, Path, Path]:
-    output_hg, summary = apply_command(
-        input_hg, command, increase_factor, bounds=bounds
-    )
+) -> tuple[dict, str]:
+    """Apply *command* to *input_hg*, validate, and return (edited_hg, summary)."""
+    output_hg, summary = apply_command(input_hg, command, increase_factor, bounds=bounds)
     is_valid, _, failed, _ = Hypergraph(output_hg).validate(quick=True)
     if not is_valid:
         raise ValueError("Edited hypergraph failed validation: " + "; ".join(failed))
-    # 'rotate <deg>' keeps the footprint identical and only rotates BSP cuts; pass
-    # the original bounds straight through. Renderers still accept output_bounds
-    # so future commands that want to transform the footprint can plumb it.
-    output_bounds = bounds
-    command_slug = slugify_command(command)
-    run_dir = output_dir / f"{command_slug}_{sample_id}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{sample_id}_{command_slug}_{tag}"
-    json_path = run_dir / f"{stem}.json"
-    png_path = run_dir / f"{stem}.png"
-    summary_path = run_dir / f"{stem}_summary.txt"
-    with open(json_path, "w") as f:
-        json.dump(output_hg, f, indent=2)
-    render_comparison(
-        sample_id, command, bounds, input_hg, output_hg, png_path,
-        output_bounds=output_bounds,
-    )
-
-    input_png = run_dir / f"{stem}_input.png"
-    output_png = run_dir / f"{stem}_output.png"
-    pair_png = run_dir / f"{stem}_input_output.png"
-    try:
-        render_single_mesh(Hypergraph(input_hg), bounds, input_png)
-        render_single_mesh(Hypergraph(output_hg), output_bounds, output_png)
-        render_input_output_pair(
-            input_hg, output_hg, bounds, pair_png,
-            output_bounds=output_bounds,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Standalone mesh PNGs failed for %s: %s", sample_id, exc)
-
-    summary_path.write_text(summary + "\n")
-    return json_path, png_path, summary_path
+    return output_hg, summary
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Run a single procedural command on one or all samples."
-    )
+    parser = argparse.ArgumentParser(description="Apply a procedural command to one or all hypergraphs.")
     parser.add_argument("--hypergraphs-file", type=Path, required=True)
-    parser.add_argument(
-        "--sample-id",
-        default=None,
-        help="One id from the hypergraphs JSON (omit if --all-samples).",
-    )
-    parser.add_argument(
-        "--all-samples",
-        action="store_true",
-        help="Run --command for every key in --hypergraphs-file; write outputs per id under --output-dir.",
-    )
+    parser.add_argument("--sample-id", default=None, help="Single id (omit for --all-samples).")
+    parser.add_argument("--all-samples", action="store_true")
     parser.add_argument(
         "--test-dir",
         type=Path,
         default=Path("/raid/home/nikita/HypergraphFormer/dataset/rplan/dataset_hypergraph_la0_fixed/test"),
     )
     parser.add_argument("--command", required=True)
-    parser.add_argument("--tag", default="procedural")
     parser.add_argument("--increase-factor", type=float, default=2.0)
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / ".procedural_edit_outputs")
+    parser.add_argument("--output", type=Path, default=None, help="Output JSON (default: beside input).")
     args = parser.parse_args()
 
+    with open(args.hypergraphs_file, encoding="utf-8") as f:
+        all_hg: dict = json.load(f)
+
     if args.all_samples:
-        with open(args.hypergraphs_file, encoding="utf-8") as f:
-            all_hg: dict = json.load(f)
-        ids = sorted(all_hg.keys(), key=lambda x: (len(str(x)), str(x)))
-        n_ok = 0
-        n_err = 0
-        err_path = args.output_dir / f"_batch_errors_{slugify_command(args.command)}_{args.tag}.txt"
-        lines: list[str] = []
-        for sid in ids:
-            sid_s = str(sid)
+        out: dict[str, Any] = {}
+        n_ok = n_err = 0
+        for sid in sorted(all_hg.keys(), key=lambda x: (len(str(x)), str(x))):
             try:
-                input_hg = all_hg[sid]
-                if not isinstance(input_hg, dict):
-                    raise TypeError("hypergraph must be a dict")
-                bounds = load_bounds(args.test_dir, sid_s)
-                jp, pp, sp = _run_one_cli(
-                    sid_s,
-                    input_hg,
-                    bounds,
-                    args.command,
-                    args.increase_factor,
-                    args.tag,
-                    args.output_dir,
-                )
+                bounds = load_bounds(args.test_dir, str(sid))
+                edited, summary = _apply_one(all_hg[sid], bounds, args.command, args.increase_factor)
+                out[str(sid)] = edited
                 n_ok += 1
-                print(jp)
-                print(pp)
-                print(sp)
+                logger.info("%s: %s", sid, summary)
             except Exception as exc:  # noqa: BLE001
                 n_err += 1
-                lines.append(f"{sid_s}\t{exc}\n")
-                logger.warning("Sample %s failed: %s", sid_s, exc)
-        if lines:
-            args.output_dir.mkdir(parents=True, exist_ok=True)
-            err_path.write_text("".join(lines), encoding="utf-8")
-        logger.info("Batch done: %d ok, %d errors (see %s)", n_ok, n_err, err_path if lines else "—")
+                logger.warning("Sample %s failed: %s", sid, exc)
+        out_path = args.output or (
+            args.hypergraphs_file.parent / f"{args.hypergraphs_file.stem}_{slugify_command(args.command)}.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, sort_keys=True)
+        print(f"Batch done: {n_ok} ok, {n_err} errors → {out_path}")
         return 0 if n_err == 0 else 1
 
     if not args.sample_id:
@@ -969,18 +898,15 @@ def main() -> int:
 
     input_hg = load_hypergraph(args.hypergraphs_file, args.sample_id)
     bounds = load_bounds(args.test_dir, args.sample_id)
-    json_path, png_path, summary_path = _run_one_cli(
-        args.sample_id,
-        input_hg,
-        bounds,
-        args.command,
-        args.increase_factor,
-        args.tag,
-        args.output_dir,
+    edited, summary = _apply_one(input_hg, bounds, args.command, args.increase_factor)
+    out_path = args.output or (
+        args.hypergraphs_file.parent / f"{args.sample_id}_{slugify_command(args.command)}.json"
     )
-    print(json_path)
-    print(png_path)
-    print(summary_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(edited, f, indent=2, sort_keys=True)
+    print(summary)
+    print(f"Saved to {out_path}")
     return 0
 
 
