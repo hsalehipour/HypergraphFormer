@@ -132,6 +132,7 @@ def _ged_worker_main() -> int:
     }
 
     bounds = gt["bounds"] if args.correct_accessgraph else None
+
     start = time.perf_counter()
     ged, graph_len = compute_ged_from_hypergraph(
         gt["accessgraph"],
