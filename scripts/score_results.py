@@ -132,13 +132,12 @@ def _ged_worker_main() -> int:
     }
 
     bounds = gt["bounds"] if args.correct_accessgraph else None
-    timeout_ms = int(args.timeout_seconds * 1000)
     start = time.perf_counter()
     ged, graph_len = compute_ged_from_hypergraph(
         gt["accessgraph"],
         copy.deepcopy(results[sample_id]) if args.correct_accessgraph else results[sample_id],
         sample_id,
-        timeout=timeout_ms,
+        timeout=int(args.timeout_seconds * 1000),
         correct_accessgraph=args.correct_accessgraph,
         bounds=bounds,
     )
