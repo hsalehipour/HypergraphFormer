@@ -336,3 +336,145 @@ def _draw_entry_door_at_segment(ax, apt_polygon_pts, door_segment, *,
                            t_inner_w=-t_w, t_outer_w=t_p,
                            t_inner_c=-1.20 * t_w, t_outer_c=t_p + 0.20 * t_w,
                            bg_zorder=bg_zorder, fg_zorder=fg_zorder, jamb_lw=jamb_lw)
+
+
+# ---------------------------------------------------------------------------
+# Hypergraph viz-data helpers (moved from Hypergraph class; not in dev)
+# ---------------------------------------------------------------------------
+
+def mesh_entry_door_face_idx(hg, mesh):
+    """Return the mesh face index of the entrance room (connected to 'outside').
+
+    Picks the largest leaf with ``outside`` in its ``connected`` list and
+    returns its corresponding face index in ``mesh.faceList``.  Returns
+    ``None`` if no such leaf or face exists.
+    """
+    leaves = hg.leaves
+    if not leaves:
+        return None
+    candidates = [
+        leaf for leaf in leaves
+        if any(str(c).strip().lower() == "outside" for c in (leaf.get("connected") or []))
+    ]
+    if not candidates:
+        return None
+    entry_name = max(candidates, key=lambda L: float(L.get("area", 0.0))).get("name", "")
+    if not entry_name:
+        return None
+    n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+    for i in range(n):
+        if (getattr(mesh.faceList[i], "unique_id", "") or "") == entry_name:
+            return i
+    return None
+
+
+def mesh_door_face_pairs(hg, mesh, *, access_graph=None, bounds=None) -> list:
+    """Return ``(face_idx_a, face_idx_b)`` pairs for each access-graph edge.
+
+    Used by :meth:`HypergraphPlotter.plot_mesh_on_axis` to draw door symbols
+    at the shared wall between adjacent rooms.
+    """
+    leaves = hg.leaves
+    if not leaves:
+        return []
+    leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
+    id_to_leaf_name = {v: k for k, v in leaf_name_to_id.items()}
+
+    n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+    leaf_to_face_idx: dict = {}
+    for i in range(n):
+        uid = getattr(mesh.faceList[i], "unique_id", "") or ""
+        if uid and uid not in leaf_to_face_idx:
+            leaf_to_face_idx[uid] = i
+
+    if access_graph is None:
+        if bounds is not None:
+            try:
+                access_graph = hg.correct_accessgraph(bounds=bounds)
+            except Exception:
+                access_graph = hg.access_graph or {}
+        else:
+            access_graph = hg.access_graph or {}
+    ag = access_graph or {}
+    pairs: list = []
+    seen: set = set()
+    for edge in ag.get("edges", []) or []:
+        if not edge or len(edge) < 2:
+            continue
+        u, v = edge[0], edge[1]
+        if str(u).strip().lower() == "outside" or str(v).strip().lower() == "outside":
+            continue
+        ln_u = id_to_leaf_name.get(str(u))
+        ln_v = id_to_leaf_name.get(str(v))
+        if not ln_u or not ln_v:
+            continue
+        i = leaf_to_face_idx.get(ln_u)
+        j = leaf_to_face_idx.get(ln_v)
+        if i is None or j is None or i == j:
+            continue
+        key = (min(i, j), max(i, j))
+        if key not in seen:
+            seen.add(key)
+            pairs.append((i, j))
+    return pairs
+
+
+def adjacency_graph_from_polygons(
+    room_polygons: list, *, scale_factor: float = 1.05,
+) -> dict:
+    """Build a mesh-adjacency graph from a ``room_polygons`` dataset list.
+
+    Each item must have ``id`` (1-based), ``mergeid``, and ``coords``
+    (format stored in dataset ``.txt`` files).  Uses the same adjacency rules
+    as :func:`adjacency_graph`.
+
+    Returns ``{"nodes": {id: mergeid, ...}, "edges": [[u, v], ...]}``.
+    """
+    from shapely.affinity import scale as _scale
+    from shapely.geometry import Polygon
+    from utils.hypergraph import _polygon_adjacency_pairs_by_id
+
+    polys: list = []
+    ids: list = []
+    nodes: dict = {}
+    for rp in room_polygons or []:
+        rid = rp.get("id")
+        if rid is None:
+            continue
+        rid_str = str(rid)
+        coords = rp.get("coords") or []
+        poly = Polygon(coords) if len(coords) >= 3 else Polygon()
+        if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+            try:
+                poly = _scale(poly, xfact=float(scale_factor), yfact=float(scale_factor),
+                              origin="centroid")
+            except Exception:
+                pass
+        polys.append(poly)
+        ids.append(rid_str)
+        nodes[rid_str] = str(rp.get("mergeid", "Unknown"))
+
+    pairs = _polygon_adjacency_pairs_by_id(polys, ids)
+    return {
+        "nodes": {k: nodes[k] for k in sorted(nodes, key=int)},
+        "edges": [[u, v] for (u, v) in sorted(pairs, key=lambda e: (int(e[0]), int(e[1])))],
+    }
+
+
+def adjacency_graph(hg, bounds: dict, *, scale_factor: float = 1.05) -> dict:
+    """Pure mesh-adjacency graph between BSP leaves (no edge filtering).
+
+    Returns every pair of leaves whose face polygons share a non-sliver wall,
+    without filtering by the predicted access graph or adding bridge edges.
+    Complement of :meth:`Hypergraph.correct_accessgraph`.
+
+    Returns ``{"nodes": {id: mergeid, ...}, "edges": [[u, v], ...]}``.
+    """
+    out = hg._compute_mesh_adjacency(bounds, scale_factor=scale_factor)
+    if out is None:
+        return {"nodes": {}, "edges": []}
+    mesh_adj, id_to_mergeid, node_ids = out
+    return {
+        "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
+        "edges": [[u, v] for (u, v) in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1])))],
+    }
