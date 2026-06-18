@@ -37,6 +37,10 @@ def load_example_hypergraphs(examples_dir, num_examples=3, exclude_file=None, se
               When None, uses the global random state.
     """
     examples_dir = Path(examples_dir)
+
+    if num_examples is not None and num_examples <= 0:
+        return []
+
     example_files = list(examples_dir.glob("*.txt"))
 
     if not example_files:

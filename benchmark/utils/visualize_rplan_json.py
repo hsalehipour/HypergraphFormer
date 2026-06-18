@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import os
 
-from scripts.viz import draw_graph, ID_COLOR
+from houseganpp.scripts.viz import draw_graph, ID_COLOR
 
 
 def make_sequence(edges):
@@ -198,7 +198,7 @@ Examples:
   python visualize_json_graph.py --json benchmark/houseganpp/rplan_json/1000.json --output_path ./output
 
   # Output will be:
-  #   ./output/graph_1000.jpg
+  #   ./output/graph_1000.png
   #   ./output/floor_1000.png
         """
     )
