@@ -151,94 +151,6 @@ def repair_bsp_tree_names(hypergraph: dict) -> dict:
     return hg
 
 
-# ---------------------------------------------------------------------------
-# Mesh / polygon adjacency primitives
-#
-# Shared by ``Hypergraph.correct_accessgraph`` (intersection of declared edges
-# with mesh adjacency) and ``Hypergraph.adjacency_graph`` /
-# ``adjacency_graph_from_polygons`` (full mesh-adjacency graph).
-#
-# Geometry rules (kept identical to the original
-# ``correct_accessgraph._polygons_adjacent`` so behaviour is unchanged):
-#   - point contact  -> not adjacent
-#   - shared edge    -> adjacent if length > 1e-4
-#   - shared overlap -> adjacent if area   > max(1e-4, 1e-3 * min(area))
-#   - mixed geometry collection -> any of the above qualifies
-# ---------------------------------------------------------------------------
-
-
-def _polygons_adjacent(a, b) -> bool:
-    """True if two Shapely polygons share a non-sliver wall."""
-    if a.is_empty or b.is_empty:
-        return False
-    try:
-        inter = a.intersection(b)
-    except Exception:
-        return False
-    if inter.is_empty:
-        return False
-    gt = inter.geom_type
-    if gt == "Point":
-        return False
-    min_area = max(1e-4, 1e-3 * min(a.area, b.area))
-    if gt in ("LineString", "LinearRing", "MultiLineString"):
-        return inter.length > 1e-4
-    if gt == "Polygon":
-        return inter.area > min_area
-    if gt == "GeometryCollection":
-        for g in inter.geoms:
-            if g.geom_type in ("LineString", "LinearRing", "MultiLineString") and g.length > 1e-4:
-                return True
-            if g.geom_type == "Polygon" and g.area > min_area:
-                return True
-    return False
-
-
-def _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor):
-    """Return (polys, face_node) parallel lists for each mesh face."""
-    from shapely.affinity import scale as _scale
-    from shapely.geometry import Polygon
-
-    n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    polys, face_node = [], []
-    for i in range(n):
-        face = mesh.faceList[i]
-        uid = getattr(face, "unique_id", "") or ""
-        face_node.append(leaf_name_to_id.get(uid))
-        pts = face.getPoints()
-        corners = [(float(pts[j].X), float(pts[j].Y))
-                   for j in range(int(getattr(pts, "Count", 0) or 0))]
-        poly = Polygon(corners) if len(corners) >= 3 else Polygon()
-        if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
-            poly = _scale(poly, xfact=float(scale_factor), yfact=float(scale_factor),
-                          origin="centroid")
-        polys.append(poly)
-    return polys, face_node
-
-
-def _polygon_adjacency_pairs_by_id(polys, ids) -> set[tuple[str, str]]:
-    """Return all adjacent (u, v) id-pairs, sorted by integer id."""
-    out: set[tuple[str, str]] = set()
-    for i, u in enumerate(ids):
-        if u is None or polys[i].is_empty:
-            continue
-        for j in range(i + 1, len(polys)):
-            v = ids[j]
-            if v is None or polys[j].is_empty or u == v:
-                continue
-            try:
-                if _polygons_adjacent(polys[i], polys[j]):
-                    out.add(tuple(sorted((str(u), str(v)), key=int)))
-            except Exception:
-                continue
-    return out
-
-
-def adjacency_graph_from_polygons(room_polygons, *, scale_factor=1.05):  # re-export for backward compat
-    from utils.visualization_helpers import adjacency_graph_from_polygons as _impl
-    return _impl(room_polygons, scale_factor=scale_factor)
-
-
 class Hypergraph:
     """A BSP-tree hypergraph representing a spatial floor plan subdivision.
 
@@ -827,91 +739,189 @@ class Hypergraph:
                 distinct.get(ag_id, getattr(face, 'merge_id', 'unknown')))
         return labels
 
-    def mesh_entry_door_face_idx(self, mesh):
-        """See :func:`utils.visualization_helpers.mesh_entry_door_face_idx`."""
-        from utils.visualization_helpers import mesh_entry_door_face_idx as _impl
-        return _impl(self, mesh)
+    def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
+        """Correct the leaf access graph using **mesh adjacency between access node ids**.
 
-    def mesh_door_face_pairs(self, mesh, *, access_graph=None, bounds=None) -> list:
-        """See :func:`utils.visualization_helpers.mesh_door_face_pairs`."""
-        from utils.visualization_helpers import mesh_door_face_pairs as _impl
-        return _impl(self, mesh, access_graph=access_graph, bounds=bounds)
+        Pipeline (all geometric reasoning uses ids, not room types):
 
-    def _compute_mesh_adjacency(self, bounds, *, scale_factor=1.05):
-        """Return (mesh_adj, id_to_mergeid, node_ids) or None if no leaves."""
+        1. Start from :attr:`access_graph` edges as pairs of node ids ``\"1\"``…``\"N\"``.
+        2. Build mesh adjacency: each face’s ``unique_id`` is the BSP leaf ``name``; map that to
+           the same access id as :attr:`access_graph`. Two ids are mesh-adjacent if some pair of
+           their faces has a shared wall / non-sliver contact (see below).
+        3. Drop predicted edges that are not mesh-adjacent; add mesh edges (sorted by id) until the
+           graph is connected when possible.
+        4. **Only then** fill ``nodes`` with each id’s ``mergeid`` (room type) from the hypergraph
+           leaves — edges stay id–id pairs.
+
+        Args:
+            bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
+            scale_factor: Uniform scale of face polygons about the centroid before adjacency tests.
+                Default ``1.05`` matches the prior heuristic (bridges small mesh gaps); use ``1.0`` for
+                no inflation (stricter contact).
+        """
+        from shapely.affinity import scale as _scale
+        from shapely.geometry import Polygon
+
+        def _geoms_from_collection(geom) -> list:
+            if geom.geom_type == "GeometryCollection":
+                return list(geom.geoms)
+            return [geom]
+
+        def _polygons_adjacent(a: Polygon, b: Polygon) -> bool:
+            if a.is_empty or b.is_empty:
+                return False
+            try:
+                inter = a.intersection(b)
+            except Exception:
+                return False
+            if inter.is_empty:
+                return False
+            if inter.geom_type == "Point":
+                return False
+            if inter.geom_type in ("LineString", "LinearRing"):
+                return inter.length > 1e-4
+            if inter.geom_type == "MultiLineString":
+                return inter.length > 1e-4
+            if inter.geom_type == "Polygon":
+                return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
+            if inter.geom_type == "GeometryCollection":
+                for g in _geoms_from_collection(inter):
+                    if g.geom_type == "Point":
+                        continue
+                    if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "MultiLineString" and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "Polygon" and g.area > max(
+                        1e-4, 1e-3 * min(a.area, b.area)
+                    ):
+                        return True
+            return False
+
         leaves = self.leaves
         if not leaves:
-            return None
+            return {"nodes": {}, "edges": []}
+
         leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
         node_ids = set(leaf_name_to_id.values())
-        id_to_mergeid = {str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))}
+
+        ag = self.access_graph or {}
+        if not isinstance(ag, dict):
+            ag = {}
+
+        raw_edges: list[list[str]] = []
+        for e in (ag.get("edges") or []):
+            if not isinstance(e, (list, tuple)) or len(e) != 2:
+                continue
+            u, v = str(e[0]), str(e[1])
+            if u not in node_ids or v not in node_ids or u == v:
+                continue
+            raw_edges.append([u, v])
+
+        def _edge_pair(u: str, v: str) -> tuple[str, str]:
+            return tuple(sorted((str(u), str(v)), key=int))
+
         mesh = self.to_mesh(bounds=bounds)
         n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
         if n_faces <= 0:
-            return set(), id_to_mergeid, node_ids
-        polys, face_node = _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor)
-        return _polygon_adjacency_pairs_by_id(polys, face_node), id_to_mergeid, node_ids
-
-    def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
-        """Return corrected access graph using mesh adjacency.
-
-        Keeps predicted edges that are mesh-adjacent; adds mesh edges as bridges
-        until the graph is connected.  Reasoning is on node ids, not room types.
-        """
-        out = self._compute_mesh_adjacency(bounds, scale_factor=scale_factor)
-        if out is None:
-            return {"nodes": {}, "edges": []}
-        mesh_adj, id_to_mergeid, node_ids = out
-
-        ag = self.access_graph if isinstance(self.access_graph, dict) else {}
-
-        def _ep(u, v):
-            return tuple(sorted((str(u), str(v)), key=int))
-
-        raw = [(str(e[0]), str(e[1])) for e in (ag.get("edges") or [])
-               if isinstance(e, (list, tuple)) and len(e) == 2
-               and str(e[0]) in node_ids and str(e[1]) in node_ids and str(e[0]) != str(e[1])]
-
-        if not mesh_adj:
+            id_to_mergeid = {
+                str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+            }
             return {
                 "nodes": {k: id_to_mergeid[k] for k in node_ids if k in id_to_mergeid},
-                "edges": [[p[0], p[1]] for p in sorted({_ep(u, v) for u, v in raw})],
+                "edges": [
+                    [p[0], p[1]]
+                    for p in sorted({_edge_pair(u, v) for u, v in raw_edges})
+                ],
             }
+
+        polys: list[Polygon] = []
+        face_node: list[str | None] = []
+        for i in range(n_faces):
+            face = mesh.faceList[i]
+            uid = getattr(face, "unique_id", "") or ""
+            face_node.append(leaf_name_to_id.get(uid))
+            pts = face.getPoints()
+            corners = [
+                (float(pts[j].X), float(pts[j].Y))
+                for j in range(int(getattr(pts, "Count", 0) or 0))
+            ]
+            poly = Polygon(corners) if len(corners) >= 3 else Polygon()
+            if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+                poly = _scale(
+                    poly,
+                    xfact=float(scale_factor),
+                    yfact=float(scale_factor),
+                    origin="centroid",
+                )
+            polys.append(poly)
+
+        mesh_adj: set[tuple[str, str]] = set()
+        for i in range(n_faces):
+            u = face_node[i]
+            if u is None or polys[i].is_empty:
+                continue
+            for j in range(i + 1, n_faces):
+                v = face_node[j]
+                if v is None or polys[j].is_empty or u == v:
+                    continue
+                try:
+                    if _polygons_adjacent(polys[i], polys[j]):
+                        mesh_adj.add(_edge_pair(u, v))
+                except Exception:
+                    continue
+
+        kept: list[tuple[str, str]] = []
+        seen_kept: set[tuple[str, str]] = set()
+        for u, v in raw_edges:
+            ep = _edge_pair(u, v)
+            if ep in mesh_adj and ep not in seen_kept:
+                seen_kept.add(ep)
+                kept.append(ep)
 
         parent = {n: n for n in node_ids}
 
-        def _find(x):
+        def _find(x: str) -> str:
             while parent[x] != x:
-                parent[x] = parent[parent[x]]; x = parent[x]
+                parent[x] = parent[parent[x]]
+                x = parent[x]
             return x
 
-        def _union(x, y):
+        def _union(x: str, y: str) -> bool:
             px, py = _find(x), _find(y)
-            if px == py: return False
-            parent[px] = py; return True
+            if px == py:
+                return False
+            parent[px] = py
+            return True
 
-        seen: set = set()
-        final = []
-        for u, v in raw:
-            ep = _ep(u, v)
-            if ep in mesh_adj and ep not in seen:
-                seen.add(ep); final.append(ep); _union(u, v)
+        final_pairs: list[tuple[str, str]] = list(kept)
+        for u, v in kept:
+            _union(u, v)
 
         for u, v in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1]))):
-            if u in node_ids and v in node_ids and _union(u, v):
-                final.append(_ep(u, v))
+            if u not in node_ids or v not in node_ids:
+                continue
+            if _union(u, v):
+                final_pairs.append((u, v))
 
-        out_seen: set = set()
-        out_edges = []
-        for ep in final:
-            if ep not in out_seen:
-                out_seen.add(ep); out_edges.append([ep[0], ep[1]])
+        out_edges: list[list[str]] = []
+        seen_out: set[tuple[str, str]] = set()
+        for u, v in final_pairs:
+            ep = _edge_pair(u, v)
+            if ep not in seen_out:
+                seen_out.add(ep)
+                out_edges.append([ep[0], ep[1]])
+
         out_edges.sort(key=lambda e: (int(e[0]), int(e[1])))
 
+        id_to_mergeid = {
+            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+        }
         return {
             "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
             "edges": out_edges,
         }
+
     def to_apartment(self, polygon, apt_id="generated",
                      RGL=None, Collections=None, verbose=False):
         """Convert this hypergraph + polygon boundary to an RGL Apartment.
@@ -1157,7 +1167,7 @@ class HypergraphPlotter:
         'Stairs': '#72246c',
         'Storeroom': '#5254a3',
         'Bathroom': '#6b6ecf',
-        'Balcony': '#BEBEBE',
+        'Balcony': '#2ca02c',
         # Lowercase (Hypergraph Dataset format)
         'bed': '#5B448C',
         'living': '#ED6D87',
@@ -1168,7 +1178,7 @@ class HypergraphPlotter:
         'dining': '#fdae6b',
         'corridor': '#fdd0a2',
         'bathroom': '#FFE953',
-        'balcony': '#BEBEBE',
+        'balcony': '#2ca02c',
         'storage': '#5254a3',
         'storeroom': '#5254a3',
         'stairs': '#72246c',
@@ -1178,20 +1188,6 @@ class HypergraphPlotter:
     ROOM_COLOR_MAP = ROOM_COLORS  # legacy alias
 
     MESH_SLIVER_FRAC = 1e-3  # faces < 0.1 % of total mesh area are Clipper noise
-
-    # Pairs of room types that should render as a single open zone -- no wall
-    # corridor and no door between them, just a thin black delineation line
-    # along their shared edge. Pairs are direction-independent.  Each room in
-    # the zone keeps its own colored fill and label; only the wall corridor
-    # between them is suppressed.  Same-type entries (e.g. ``frozenset({'foyer'})``)
-    # cover same-type adjacencies like foyer-foyer or living-living.
-    OPEN_ZONE_TYPE_PAIRS = frozenset({
-        frozenset({'foyer', 'kitchen'}),
-        frozenset({'foyer', 'living'}),
-        frozenset({'living', 'kitchen'}),
-        frozenset({'living'}),
-        frozenset({'foyer'}),
-    })
 
     def __init__(self, color_map=None):
         self.color_map = color_map if color_map is not None else self.ROOM_COLORS
@@ -1470,7 +1466,7 @@ class HypergraphPlotter:
         if node_labels is not None:
             nx.draw_networkx_labels(
                 g, pos, labels=node_labels,
-                font_size=14, font_weight="bold", ax=ax)
+                font_size=7, font_weight="bold", ax=ax)
 
         if title:
             ax.set_title(title, fontsize=12, fontweight="bold")
@@ -1578,7 +1574,7 @@ class HypergraphPlotter:
                             edgecolor='black', linewidth=1.5, label=legend_label)
                     cx, cy = np.mean(rx), np.mean(ry)
                     ax.text(cx, cy, f'{room_type}\n{area_val:.1f}m²',
-                            ha='center', va='center', fontsize=18, fontweight='bold',
+                            ha='center', va='center', fontsize=9, fontweight='bold',
                             bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
 
         if hasattr(apartment, 'facade') and apartment.facade:
@@ -1659,7 +1655,7 @@ class HypergraphPlotter:
                     ax.fill(rx, ry, color=color, alpha=0.8,
                             edgecolor='black', linewidth=1)
                     ax.text(np.mean(rx), np.mean(ry), room_type,
-                            ha='center', va='center', fontsize=16, fontweight='bold')
+                            ha='center', va='center', fontsize=8, fontweight='bold')
 
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
@@ -1712,24 +1708,56 @@ class HypergraphPlotter:
         return fig, ax
 
     def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
-                          title="Floor Plan", face_labels=None,
-                          show_title=True, show_area=True, show_frame=True,
-                          wall_inset=None, door_pairs=None,
-                          entry_door_face_idx=None,
-                          entry_door_segment=None):
-        """See :func:`utils.visualization_helpers.plot_mesh_on_axis`."""
-        from utils.visualization_helpers import plot_mesh_on_axis as _impl
-        return _impl(
-            self, mesh, ax,
-            boundary_polygon=boundary_polygon,
-            title=title,
-            face_labels=face_labels,
-            show_title=show_title,
-            show_area=show_area,
-            show_frame=show_frame,
-            wall_inset=wall_inset,
-            door_pairs=door_pairs,
-            entry_door_face_idx=entry_door_face_idx,
-            entry_door_segment=entry_door_segment,
-        )
+                          title="Floor Plan", face_labels=None):
+        """Plot a generated mesh on a specific *ax* (for subplots).
 
+        Same visual style as :meth:`simple_plot_generated_mesh` and
+        :meth:`plot_complex_apartment_on_axis` but renders onto an
+        existing Matplotlib axis.
+
+        Args:
+            mesh: RGL NMesh with room faces.
+            ax: Matplotlib axis to draw on.
+            boundary_polygon: Optional list of (x, y) tuples for the
+                apartment boundary outline.
+            title: Optional axis title.
+            face_labels: Optional list of label strings, one per face
+                (indexed same as ``mesh.faceList``).  When provided,
+                these labels are drawn instead of the raw room type.
+        """
+        import numpy as np
+        from shapely.geometry import Polygon
+
+        if boundary_polygon:
+            bx = [p[0] for p in boundary_polygon] + [boundary_polygon[0][0]]
+            by = [p[1] for p in boundary_polygon] + [boundary_polygon[0][1]]
+            ax.plot(bx, by, 'k-', linewidth=2)
+
+        min_area = self._mesh_min_area(mesh.faceList)
+        total_area = 0
+        for i in range(mesh.faceList.Count):
+            face = mesh.faceList[i]
+            room_type = getattr(face, 'merge_id', 'unknown')
+            area_val = getattr(face, 'Area', 0)
+            if area_val < min_area:
+                continue
+            total_area += area_val
+            points = face.getPoints()
+            corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
+            if len(corners) < 3:
+                continue
+            poly = Polygon(corners)
+            x, y = poly.exterior.xy
+            color = self.color_map.get(room_type, '#D3D3D3')
+            ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
+            label = (face_labels[i]
+                     if face_labels is not None and i < len(face_labels)
+                     else room_type)
+            ax.text(np.mean(list(x)), np.mean(list(y)), label,
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+
+        ax.set_aspect('equal')
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.text(0.02, 0.98, f"Area: {total_area:.1f}m\u00b2",
+                transform=ax.transAxes, verticalalignment='top', fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow'))

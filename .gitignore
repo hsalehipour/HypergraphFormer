@@ -56,3 +56,5 @@ checkpoints/
 !dataset/wmr24/wmr24.json
 *.code-workspace
 _debug/
+utils/visualization_helpers.py
+scripts/viz_rplan_qwen_meshes_and_adjacency_comparison.py
