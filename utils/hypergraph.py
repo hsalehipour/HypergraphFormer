@@ -168,7 +168,7 @@ def repair_bsp_tree_names(hypergraph: dict) -> dict:
 
 
 def _polygons_adjacent(a, b) -> bool:
-    """Are two shapely polygons adjacent (share a non-sliver wall)?"""
+    """True if two Shapely polygons share a non-sliver wall."""
     if a.is_empty or b.is_empty:
         return False
     try:
@@ -180,76 +180,49 @@ def _polygons_adjacent(a, b) -> bool:
     gt = inter.geom_type
     if gt == "Point":
         return False
-    if gt in ("LineString", "LinearRing"):
-        return inter.length > 1e-4
-    if gt == "MultiLineString":
+    min_area = max(1e-4, 1e-3 * min(a.area, b.area))
+    if gt in ("LineString", "LinearRing", "MultiLineString"):
         return inter.length > 1e-4
     if gt == "Polygon":
-        return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
+        return inter.area > min_area
     if gt == "GeometryCollection":
         for g in inter.geoms:
-            if g.geom_type == "Point":
-                continue
-            if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
+            if g.geom_type in ("LineString", "LinearRing", "MultiLineString") and g.length > 1e-4:
                 return True
-            if g.geom_type == "MultiLineString" and g.length > 1e-4:
-                return True
-            if g.geom_type == "Polygon" and g.area > max(
-                1e-4, 1e-3 * min(a.area, b.area)
-            ):
+            if g.geom_type == "Polygon" and g.area > min_area:
                 return True
     return False
 
 
 def _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor):
-    """Materialize each face polygon and the access id it belongs to.
-
-    Returns ``(polys, face_node)`` parallel lists; ``face_node[i]`` is the
-    leaf access id (e.g. ``\"3\"``) or ``None`` if the face's ``unique_id``
-    does not map to any leaf.
-    """
+    """Return (polys, face_node) parallel lists for each mesh face."""
     from shapely.affinity import scale as _scale
     from shapely.geometry import Polygon
 
-    n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-    polys: list = []
-    face_node: list = []
-    for i in range(n_faces):
+    n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+    polys, face_node = [], []
+    for i in range(n):
         face = mesh.faceList[i]
         uid = getattr(face, "unique_id", "") or ""
         face_node.append(leaf_name_to_id.get(uid))
         pts = face.getPoints()
-        corners = [
-            (float(pts[j].X), float(pts[j].Y))
-            for j in range(int(getattr(pts, "Count", 0) or 0))
-        ]
+        corners = [(float(pts[j].X), float(pts[j].Y))
+                   for j in range(int(getattr(pts, "Count", 0) or 0))]
         poly = Polygon(corners) if len(corners) >= 3 else Polygon()
         if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
-            poly = _scale(
-                poly,
-                xfact=float(scale_factor),
-                yfact=float(scale_factor),
-                origin="centroid",
-            )
+            poly = _scale(poly, xfact=float(scale_factor), yfact=float(scale_factor),
+                          origin="centroid")
         polys.append(poly)
     return polys, face_node
 
 
 def _polygon_adjacency_pairs_by_id(polys, ids) -> set[tuple[str, str]]:
-    """All adjacency pairs ``(u, v)`` between polygons, sorted by integer id.
-
-    ``polys[i]`` is paired with id ``ids[i]``; ``None`` ids and empty
-    polygons are skipped. Useful both for hypergraph meshes (one face per
-    leaf) and for ``room_polygons`` lists where ``ids[i]`` is the polygon's
-    integer id.
-    """
+    """Return all adjacent (u, v) id-pairs, sorted by integer id."""
     out: set[tuple[str, str]] = set()
-    n = len(polys)
-    for i in range(n):
-        u = ids[i]
+    for i, u in enumerate(ids):
         if u is None or polys[i].is_empty:
             continue
-        for j in range(i + 1, n):
+        for j in range(i + 1, len(polys)):
             v = ids[j]
             if v is None or polys[j].is_empty or u == v:
                 continue
@@ -864,137 +837,81 @@ class Hypergraph:
         from utils.visualization_helpers import mesh_door_face_pairs as _impl
         return _impl(self, mesh, access_graph=access_graph, bounds=bounds)
 
-    def _compute_mesh_adjacency(
-        self, bounds: dict, *, scale_factor: float = 1.05,
-    ) -> tuple[set[tuple[str, str]], dict[str, str], set[str]] | None:
-        """Build the full mesh-adjacency edge set between BSP leaves.
-
-        Returns ``(mesh_adj, id_to_mergeid, node_ids)`` where every
-        ``mesh_adj`` pair ``(u, v)`` is sorted by integer id. Returns
-        ``None`` if there are no leaves or the mesh is empty.
-
-        Used by both :meth:`correct_accessgraph` (filtered) and
-        :meth:`adjacency_graph` (unfiltered).
-        """
+    def _compute_mesh_adjacency(self, bounds, *, scale_factor=1.05):
+        """Return (mesh_adj, id_to_mergeid, node_ids) or None if no leaves."""
         leaves = self.leaves
         if not leaves:
             return None
-
         leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
         node_ids = set(leaf_name_to_id.values())
-        id_to_mergeid = {
-            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
-        }
-
+        id_to_mergeid = {str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))}
         mesh = self.to_mesh(bounds=bounds)
         n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
         if n_faces <= 0:
             return set(), id_to_mergeid, node_ids
-
         polys, face_node = _build_mesh_polygons(mesh, leaf_name_to_id, scale_factor)
-        mesh_adj = _polygon_adjacency_pairs_by_id(polys, face_node)
-        return mesh_adj, id_to_mergeid, node_ids
+        return _polygon_adjacency_pairs_by_id(polys, face_node), id_to_mergeid, node_ids
 
     def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
-        """Correct the leaf access graph using **mesh adjacency between access node ids**.
+        """Return corrected access graph using mesh adjacency.
 
-        Pipeline (all geometric reasoning uses ids, not room types):
-
-        1. Start from :attr:`access_graph` edges as pairs of node ids ``\"1\"``…``\"N\"``.
-        2. Build mesh adjacency: each face’s ``unique_id`` is the BSP leaf ``name``; map that to
-           the same access id as :attr:`access_graph`. Two ids are mesh-adjacent if some pair of
-           their faces has a shared wall / non-sliver contact (see below).
-        3. Drop predicted edges that are not mesh-adjacent; add mesh edges (sorted by id) until the
-           graph is connected when possible.
-        4. **Only then** fill ``nodes`` with each id’s ``mergeid`` (room type) from the hypergraph
-           leaves — edges stay id–id pairs.
-
-        Args:
-            bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
-            scale_factor: Uniform scale of face polygons about the centroid before adjacency tests.
-                Default ``1.05`` matches the prior heuristic (bridges small mesh gaps); use ``1.0`` for
-                no inflation (stricter contact).
+        Keeps predicted edges that are mesh-adjacent; adds mesh edges as bridges
+        until the graph is connected.  Reasoning is on node ids, not room types.
         """
         out = self._compute_mesh_adjacency(bounds, scale_factor=scale_factor)
         if out is None:
             return {"nodes": {}, "edges": []}
         mesh_adj, id_to_mergeid, node_ids = out
 
-        ag = self.access_graph or {}
-        if not isinstance(ag, dict):
-            ag = {}
+        ag = self.access_graph if isinstance(self.access_graph, dict) else {}
 
-        def _edge_pair(u: str, v: str) -> tuple[str, str]:
+        def _ep(u, v):
             return tuple(sorted((str(u), str(v)), key=int))
 
-        raw_edges: list[list[str]] = []
-        for e in (ag.get("edges") or []):
-            if not isinstance(e, (list, tuple)) or len(e) != 2:
-                continue
-            u, v = str(e[0]), str(e[1])
-            if u not in node_ids or v not in node_ids or u == v:
-                continue
-            raw_edges.append([u, v])
+        raw = [(str(e[0]), str(e[1])) for e in (ag.get("edges") or [])
+               if isinstance(e, (list, tuple)) and len(e) == 2
+               and str(e[0]) in node_ids and str(e[1]) in node_ids and str(e[0]) != str(e[1])]
 
         if not mesh_adj:
-            # Mesh produced no adjacency information -- preserve the cleaned
-            # raw edges (matches prior behaviour when n_faces <= 0).
             return {
                 "nodes": {k: id_to_mergeid[k] for k in node_ids if k in id_to_mergeid},
-                "edges": [
-                    [p[0], p[1]]
-                    for p in sorted({_edge_pair(u, v) for u, v in raw_edges})
-                ],
+                "edges": [[p[0], p[1]] for p in sorted({_ep(u, v) for u, v in raw})],
             }
-
-        kept: list[tuple[str, str]] = []
-        seen_kept: set[tuple[str, str]] = set()
-        for u, v in raw_edges:
-            ep = _edge_pair(u, v)
-            if ep in mesh_adj and ep not in seen_kept:
-                seen_kept.add(ep)
-                kept.append(ep)
 
         parent = {n: n for n in node_ids}
 
-        def _find(x: str) -> str:
+        def _find(x):
             while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
+                parent[x] = parent[parent[x]]; x = parent[x]
             return x
 
-        def _union(x: str, y: str) -> bool:
+        def _union(x, y):
             px, py = _find(x), _find(y)
-            if px == py:
-                return False
-            parent[px] = py
-            return True
+            if px == py: return False
+            parent[px] = py; return True
 
-        final_pairs: list[tuple[str, str]] = list(kept)
-        for u, v in kept:
-            _union(u, v)
+        seen: set = set()
+        final = []
+        for u, v in raw:
+            ep = _ep(u, v)
+            if ep in mesh_adj and ep not in seen:
+                seen.add(ep); final.append(ep); _union(u, v)
 
         for u, v in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1]))):
-            if u not in node_ids or v not in node_ids:
-                continue
-            if _union(u, v):
-                final_pairs.append((u, v))
+            if u in node_ids and v in node_ids and _union(u, v):
+                final.append(_ep(u, v))
 
-        out_edges: list[list[str]] = []
-        seen_out: set[tuple[str, str]] = set()
-        for u, v in final_pairs:
-            ep = _edge_pair(u, v)
-            if ep not in seen_out:
-                seen_out.add(ep)
-                out_edges.append([ep[0], ep[1]])
-
+        out_seen: set = set()
+        out_edges = []
+        for ep in final:
+            if ep not in out_seen:
+                out_seen.add(ep); out_edges.append([ep[0], ep[1]])
         out_edges.sort(key=lambda e: (int(e[0]), int(e[1])))
 
         return {
             "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
             "edges": out_edges,
         }
-
     def to_apartment(self, polygon, apt_id="generated",
                      RGL=None, Collections=None, verbose=False):
         """Convert this hypergraph + polygon boundary to an RGL Apartment.
@@ -1800,419 +1717,19 @@ class HypergraphPlotter:
                           wall_inset=None, door_pairs=None,
                           entry_door_face_idx=None,
                           entry_door_segment=None):
-        """Plot a generated mesh on a specific *ax* (for subplots).
-
-        Renders rooms as colored polygons surrounded by a white wall strip with
-        a black contour, matching a floor-plan blueprint look.  Doors can be
-        drawn at the boundary shared by two rooms by passing *door_pairs*.
-
-        Args:
-            mesh: RGL NMesh with room faces.
-            ax: Matplotlib axis to draw on.
-            boundary_polygon: Optional list of (x, y) tuples for the
-                apartment boundary outline.
-            title: Optional axis title.
-            face_labels: Optional list of label strings, one per face
-                (indexed same as ``mesh.faceList``).  When provided,
-                these labels are drawn instead of the raw room type.
-            show_title: Draw ``title`` above the axis.
-            show_area: Draw the ``Area: ...m²`` overlay box.
-            show_frame: Keep axis spines/ticks; ``False`` calls ``ax.axis('off')``.
-            wall_inset: Inward shrink distance applied to each room polygon to
-                create the white wall strip around it.  Total interior partition
-                wall thickness is ``2 * wall_inset``.  ``None`` (default)
-                auto-scales from the apartment extent (~0.6% of the larger
-                bounding-box dimension).  Set to ``0`` to disable wall
-                thickness (legacy single-line look).
-            door_pairs: Optional iterable of ``(face_idx_a, face_idx_b)`` index
-                pairs (typically from :meth:`Hypergraph.mesh_door_face_pairs`).
-                A door opening is drawn through the wall shared by each pair.
-            entry_door_face_idx: Optional integer face index (typically from
-                :meth:`Hypergraph.mesh_entry_door_face_idx`) marking the room
-                connected to ``"outside"``.  An entry-door symbol is punched
-                through the apartment outer wall on that face's exterior edge.
-            entry_door_segment: Optional explicit ``[(x0, y0), (x1, y1)]``
-                apartment-boundary segment for the entry door.  When provided,
-                this is used instead of ``entry_door_face_idx``.
-        """
-        import math
-
-        import numpy as np
-        from shapely.geometry import Polygon
-        from utils.visualization_helpers import (  # noqa: PLC0415
-            _draw_door_between, _draw_entry_door, _draw_entry_door_at_segment,
-            _plot_geom_lines, _shared_wall_line, _shrink_polygon,
+        """See :func:`utils.visualization_helpers.plot_mesh_on_axis`."""
+        from utils.visualization_helpers import plot_mesh_on_axis as _impl
+        return _impl(
+            self, mesh, ax,
+            boundary_polygon=boundary_polygon,
+            title=title,
+            face_labels=face_labels,
+            show_title=show_title,
+            show_area=show_area,
+            show_frame=show_frame,
+            wall_inset=wall_inset,
+            door_pairs=door_pairs,
+            entry_door_face_idx=entry_door_face_idx,
+            entry_door_segment=entry_door_segment,
         )
 
-        min_area = self._mesh_min_area(mesh.faceList)
-
-        polys: list = []
-        total_area = 0.0
-        for i in range(mesh.faceList.Count):
-            face = mesh.faceList[i]
-            area_val = getattr(face, 'Area', 0)
-            if area_val < min_area:
-                polys.append(None)
-                continue
-            points = face.getPoints()
-            corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
-            if len(corners) < 3:
-                polys.append(None)
-                continue
-            polys.append(Polygon(corners))
-            total_area += float(area_val)
-
-        kept = [p for p in polys if p is not None]
-
-        if wall_inset is None:
-            if kept:
-                xs_all: list = []
-                ys_all: list = []
-                for p in kept:
-                    minx, miny, maxx, maxy = p.bounds
-                    xs_all.extend([minx, maxx])
-                    ys_all.extend([miny, maxy])
-                if boundary_polygon:
-                    xs_all.extend(p[0] for p in boundary_polygon)
-                    ys_all.extend(p[1] for p in boundary_polygon)
-                extent = max(
-                    (max(xs_all) - min(xs_all)) if xs_all else 0.0,
-                    (max(ys_all) - min(ys_all)) if ys_all else 0.0,
-                    0.0,
-                )
-                wall_inset = 0.009 * extent
-            else:
-                wall_inset = 0.0
-
-        use_walls = bool(wall_inset and wall_inset > 0)
-
-        shrunk: list = []
-        for p in polys:
-            if p is None:
-                shrunk.append(None)
-            elif use_walls:
-                shrunk.append(_shrink_polygon(p, wall_inset))
-            else:
-                shrunk.append(p)
-
-        if use_walls:
-            ax.set_facecolor('white')
-
-        # === Open-zone merge groups (e.g. foyer + kitchen + living) ===
-        # Faces whose types form an OPEN_ZONE_TYPE_PAIRS pair AND that share a
-        # real wall are merged into a single rendered "zone": one outer
-        # contour, no interior wall corridor, no doors between them.
-        face_types: list = [
-            None if polys[i] is None
-            else getattr(mesh.faceList[i], 'merge_id', None)
-            for i in range(mesh.faceList.Count)
-        ]
-        n_faces = len(polys)
-        uf_parent = list(range(n_faces))
-
-        def _uf_find(x: int) -> int:
-            while uf_parent[x] != x:
-                uf_parent[x] = uf_parent[uf_parent[x]]
-                x = uf_parent[x]
-            return x
-
-        def _uf_union(x: int, y: int) -> None:
-            rx, ry = _uf_find(x), _uf_find(y)
-            if rx != ry:
-                uf_parent[rx] = ry
-
-        if use_walls:
-            for i in range(n_faces):
-                if polys[i] is None or face_types[i] is None:
-                    continue
-                for j in range(i + 1, n_faces):
-                    if polys[j] is None or face_types[j] is None:
-                        continue
-                    if (frozenset({face_types[i], face_types[j]})
-                            not in self.OPEN_ZONE_TYPE_PAIRS):
-                        continue
-                    line = _shared_wall_line(
-                        polys[i], polys[j], inset=float(wall_inset),
-                    )
-                    if line is None:
-                        continue
-                    if float(line.length) < max(
-                            2.0 * float(wall_inset), 1e-6):
-                        continue
-                    _uf_union(i, j)
-
-        zone_members: dict = {}
-        for i in range(n_faces):
-            if polys[i] is None:
-                continue
-            zone_members.setdefault(_uf_find(i), []).append(i)
-
-        zone_shrunk: dict = {}  # root -> shrunk merged polygon
-        if use_walls:
-            from shapely.ops import unary_union
-            for root, members in zone_members.items():
-                if len(members) <= 1:
-                    zone_shrunk[root] = (
-                        shrunk[members[0]] if members
-                        and shrunk[members[0]] is not None
-                        else (polys[members[0]] if members else None)
-                    )
-                    continue
-                # Bridge sub-pixel floating-point gaps between adjacent
-                # member polygons (which can otherwise leave ``unary_union``
-                # returning a MultiPolygon) by inflating before union and
-                # then trimming back. Without this, kitchen/living polygons
-                # whose shared-edge x-coordinates differ by ~1e-9 would
-                # never actually merge into a single zone polygon.
-                eps = max(1e-3 * float(wall_inset), 1e-6)
-                try:
-                    buffered = [
-                        polys[k].buffer(eps, join_style=2, mitre_limit=4.0)
-                        for k in members
-                    ]
-                    union_poly = unary_union(buffered)
-                    if not union_poly.is_empty:
-                        union_poly = union_poly.buffer(
-                            -eps, join_style=2, mitre_limit=4.0,
-                        )
-                except Exception:
-                    union_poly = None
-                if union_poly is None or union_poly.is_empty:
-                    zone_shrunk[root] = None
-                    continue
-                if union_poly.geom_type == 'MultiPolygon':
-                    union_poly = max(union_poly.geoms, key=lambda g: g.area)
-                zone_shrunk[root] = _shrink_polygon(
-                    union_poly, wall_inset,
-                )
-
-        outer_pad = 1.5 * float(wall_inset) if use_walls else 0.0
-        outer_pts = list(boundary_polygon) if boundary_polygon else None
-        if boundary_polygon and outer_pad > 0:
-            try:
-                bp = Polygon(boundary_polygon)
-                if not bp.is_valid:
-                    bp = bp.buffer(0)
-                bp_expanded = bp.buffer(
-                    outer_pad, join_style=2, mitre_limit=4.0,
-                )
-                if (not bp_expanded.is_empty
-                        and bp_expanded.geom_type == 'Polygon'):
-                    outer_pts = list(bp_expanded.exterior.coords)
-            except Exception:
-                outer_pts = list(boundary_polygon)
-
-        # When walls are off, draw the apartment perimeter at the bottom of
-        # the stack so it sits behind the room fills (legacy look). When
-        # walls are on, the perimeter contour is drawn later (after door
-        # cuts are computed) so it can be cleanly broken at the entry door.
-        if outer_pts and not use_walls:
-            bx = [p[0] for p in outer_pts] + [outer_pts[0][0]]
-            by = [p[1] for p in outer_pts] + [outer_pts[0][1]]
-            ax.plot(bx, by, 'k-', linewidth=2, zorder=1.5)
-
-        for i in range(mesh.faceList.Count):
-            if polys[i] is None:
-                continue
-            face = mesh.faceList[i]
-            room_type = getattr(face, 'merge_id', 'unknown')
-            color = self.color_map.get(room_type, '#D3D3D3')
-
-            # If this face is part of a multi-face open zone, clip its
-            # full unshrunk polygon to the zone's shrunk envelope -- so its
-            # color tiles right up to the original wall centerline shared
-            # with its zone partners (no white corridor between them).
-            fill_geom = None
-            if use_walls:
-                root_i = _uf_find(i)
-                if (root_i in zone_members
-                        and len(zone_members[root_i]) > 1):
-                    zs = zone_shrunk.get(root_i)
-                    if zs is not None and not zs.is_empty:
-                        try:
-                            fill_geom = polys[i].intersection(zs)
-                        except Exception:
-                            fill_geom = None
-            if fill_geom is None or fill_geom.is_empty:
-                fill_geom = shrunk[i] if shrunk[i] is not None else polys[i]
-
-            # Plot the fill geometry: fill_geom may be a Polygon or
-            # MultiPolygon; render each polygon component once.
-            geoms_to_fill = (
-                fill_geom.geoms
-                if getattr(fill_geom, 'geom_type', None) == 'MultiPolygon'
-                else [fill_geom]
-            )
-            for g in geoms_to_fill:
-                try:
-                    xs_g, ys_g = g.exterior.xy
-                except Exception:
-                    continue
-                if use_walls:
-                    ax.fill(xs_g, ys_g, color=color, edgecolor='none',
-                            linewidth=0, alpha=1, zorder=2)
-                else:
-                    ax.fill(xs_g, ys_g, color=color, edgecolor='black',
-                            linewidth=0.5, alpha=1, zorder=2)
-
-            try:
-                sh_centroid = (shrunk[i] if shrunk[i] is not None
-                               else polys[i]).centroid
-                cx_, cy_ = float(sh_centroid.x), float(sh_centroid.y)
-            except Exception:
-                try:
-                    xs0, ys0 = polys[i].exterior.xy
-                    cx_ = float(np.mean(list(xs0)))
-                    cy_ = float(np.mean(list(ys0)))
-                except Exception:
-                    cx_, cy_ = 0.0, 0.0
-            label = (face_labels[i]
-                     if face_labels is not None and i < len(face_labels)
-                     else room_type)
-            ax.text(cx_, cy_, label,
-                    ha='center', va='center', fontsize=16, fontweight='bold',
-                    zorder=5)
-
-        door_w = 8.0 * float(wall_inset) if use_walls else 0.0
-
-        # Draw doors (white fills + jambs) and collect their cut polygons,
-        # which are then subtracted from the room/perimeter contours below
-        # so the contours break cleanly exactly at each door span.
-        door_cuts: list = []
-
-        if use_walls and door_pairs:
-            for pair in door_pairs:
-                if not pair or len(pair) < 2:
-                    continue
-                a, b = int(pair[0]), int(pair[1])
-                if not (0 <= a < len(polys) and 0 <= b < len(polys)):
-                    continue
-                if polys[a] is None or polys[b] is None:
-                    continue
-                # Skip doors entirely between rooms that are part of the
-                # same open zone -- those rooms render as one continuous
-                # space, with no wall to put a door through.
-                if _uf_find(a) == _uf_find(b):
-                    continue
-                cut = _draw_door_between(
-                    ax, polys[a], polys[b],
-                    inset=float(wall_inset),
-                    door_w=door_w,
-                    bg_zorder=3,
-                    fg_zorder=4,
-                    jamb_lw=1.5,
-                )
-                if cut is not None:
-                    door_cuts.append(cut)
-
-        if (use_walls and entry_door_segment is not None
-                and boundary_polygon and outer_pad > 0):
-            cut = _draw_entry_door_at_segment(
-                ax, boundary_polygon, entry_door_segment,
-                inset=float(wall_inset),
-                outer_pad=float(outer_pad),
-                bg_zorder=3,
-                fg_zorder=4,
-                jamb_lw=1.5,
-                door_w=door_w,
-                corner_margin=2.0 * float(wall_inset),
-            )
-            if cut is not None:
-                door_cuts.append(cut)
-        elif (use_walls and entry_door_face_idx is not None
-                and boundary_polygon and outer_pad > 0):
-            ei = int(entry_door_face_idx)
-            if 0 <= ei < len(polys) and polys[ei] is not None:
-                cut = _draw_entry_door(
-                    ax, polys[ei], boundary_polygon,
-                    inset=float(wall_inset),
-                    outer_pad=float(outer_pad),
-                    door_w=door_w,
-                    bg_zorder=3,
-                    fg_zorder=4,
-                    jamb_lw=1.5,
-                )
-                if cut is not None:
-                    door_cuts.append(cut)
-
-        if use_walls:
-            for root, members in zone_members.items():
-                if not members:
-                    continue
-                sh = zone_shrunk.get(root)
-                if sh is None:
-                    sh = (shrunk[members[0]] if shrunk[members[0]] is not None
-                          else polys[members[0]])
-                if sh is None:
-                    continue
-                try:
-                    contour = sh.boundary
-                except Exception:
-                    continue
-                for cut in door_cuts:
-                    try:
-                        if cut.intersects(contour):
-                            contour = contour.difference(cut)
-                    except Exception:
-                        continue
-                _plot_geom_lines(
-                    ax, contour, color='black',
-                    linewidth=2.0, zorder=4,
-                )
-
-                # Delineation lines: for each shared wall between two rooms
-                # in the same open zone, draw a thin black line along the
-                # centerline (clipped to the zone's shrunk envelope) so the
-                # underlying rooms remain visually distinct without a wall
-                # corridor or door between them.
-                if len(members) > 1:
-                    for ii in range(len(members)):
-                        for jj in range(ii + 1, len(members)):
-                            a = members[ii]
-                            b = members[jj]
-                            line = _shared_wall_line(
-                                polys[a], polys[b],
-                                inset=float(wall_inset),
-                            )
-                            if line is None:
-                                continue
-                            try:
-                                inside = line.intersection(sh)
-                            except Exception:
-                                inside = None
-                            if inside is None or inside.is_empty:
-                                continue
-                            _plot_geom_lines(
-                                ax, inside, color='black',
-                                linewidth=0.8, zorder=4,
-                            )
-
-        if use_walls and outer_pts:
-            from shapely.geometry import LineString as _SLine
-            try:
-                outer_geom = _SLine(
-                    list(outer_pts) + [outer_pts[0]]
-                )
-            except Exception:
-                outer_geom = None
-            if outer_geom is not None:
-                for cut in door_cuts:
-                    try:
-                        if cut.intersects(outer_geom):
-                            outer_geom = outer_geom.difference(cut)
-                    except Exception:
-                        continue
-                _plot_geom_lines(
-                    ax, outer_geom, color='black',
-                    linewidth=3.0, zorder=4,
-                )
-
-        ax.set_aspect('equal')
-        if show_title:
-            ax.set_title(title, fontsize=12, fontweight='bold')
-        if show_area:
-            ax.text(0.02, 0.98, f"Area: {total_area:.1f}m\u00b2",
-                    transform=ax.transAxes, verticalalignment='top', fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow'))
-        if not show_frame:
-            ax.set_axis_off()
