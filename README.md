@@ -77,6 +77,11 @@ The model is stored in `~/.cache/huggingface/hub/`.
 
 ## Repository Structure
 
+> The tree below lists **version-controlled** files only.  Datasets, prepared
+> evaluation data, checkpoints, and inference outputs are generated or downloaded
+> locally (see [Datasets](#datasets) and
+> [Preparing the RPLAN Dataset](#preparing-the-rplan-dataset)) and are not tracked.
+
 ```
 HypergraphFormer/
 │
@@ -96,7 +101,15 @@ HypergraphFormer/
 │   │                                      fewshot-qwen, fewshot-gpt)
 │   │
 │   │  # Post-inference scoring (--metrics ged accuracy delta area_proportion_error)
-│   └── score_results.py             Score saved results against ground truth
+│   ├── score_results.py             Score saved results against ground truth
+│   │
+│   │  # Procedural editing & parametric optimization
+│   ├── procedural_edits.py          Add-remove / rotate procedural edit operations
+│   ├── postprocessing.py            Post-inference hypergraph cleanup
+│   ├── run_parametric.py            Parametric optimization driver
+│   ├── utils_parametric.py          Helpers for parametric optimization
+│   ├── qwen_predict_accessgraph_edges.py   Predict access-graph edges from room sets
+│   └── __init__.py
 │
 ├── rplan/                          # ── RPLAN dataset processing ───────
 │   ├── build_dataset_access.py      Build access graphs from DiffPlanner + original PNGs
@@ -105,7 +118,8 @@ HypergraphFormer/
 │   ├── fix_rplan_accessgraph_connectivity.py   Fix disconnected access graphs
 │   ├── visualize_rplan_hypergraph.py            Visualize BSP + RGL mesh
 │   ├── visualize_disconnected_accessgraphs.py   Visualize disconnected samples
-│   └── visualize_fixed_accessgraphs.py          Before/after comparison
+│   ├── visualize_fixed_accessgraphs.py          Before/after comparison
+│   └── __init__.py
 │
 ├── utils/                          # ── Shared utility library ─────────
 │   ├── __init__.py                     Public API re-exports
@@ -117,55 +131,53 @@ HypergraphFormer/
 │   ├── hypergraph.py                   Hypergraph class, HypergraphPlotter
 │   ├── prompts.py                      BSP rules, prompt templates
 │   ├── data_loading.py                 Dataset helpers, example loading
-│   └── benchmark_qwen_inference.py     Inference timing benchmark
+│   ├── visualize_results_comparison.py  Side-by-side results comparison plots
+│   ├── benchmark_qwen_inference.py     Inference timing benchmark
+│   └── skipped_ids                     IDs excluded from evaluation
 │
-├── dataset/                        # ── Raw datasets ───────────────────
-│   ├── wmr24/                           WMR24: wmr24.json + HouseGAN++ conversions
-│   │   ├── wmr24.json                       Full dataset (hypergraph format)
-│   │   └── wmr24_housegan_json/             Converted for baseline evaluation
-│   │       ├── processed_rplan/                 NPZ files (House-Diffusion)
-│   │       └── processed_rplan_pickles/         Pickle files (HouseGAN++)
-│   ├── rplan/                           RPLAN data (see "Preparing the RPLAN Dataset")
-│   │   ├── dataset_original/               RPLAN floorplan PNGs (downloaded)
-│   │   ├── dataset_diffplanner/            DiffPlanner JSON splits (downloaded)
-│   │   ├── dataset_access/                 Access graphs (built from above)
-│   │   ├── dataset_hypergraph_la0/         BSP hypergraphs (exported)
-│   │   └── dataset_hypergraph_la0_fixed/   Post-processed (access graphs fixed)
-│   └── msd/                             Modified Swiss Dwellings CSV
-│
-├── eval_format/                    # ── Prepared evaluation data ───────
-│   ├── train/                          779 .txt files (accessgraph + hypergraph)
-│   └── test/                           167 .txt files
-│
-├── checkpoints/                    # ── Trained model checkpoints ──────
+├── dataset/                        # ── Raw datasets (tracked: WMR24 only) ──
+│   └── wmr24/                           WMR24 dataset
+│       └── wmr24.json                       Full dataset (hypergraph format)
 │
 ├── msd/                            # MSD dataset processing
 │   ├── graph.py                        MSDGraph class
 │   ├── plotter.py                      MSDPlotter class
 │   ├── msd_to_hypergraph.py            Conversion utilities
-│   └── notebooks/                      MSD exploration notebooks
+│   ├── validate_faces_leaves.py        Validate mesh faces against leaf nodes
+│   ├── process_unsuccessful.py         Retry / handle failed conversions
+│   ├── notebooks/
+│   │   └── MSD to Hypergraph and Reverse.ipynb
+│   └── __init__.py
 │
-├── benchmark/                      # HouseGAN++ & House-Diffusion baselines
+├── benchmark/                      # ── Baselines: HouseGAN++, House-Diffusion, DiffPlanner, iPlan ──
+│   ├── README.md
 │   ├── eval_houseganpp.sh              Evaluate HouseGAN++
 │   ├── eval_housediffusion.sh          Evaluate House-Diffusion
 │   ├── setup_houseganpp.sh             Setup HouseGAN++ environment + data conversion
 │   ├── setup_housediffusion.sh         Setup House-Diffusion environment + data conversion
+│   ├── setup_diffplanner.sh            Setup DiffPlanner baseline
+│   ├── setup_iplan.sh                  Setup iPlan baseline
 │   ├── utils/
 │   │   ├── convert_hypergraph_to_housegan_json.py   WMR24 JSON → HouseGAN++ JSON
+│   │   ├── convert_hypergraph_to_diffplanner.py     WMR24 JSON → DiffPlanner format
+│   │   ├── convert_hypergraph_to_iplan_mat.py       WMR24 JSON → iPlan .mat
+│   │   ├── convert_png_to_iplan_mat.py              RPLAN PNG → iPlan .mat
 │   │   ├── convert_json_to_pickle.py                HouseGAN++ JSON → pickle
-│   │   └── convert_json_to_npz.py                   HouseGAN++ JSON → NPZ
+│   │   ├── convert_json_to_npz.py                   HouseGAN++ JSON → NPZ
+│   │   ├── visualize_diffplanner.py                 Visualize DiffPlanner outputs
+│   │   └── visualize_rplan_json.py                  Visualize RPLAN JSON samples
 │   └── src/
 │       ├── dataset_loader.py            Shared PyTorch dataset module
 │       ├── evaluate_houseganpp.py       HouseGAN++ evaluation
-│       └── evaluate_housediffusion.py   House-Diffusion evaluation
-│
-├── notebooks/                      # Jupyter notebooks
-│   └── generate_and_visualize_hypergraphs.ipynb
+│       ├── evaluate_housediffusion.py   House-Diffusion evaluation
+│       ├── evaluate_diffplanner.py      DiffPlanner evaluation
+│       └── evaluate_iplan.py            iPlan evaluation
 │
 ├── prepare_rplan_hypergraph.sh     # End-to-end RPLAN pipeline (download, build, export)
 ├── setup_hypergraph.sh             # Clone & build C# geometry library
 ├── pyproject.toml                  # Editable install config (pip install -e .)
 ├── requirements.txt
+├── .gitignore
 └── README.md
 ```
 
@@ -369,10 +381,11 @@ python scripts/score_results.py \
     --correct-accessgraph
 ```
 
-### 6. Benchmark against baselines (HouseGAN++, House-Diffusion)
+### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
 
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
-the HouseGAN++ and House-Diffusion baselines on the WMR24 dataset.
+the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
+dataset.
 
 ### 7. Evaluate a single hypergraph (quick test)
 
@@ -546,5 +559,5 @@ If you use this code or the WMR24 dataset, please cite:
 ---
 
 **Project**: HypergraphFormer
-**Last Updated**: 2026-04-16
+**Last Updated**: 2026-06-22
 **Python**: 3.9+
