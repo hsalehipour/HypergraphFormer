@@ -73,6 +73,38 @@ AutoModelForCausalLM.from_pretrained(m, torch_dtype='auto')
 
 The model is stored in `~/.cache/huggingface/hub/`.
 
+### Load the fine-tuned adapters from the Hub
+
+The trained LoRA adapters are published on the Hugging Face Hub at
+[`NikitaKlimenko/HypergraphFormer`](https://huggingface.co/NikitaKlimenko/HypergraphFormer),
+one adapter per training-set size. Each adapter lives in its own subfolder:
+
+| Subfolder (`subfolder=`) | Training set |
+|---|---|
+| `qwen_hypergraphformer_1000_samples/checkpoint-240`   | 1,000 samples |
+| `qwen_hypergraphformer_5000_samples/checkpoint-750`   | 5,000 samples |
+| `qwen_hypergraphformer_10000_samples/checkpoint-1500` | 10,000 samples |
+| `qwen_hypergraphformer_25000_samples/checkpoint-3900` | 25,000 samples |
+| `qwen_hypergraphformer/checkpoint-8700`               | full dataset |
+
+Load any checkpoint on top of the base model:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+base_id = "Qwen/Qwen3-4B-Instruct-2507"
+repo_id = "NikitaKlimenko/HypergraphFormer"
+subfolder = "qwen_hypergraphformer_25000_samples/checkpoint-3900"
+
+tok = AutoTokenizer.from_pretrained(repo_id, subfolder=subfolder)
+base = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="auto", device_map="auto")
+model = PeftModel.from_pretrained(base, repo_id, subfolder=subfolder)
+```
+
+Swap `subfolder` to use a different dataset size (e.g.
+`qwen_hypergraphformer_1000_samples/checkpoint-240`).
+
 ---
 
 ## Repository Structure
