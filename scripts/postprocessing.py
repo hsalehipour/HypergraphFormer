@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Post-processing for predicted hypergraphs: three modes via ``--pp-mode``.
+Post-processing for predicted hypergraphs: two modes via ``--pp-mode``.
 
 * ``parametric`` (default) — greedy add/remove multiset planning + optional procedural edits
   (``--apply-procedural-step1``). Default ``--procedural-steps 5``.
 * ``orientation`` — BSP reorientation search (3 mirrors × 4 rotations), picks min δ_sq.
-* ``optimization`` — gradient-descent split optimization via ``run_parametric.optimize_hypergraph``.
+
+For gradient-descent split optimization, use ``scripts.run_parametric --all``.
 """
 from __future__ import annotations
 
@@ -462,7 +463,7 @@ def process_sample(
     return {"command": cmd1, "detail": detail, "multiset_commands": chain}
 
 
-# --- Optional batch modes: orientation (bsp) & parametric optimization (GD) ---
+# --- Optional batch mode: orientation (bsp) ---
 
 
 def orientation_variant_passes_ref_accessgraph(
@@ -696,84 +697,6 @@ def run_orientation_mode(
     logger.info("Wrote hypergraphs only (%d ids, same format as --results-hypergraphs) to %s", len(out), out_path)
 
 
-def _optim_worker_pack(t: tuple) -> tuple[str, dict, dict[str, Any] | None, str | None]:
-    import json as _json
-    from pathlib import Path as _Path
-
-    from scripts.run_parametric import optimize_hypergraph
-    from utils_parametric import OptimConfig
-
-    sid, grpo_path_s, cfg_json, _unused = t
-    grpo = _Path(grpo_path_s)
-    with open(grpo, encoding="utf-8") as f:
-        allh: dict = _json.load(f)
-    if sid not in allh:
-        return sid, repair_bsp_tree_names({}), None, f"missing id {sid}"
-    cfg = OptimConfig(**_json.loads(cfg_json))
-    try:
-        best_hg, _bm, _om, _gt, mo, mp, *_ = optimize_hypergraph(sid, cfg, grpo_file_path=grpo)
-        return sid, best_hg, {"metrics_original": mo, "metrics_optimized": mp}, None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Optimization failed for %s: %s", sid, exc)
-        return sid, repair_bsp_tree_names(allh[sid]), None, f"{type(exc).__name__}: {exc}"
-
-
-def run_optimization_mode(
-    results: dict[str, dict],
-    test_dir: Path,
-    grpo: Path,
-    *,
-    out_hg: Path,
-    out_meta: Path,
-    max_samples: int | None,
-    workers: int,
-    show_progress: bool,
-    objective: str = "delta",
-) -> None:
-    from dataclasses import asdict
-
-    from utils_parametric import OptimConfig
-
-    try:
-        td_rel = str(test_dir.resolve().relative_to(REPO_ROOT))
-    except ValueError:
-        td_rel = str(test_dir)
-    cfg_json = json.dumps(asdict(OptimConfig(objective=objective, test_dir=td_rel, grpo_file=str(grpo.resolve()))), default=str)
-
-    ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
-    if max_samples is not None:
-        ids = ids[:int(max_samples)]
-    n_out = len(ids)
-    pack_args = [(sid, str(grpo.resolve()), cfg_json, td_rel) for sid in ids]
-    out_h: dict[str, dict] = {}
-    meta: dict[str, Any] = {}
-
-    def _collect(sid: str, hg: dict, m: dict | None, err: str | None) -> None:
-        out_h[sid] = hg
-        if m or err:
-            meta[sid] = {**(m or {}), **({} if not err else {"error": err})}
-
-    if workers <= 1:
-        for p in tqdm(pack_args, total=n_out, desc="Optimization", unit="sample", disable=not show_progress):
-            _collect(*_optim_worker_pack(p))
-    else:
-        ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-            futs = [pool.submit(_optim_worker_pack, p) for p in pack_args]
-            with tqdm(total=n_out, desc="Optimization", unit="sample", disable=not show_progress) as pbar:
-                for fut in as_completed(futs):
-                    _collect(*fut.result())
-                    pbar.update(1)
-
-    out_hg.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_hg, "w", encoding="utf-8") as f:
-        json.dump(out_h, f, indent=2, sort_keys=True)
-    logger.info("Wrote %d optimized hypergraphs to %s", len(out_h), out_hg)
-    out_meta.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_meta, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, sort_keys=True)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-hypergraphs", type=Path,
@@ -792,16 +715,13 @@ def main() -> int:
     parser.add_argument("--increase-factor", type=float, default=2.0,
         help="Scaling factor for increase/reduce commands.")
     parser.add_argument("--workers", type=int, default=16, metavar="N",
-        help="Parallel spawn processes for procedural/orientation/optimization (default: %(default)s).")
+        help="Parallel spawn processes for procedural/orientation (default: %(default)s).")
     parser.add_argument("--pp-mode", type=str, default="parametric",
-        choices=("parametric", "orientation", "optimization"),
-        help="parametric (default), orientation (BSP 3×4 search), or optimization (GD).")
+        choices=("parametric", "orientation"),
+        help="parametric (default) or orientation (BSP 3×4 search). "
+             "For GD split optimization use scripts.run_parametric --all.")
     parser.add_argument("--output-orientation", type=Path, default=None,
         help="Orientation output (default: results_hypergraphs_orientation.json).")
-    parser.add_argument("--output-optimization", type=Path, default=None,
-        help="Optimization output hypergraphs (default: results_hypergraphs_optimized.json).")
-    parser.add_argument("--optimization-objective", type=str, default="delta",
-        choices=("delta", "area", "area_delta", "delta_epsilon", "epsilon"))
     parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -814,15 +734,6 @@ def main() -> int:
         out_o = args.output_orientation or (args.results_hypergraphs.parent / "results_hypergraphs_orientation.json")
         run_orientation_mode(results, args.test_dir, out_path=out_o,
             max_samples=args.max_samples, workers=int(args.workers), show_progress=not args.quiet)
-        return 0
-
-    if args.pp_mode == "optimization":
-        out_hg = args.output_optimization or (args.results_hypergraphs.parent / "results_hypergraphs_optimized.json")
-        out_meta = out_hg.parent / f"{out_hg.stem}_meta.json"
-        run_optimization_mode(results, args.test_dir, args.results_hypergraphs,
-            out_hg=out_hg, out_meta=out_meta, max_samples=args.max_samples,
-            workers=int(args.workers), show_progress=not args.quiet,
-            objective=str(args.optimization_objective))
         return 0
 
     # --- parametric mode ---

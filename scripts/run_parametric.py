@@ -51,12 +51,12 @@ from utils.metrics import (  # noqa: E402
     produce_room_list_from_polygons,
 )
 
-MIN_SPLIT, MAX_SPLIT = 0.15, 0.85
-ACCESSGRAPH_VIOLATION_WEIGHT = 0.05
-OBJECTIVES = ("delta", "delta_epsilon", "epsilon")
-DEFAULT_WMR24_RESULTS = REPO_ROOT / "inference_8700_on_wmr24_inference_vllm_64" / "results_hypergraphs.json"
-
 from utils_parametric import (  # noqa: E402
+    ACCESSGRAPH_VIOLATION_WEIGHT,
+    DEFAULT_WMR24_RESULTS,
+    MAX_SPLIT,
+    MIN_SPLIT,
+    OBJECTIVES,
     OptimConfig,
     _delta_metric_square_from_room_list,
     _bedroom_group_from_accessgraph,
@@ -548,7 +548,7 @@ def _run_batch(config: OptimConfig) -> None:
             all_traces.append((_id, mt, bt))
 
     if workers == 1:
-        rgl, col = init_rgl() if True else (None, None)
+        rgl, col = init_rgl()
         for k, _id in enumerate(ids, start=1):
             print(f"\n[{k}/{len(ids)}] {_id}")
             _accumulate(*_process_one_apt(_id, config, results[_id], grpo_file_path, rgl, col))

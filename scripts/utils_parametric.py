@@ -232,27 +232,19 @@ def hypergraph_bounds_to_mesh(hg: dict, bounds: dict, *, RGL=None, Collections=N
 
 def load_ground_truth_txt(test_dir: Path, sample_id: str) -> tuple[dict, dict, dict, list | None]:
     """Load ``<test_dir>/<id>.txt`` → ``(bounds, hypergraph, accessgraph, room_polygons|None)``."""
-    def _j(val):
+    def _dict(val) -> dict:
+        """Parse a JSON-or-dict field, returning {} for anything non-dict."""
         if isinstance(val, str):
             s = val.strip()
-            return json.loads(s) if s else {}
-        return val if val is not None else {}
+            val = json.loads(s) if s else {}
+        return val if isinstance(val, dict) else {}
 
     with open(test_dir / f"{sample_id}.txt", encoding="utf-8") as f:
         raw = json.load(f)
 
-    bounds = _j(raw.get("bounds", "{}"))
-    if not isinstance(bounds, dict):
-        bounds = {}
-
-    hg = _j(raw.get("hypergraph"))
-    if not isinstance(hg, dict):
-        hg = {}
-
-    ag = _j(raw.get("accessgraph") or {})
-    if not isinstance(ag, dict):
-        ag = {}
-
+    bounds = _dict(raw.get("bounds", "{}"))
+    hg = _dict(raw.get("hypergraph"))
+    ag = _dict(raw.get("accessgraph") or {})
     rp = raw.get("room_polygons")
     return bounds, hg, ag, (rp if isinstance(rp, list) else None)
 

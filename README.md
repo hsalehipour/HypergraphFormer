@@ -384,7 +384,150 @@ python scripts/evaluator.py --mode fewshot-gpt \
     --model gpt-4-turbo --dataset-dir eval_format/test
 ```
 
-### 5. Score saved results (post-inference)
+### 5. Procedural Editing and Optimization
+
+After inference, generated hypergraphs can be (a) **procedurally edited** with
+high-level room commands and (b) **parametrically optimized** to refine room
+geometry. Both operate on a `*_hypergraphs.json` file produced by
+`evaluator.py` (a `sample_id → hypergraph` mapping).
+
+#### Procedural editing
+
+`scripts/procedural_edits.py` applies a single natural-language-style command to
+one sample or to every sample in the file, validating each edited hypergraph
+before writing it out. Supported commands:
+
+| Command | Effect |
+|---|---|
+| `increase <room>` / `reduce <room>` | Scale a room's area by `--increase-factor` (reduce uses `1/factor`) |
+| `add <new_room> by <anchor_room>` | Split the anchor room's leaf to insert a new room |
+| `delete <room>` | Remove a room and promote its sibling subtree |
+| `swap <room1> and <room2>` | Exchange the two rooms' types and areas |
+| `reorient <deg_ccw> <reflect_mode>` | Rigidly rotate/reflect the BSP (e.g. `reorient 90 normal`, `reorient 0 flip_x`) |
+
+```bash
+# Edit a single sample (writes <sample-id>_<command>.json beside the input)
+python scripts/procedural_edits.py \
+    --hypergraphs-file path/to/results_test_hypergraphs.json \
+    --sample-id b-0001 \
+    --command "increase kitchen" \
+    --increase-factor 2.0 \
+    --test-dir dataset/rplan/dataset_hypergraph_la0_fixed/test
+
+```
+
+Each run applies **one** command (via `--command`) to all samples. Run the
+script once per operation, pointing `--output` at a per-operation file. The
+`--all-samples` examples below cover every supported command:
+
+```bash
+TEST_DIR=dataset/rplan/dataset_hypergraph_la0_fixed/test
+HG=path/to/results_test_hypergraphs.json
+
+# add / remove a room
+python scripts/procedural_edits.py --hypergraphs-file $HG --all-samples \
+    --command "add bathroom by bedroom" --test-dir $TEST_DIR \
+    --output edited_add_bathroom.json
+
+```
+
+By default the output is written beside the input
+(`<input_stem>_<command>.json` for `--all-samples`, or
+`<sample-id>_<command>.json` for a single sample); override it with `--output`.
+
+#### Automatic post-processing (bulk add/remove + rotate)
+
+`scripts/procedural_edits.py` requires you to name each command. To fix up a
+**whole results file automatically**, use `scripts/postprocessing.py`: it
+inspects each predicted hypergraph, decides *which* rooms to add or remove (and
+how to reorient), and applies the edits in bulk. It has two modes via
+`--pp-mode`:
+
+| `--pp-mode` | What it does |
+|---|---|
+| `parametric` (default) | Compares each prediction's room multiset against the GT access graph, greedily **plans an add/remove chain** (which room type is missing/extra), and — with `--apply-procedural-step1` — applies it through `procedural_edits`. The `add` anchor is chosen from GT-neighbor room types automatically. |
+| `orientation` | Bulk **rotate/reflect** search: for every sample tries all 3 mirrors × 4 rotations (90° steps) and keeps the orientation with the lowest δ_sq compactness, subject to the access-graph edge check. |
+
+For gradient-descent split optimization over all samples, use
+`run_parametric.py --all` ([Parametric optimization](#parametric-optimization) below).
+
+```bash
+RESULTS=path/to/results_test_hypergraphs.json
+TEST_DIR=dataset/rplan/eval_access/test
+
+# (a) Plan add/remove for every sample WITHOUT editing — just writes the plan
+python scripts/postprocessing.py \
+    --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
+    --output-json parametric_commands.json
+# parametric_commands.json holds, per id, the chosen command + multiset_command_chain
+# (the missing/extra room diff that drove the decision).
+
+# (b) Plan AND apply the add/remove chain in bulk (procedural edits)
+python scripts/postprocessing.py \
+    --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
+    --apply-procedural-step1 \
+    --procedural-steps 5 \
+    --increase-factor 2.0 \
+    --workers 16 \
+    --output-step1-hypergraphs results_hypergraphs_step1_procedural.json
+
+# (c) Bulk rotate/reflect: pick the best orientation per sample
+python scripts/postprocessing.py --pp-mode orientation \
+    --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
+    --workers 16 \
+    --output-orientation results_hypergraphs_orientation.json
+```
+
+`--procedural-steps N` caps how many add/remove edits to plan and apply per
+sample (`0` = greedily continue until the room multiset matches GT). Use
+`--max-samples` to dry-run on a handful of ids, and `-q/--quiet` to reduce
+logging. Each mode writes a `sample_id → hypergraph` JSON in the same format as
+the inference results, so the output can be fed straight into
+`score_results.py` (next section) or back into another post-processing pass.
+For gradient-descent split optimization over all samples, use
+`run_parametric.py --all` (below).
+
+#### Parametric optimization
+
+`scripts/run_parametric.py` refines the BSP area-split fractions of a generated
+hypergraph via projected gradient descent against ground-truth geometry. Three
+objectives are available (lower is better):
+
+| `--objective` | Optimizes |
+|---|---|
+| `delta` | δ_sq — per-leaf perimeter-vs-square compactness |
+| `epsilon` | ε — room-area proportions vs reference fractions |
+| `delta_epsilon` | equally-weighted blend of the two (default) |
+
+Run it as a module from the repo root. Pass an apartment id for a single sample,
+or `--all` for batch mode over every id in the results file:
+
+```bash
+# Single apartment
+python -m scripts.run_parametric b-0001 \
+    --results-hypergraphs path/to/results_test_hypergraphs.json \
+    --test-dir dataset/wmr24/test \
+    --objective delta_epsilon --maxiter 80
+
+# Batch over all samples (parallel), writing a merged optimized JSON
+python -m scripts.run_parametric --all \
+    --results-hypergraphs path/to/results_test_hypergraphs.json \
+    --test-dir dataset/wmr24/test \
+    --objective delta_epsilon \
+    --batch-workers 64 --gd-lr 0.15 --maxiter 200 \
+    --batch-output-dir INFERENCE_RESULTS/<EXPERIMENT>/optimize_delta_epsilon
+```
+
+Key flags: `--maxiter` (GD steps), `--gd-lr` (step size), `--patience` /
+`--ftol` (early-stop), `--limit` (cap number of samples), `--no-accessgraph`
+(disable the access-graph edge penalty in the objective). In `--all` mode the
+merged, optimized hypergraphs are written to
+`<batch-output-dir>/<input_stem>_optimized.json` (override with
+`--merged-hypergraphs-json`), alongside a per-sample metrics CSV and a
+`metric_progress.csv` convergence trace. The optimized JSON can then be scored
+with `score_results.py` (next section).
+
+### 6. Score saved results (post-inference)
 
 Compute any combination of GED, accuracy, delta, and area proportion error
 metrics on saved `*_hypergraphs.json` files:
@@ -413,13 +556,13 @@ python scripts/score_results.py \
     --correct-accessgraph
 ```
 
-### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
+### 7. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
 
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
 dataset.
 
-### 7. Evaluate a single hypergraph (quick test)
+### 8. Evaluate a single hypergraph (quick test)
 
 ```bash
 # Few-shot Qwen on one sample
@@ -430,6 +573,36 @@ python scripts/evaluator.py --mode fewshot-qwen \
 python scripts/evaluator.py --mode fewshot-gpt \
     --dataset-dir eval_format/train --max-samples 1
 ```
+
+### 9. Visualize results
+
+`utils/visualize_results.py` renders a single sample as two PNGs: a blueprint-style
+floor-plan **mesh** (walls, interior door gaps, entry door, apartment boundary) and
+its **access graph** (room types only, labels above nodes). It has three data modes —
+pick one flag:
+
+```bash
+# Generated apartments (default): mesh + corrected access graph from the
+# generated hypergraph. Bounds are read from <test-dir>/<id>.txt.
+python -m utils.visualize_results --generated_data --sample-id 19764 \
+    --hypergraph .../results_hypergraphs.json \
+    --test-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
+    --output-dir /tmp/viz
+
+# RPLAN ground truth: mesh built from room_polygons, access graph from the
+# stored "accessgraph" key (needs a test dir that has room_polygons).
+python -m utils.visualize_results --gt_rplan --sample-id 19764 \
+    --test-dir dataset/rplan/eval_access_mid/test --output-dir /tmp/viz
+
+# WMR24 ground truth: mesh + corrected access graph from the embedded hypergraph.
+python -m utils.visualize_results --gt_wmr24 --sample-id b-0001 \
+    --test-dir dataset/wmr24/test --output-dir /tmp/viz
+```
+
+Outputs are written as `<id>_mesh.png` and `<id>_accessgraph.png` in `--output-dir`.
+The module is also importable: `render_mesh`, `render_accessgraph`, and the
+`visualize_*` mode functions accept a `save_path` — pass a path to write a PNG, or
+`None` to get the live matplotlib `Figure` back for embedding in other scripts.
 
 ---
 
