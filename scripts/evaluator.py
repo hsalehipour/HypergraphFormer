@@ -831,11 +831,30 @@ class TrainedModelEvaluator(Evaluator):
     def load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_path = Path(self.args.model)
-        is_lora = (model_path / "adapter_config.json").exists()
+        use_hub = getattr(self.args, "hub", False)
         use_vllm = not getattr(self.args, "no_vllm", False) and VLLM_AVAILABLE
         if not getattr(self.args, "no_vllm", False) and not VLLM_AVAILABLE:
             logger.warning("vLLM not installed; using HuggingFace generate (pip install vllm)")
+
+        if use_hub:
+            # ── Hub mode: load LoRA adapter from NikitaKlimenko/HypergraphFormer ──
+            HUB_REPO = "NikitaKlimenko/HypergraphFormer"
+            BASE_ID = "Qwen/Qwen3-4B-Instruct-2507"
+            subfolder = self.args.hub_subfolder
+            logger.info(f"Loading adapter from Hub: {HUB_REPO}/{subfolder}")
+            if use_vllm:
+                logger.warning("vLLM does not support Hub-based LoRA loading; falling back to HuggingFace generate")
+            from peft import PeftModel
+            tokenizer = AutoTokenizer.from_pretrained(HUB_REPO, subfolder=subfolder)
+            base_model = AutoModelForCausalLM.from_pretrained(BASE_ID, torch_dtype="auto", device_map="auto")
+            model = PeftModel.from_pretrained(base_model, HUB_REPO, subfolder=subfolder)
+            self._raw_model = model
+            self.generator = QwenGenerator(model=model, tokenizer=tokenizer)
+            return
+
+        # ── Local mode: load from --model path ──
+        model_path = Path(self.args.model)
+        is_lora = (model_path / "adapter_config.json").exists()
 
         if use_vllm:
             if is_lora:
@@ -877,10 +896,9 @@ class TrainedModelEvaluator(Evaluator):
             if not base_name:
                 raise ValueError("Missing base_model_name_or_path in adapter_config.json")
             logger.info(f"LoRA adapter detected, base model: {base_name}")
-
+            from peft import PeftModel
             tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             base_model = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=torch.float16)
-            from peft import PeftModel
             model = PeftModel.from_pretrained(base_model, str(model_path))
         else:
             tokenizer = AutoTokenizer.from_pretrained(self.args.model, local_files_only=True)
@@ -1298,6 +1316,27 @@ def cli():
 
     # Trained / rooms-only
     parser.add_argument("--model", type=str, default=None)
+    parser.add_argument(
+        "--hub",
+        action="store_true",
+        help=(
+            "Load adapter from Hugging Face Hub (NikitaKlimenko/HypergraphFormer) "
+            "instead of a local path. Use --hub-subfolder to select the checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--hub-subfolder",
+        type=str,
+        default="qwen_hypergraphformer/checkpoint-8700",
+        help=(
+            "Subfolder inside NikitaKlimenko/HypergraphFormer to load. "
+            "Default: qwen_hypergraphformer/checkpoint-8700 (full dataset). "
+            "Other options: qwen_hypergraphformer_1000_samples/checkpoint-240, "
+            "qwen_hypergraphformer_5000_samples/checkpoint-750, "
+            "qwen_hypergraphformer_10000_samples/checkpoint-1500, "
+            "qwen_hypergraphformer_25000_samples/checkpoint-3900."
+        ),
+    )
     parser.add_argument("--noged", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
@@ -1373,7 +1412,10 @@ def cli():
         elif args.mode == "fewshot-gpt":
             args.model = "gpt-4"
         elif args.mode in ("trained", "rooms-only"):
-            parser.error(f"--model is required for --mode {args.mode}")
+            if getattr(args, "hub", False):
+                args.model = "NikitaKlimenko/HypergraphFormer"  # placeholder for output filename
+            else:
+                parser.error(f"--model is required for --mode {args.mode} (or pass --hub to load from Hugging Face Hub)")
 
     if args.output is None:
         args.output = f"results_{args.mode.replace('-', '_')}_{Path(args.model).name}_{args.seed}.json"

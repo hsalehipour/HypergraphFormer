@@ -140,6 +140,7 @@ HypergraphFormer/
 │   ├── run_parametric.py            Parametric optimization driver
 │   ├── utils_parametric.py          Helpers for parametric optimization
 │   ├── qwen_predict_accessgraph_edges.py   Predict access-graph edges from room sets
+│   ├── partition_dataset.py         Subsample sft/ → sft_<N>/ for dataset-size ablations
 │   └── __init__.py
 │
 ├── rplan/                          # ── RPLAN dataset processing ───────
@@ -304,17 +305,17 @@ python rplan/visualize_fixed_accessgraphs.py \
 
 ### 1. Prepare training data
 
-The dataset ships pre-split (`train.json`, `validation.json`,
-`test.json`).  Convert it to the JSONL instruction format that
-`sft_pipeline.py` expects:
+The RPLAN dataset is pre-split into `train.json`, `validation.json`,
+`test.json` by `prepare_rplan_hypergraph.sh`.  Convert it to the JSONL
+instruction format that `sft_pipeline.py` expects:
 
 ```bash
 python scripts/data_preparation.py --mode train \
-    --dataset-dir dataset/hypergraph
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed
 ```
 
 This produces `train.jsonl`, `validation.jsonl`, and `test.jsonl` in
-`dataset/hypergraph/sft/`.
+`dataset/rplan/dataset_hypergraph_la0_fixed/sft/`.
 
 ### 2. Train with SFT (LoRA fine-tuning)
 
@@ -339,8 +340,8 @@ Prepare the eval-format directory (one `{id}.txt` per sample):
 
 ```bash
 python scripts/data_preparation.py --mode eval \
-    --input-file dataset/hypergraph/test.json \
-    --output-dir dataset/hypergraph/test
+    --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
+    --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test
 ```
 
 Optionally pass `--aggregate` to merge same-type, spatially adjacent,
@@ -348,25 +349,32 @@ access-connected rooms into single nodes in the output access graphs:
 
 ```bash
 python scripts/data_preparation.py --mode eval --aggregate \
-    --input-file dataset/hypergraph/test.json \
-    --output-dir dataset/hypergraph/test_aggregated
+    --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
+    --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated
 ```
 
 Run evaluation (generates hypergraphs + inline scoring):
 
 ```bash
-# Single GPU
+# From a local checkpoint (single GPU)
 python scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
-    --dataset-dir dataset/hypergraph/test \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
     --noged --shuffle \
     --output results_eval.json
 
-# Multi-GPU
+# From a local checkpoint (multi-GPU)
 accelerate launch --num_processes=8 scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
-    --dataset-dir dataset/hypergraph/test \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
     --noged --shuffle
+
+# From Hugging Face Hub (full-dataset adapter, default subfolder)
+python scripts/evaluator.py --mode trained --hub \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
+    --hub-subfolder qwen_hypergraphformer/checkpoint-8700
+    --noged --shuffle
+
 ```
 
 ### 4. Evaluate the base model (few-shot, no fine-tuning)
@@ -601,6 +609,24 @@ Outputs are written as `<id>_mesh.png` and `<id>_accessgraph.png` in `--output-d
 The module is also importable: `render_mesh`, `render_accessgraph`, and the
 `visualize_*` mode functions accept a `save_path` — pass a path to write a PNG, or
 `None` to get the live matplotlib `Figure` back for embedding in other scripts.
+
+---
+
+## Additional Workflows
+
+Miscellaneous routines that complement the main workflow but are not part of the standard training/evaluation pipeline.
+
+### Training on a smaller subset of RPLAN
+
+To train on a smaller subset (e.g. ablations by dataset size), create a
+downsampled partition from the full `sft/` directory:
+
+```bash
+python scripts/partition_dataset.py -n 1000 \
+    --input-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
+# → writes sft_1000/ alongside sft/ with subsampled train.jsonl
+#   and unchanged validation.jsonl / test.jsonl
+```
 
 ---
 
