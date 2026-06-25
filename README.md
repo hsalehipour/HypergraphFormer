@@ -13,12 +13,11 @@ and geometric subdivisions, enabling generation of floor plans for arbitrary,
 user-specified boundaries.
 
 Evaluated on the **WMR24** dataset (~1,000 architect-designed floor
-plans from Zurich, New York, and Singapore), HypergraphFormer achieves a GED
-of **1.45** and room-set accuracy of **94.2%**, outperforming HouseDiffusion
-and HouseGAN++ while requiring significantly less training data.
+plans from Zurich, New York, and Singapore), and **RPLAN** dataset (Converted to the Hyperrgaph format), HypergraphFormer outperforms HouseDiffusion
+and HouseGAN++ while requiring significantly less training data and allowing controllable edits of generated floorplans.
 
-> **Paper:** Submitted to ICML 2026.  Preprint available on
-> [arXiv](https://arxiv.org/) (link will be added upon publication).
+> **Paper:** Submitted to NeurIPS 2026.  Preprint available on
+> [arXiv](https://arxiv.org/abs/2605.18932).
 
 ---
 
@@ -163,9 +162,8 @@ HypergraphFormer/
 │   ├── hypergraph.py                   Hypergraph class, HypergraphPlotter
 │   ├── prompts.py                      BSP rules, prompt templates
 │   ├── data_loading.py                 Dataset helpers, example loading
-│   ├── visualize_results_comparison.py  Side-by-side results comparison plots
-│   ├── benchmark_qwen_inference.py     Inference timing benchmark
-│   └── skipped_ids                     IDs excluded from evaluation
+│   ├── visualize_results.py            Floor-plan & access-graph renderer (generated, GT RPLAN, GT WMR24)
+│   └── benchmark_qwen_inference.py     Inference timing benchmark
 │
 ├── dataset/                        # ── Raw datasets (tracked: WMR24 only) ──
 │   └── wmr24/                           WMR24 dataset
@@ -630,10 +628,11 @@ The `utils/` package provides shared helpers used by the pipeline scripts:
 | `utils/hypergraph.py` | `Hypergraph` class (validation, transformers, RGL integration, parsing, access-graph component analysis), `HypergraphPlotter` (mesh sliver filtering, `unique_id`-based face labelling) |
 | `utils/utils.py` | `validate_hypergraph`, `TimeoutException`, `time_limit`, JSON extraction helpers |
 | `utils/metrics.py` | `accessgraph_dict_to_nx`, `ged_between_graphs`, `compute_ged_from_hypergraph`, `compute_room_similarity_score`, `compute_room_area_proportion_error`, `room_type_accuracy`, `compute_room_type_accuracy`, `produce_room_list` |
-| `utils/report_results.py` | `report_results` -- unified NPZ + TXT reporting for all evaluation pipelines |
+| `utils/report_results.py` | `report_results` — unified NPZ + TXT reporting for all evaluation pipelines |
 | `utils/analyze_metrics_by_room_count.py` | CLI script to bin NPZ metrics by room count and produce per-bin statistics |
 | `utils/prompts.py` | BSP rules text, prompt templates (`create_structured_prompt`, `create_simple_prompt`, etc.) |
 | `utils/data_loading.py` | `load_example_hypergraphs`, `load_target_from_dataset`, `save_training_data`, `log_slow_generation`, `HypergraphDataset`, `collate_fn` |
+| `utils/visualize_results.py` | `render_mesh`, `render_accessgraph`, `render_mesh_from_polygons`, `render_accessgraph_from_dict` — blueprint-style floor-plan and access-graph renderer; CLI supports `--generated_data`, `--gt_rplan`, `--gt_wmr24` modes |
 | `utils/benchmark_qwen_inference.py` | Inference timing benchmark for Qwen models |
 
 ---
@@ -755,14 +754,14 @@ If you use this code or the WMR24 dataset, please cite:
   title     = {Learning Hypergraph Representation with Large Language Models
                for Controllable Floor-Plan Generation},
   author    = {Anonymous},
-  booktitle = {Submitted to the International Conference on Machine Learning (ICML)},
+  booktitle = {Submitted to the Conference on Neural Information Processing Systems (NeurIPS)},
   year      = {2026},
-  note      = {Under review. Preprint available on arXiv.}
+  note      = {Under review. Preprint available on arXiv:2605.18932.}
 }
 ```
 
 ---
 
 **Project**: HypergraphFormer
-**Last Updated**: 2026-06-22
+**Last Updated**: 2026-06-25
 **Python**: 3.9+
