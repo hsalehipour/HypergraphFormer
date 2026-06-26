@@ -782,8 +782,7 @@ If you use this code or the WMR24 dataset, please cite:
 
 ```bibtex
 @inproceedings{hypergraphformer2026,
-  title     = {Learning Hypergraph Representation with Large Language Models
-               for Controllable Floor-Plan Generation},
+  title     = {HypergraphFormer: Learning Hypergraphs from LLMs for Editable Floor Plan Generation},
   author    = {Anonymous},
   booktitle = {Submitted to the Conference on Neural Information Processing Systems (NeurIPS)},
   year      = {2026},
