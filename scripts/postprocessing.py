@@ -640,6 +640,12 @@ def _hypergraph_from_results_value(v: Any) -> dict[str, Any]:
     return v
 
 
+def _parse_jsonish(val):
+    if isinstance(val, str):
+        return json.loads(val)
+    return val
+
+
 def load_eval_access_gt(test_dir: Path, sample_id: str) -> tuple[dict, dict, dict]:
     path = test_dir / f"{sample_id}.txt"
     with open(path, encoding="utf-8") as f:
@@ -735,7 +741,7 @@ def main() -> int:
         help="Parallel spawn processes for procedural/orientation (default: %(default)s).")
     parser.add_argument("--pp-mode", type=str, default="addremove",
         choices=("addremove", "orientation"),
-        help="parametric (default) or orientation (BSP 3×4 search). "
+        help="addremove (default) or orientation (BSP 3×4 search). "
              "For GD split optimization use scripts.run_parametric --all.")
     parser.add_argument("--output-orientation", type=Path, default=None,
         help="Orientation output (default: results_hypergraphs_orientation.json).")
@@ -753,7 +759,7 @@ def main() -> int:
             max_samples=args.max_samples, workers=int(args.workers), show_progress=not args.quiet)
         return 0
 
-    # --- parametric mode ---
+    # --- addremove mode ---
     out_path = args.output_json or (args.results_hypergraphs.parent / "addremove_commands.json")
     ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
     if args.max_samples is not None:

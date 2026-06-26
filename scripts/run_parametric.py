@@ -437,13 +437,13 @@ _POOL_RGL: tuple[object, object] = (None, None)
 def _pool_init(quiet: bool = False) -> None:
     """ProcessPool initializer: one RGL per worker, single-threaded BLAS."""
     global _POOL_RGL
-    import logging as _logging
-    import warnings as _warnings
+    import logging
+    import warnings
     for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(k, "1")
     if quiet:
-        _logging.disable(_logging.WARNING)
-        _warnings.filterwarnings("ignore")
+        logging.disable(logging.WARNING)
+        warnings.filterwarnings("ignore")
     try:
         _POOL_RGL = init_rgl()
     except Exception:
@@ -612,12 +612,12 @@ def _run_single(config: OptimConfig, apt_id: str) -> None:
 
 
 def main() -> None:
-    import logging as _logging
-    import warnings as _warnings
+    import logging
+    import warnings
     config, apt_id, run_all = OptimConfig.from_args()
     if config.quiet:
-        _logging.disable(_logging.WARNING)
-        _warnings.filterwarnings("ignore")
+        logging.disable(logging.WARNING)
+        warnings.filterwarnings("ignore")
     if run_all:
         _run_batch(config)
     elif apt_id:

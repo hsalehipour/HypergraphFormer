@@ -43,7 +43,7 @@ git clone https://github.com/hsalehipour/HypergraphFormer.git
 # base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed.
 # Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
 
-docker run -it --gpus all --name hypergraphformer2 \
+docker run -it --gpus all --name hypergraphformer_image \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
     pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
@@ -389,7 +389,7 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evalua
     --dataset-dir dataset/rplan/eval_test \
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
     --noged --shuffle \
-    --vllm-prompt-batch-size 8 \
+    --vllm-prompt-batch-size 64 \
     --output results_eval.json
 ```
 
@@ -418,20 +418,13 @@ python scripts/procedural_edits.py \
     --test-dir dataset/wmr24/test
 ```
 
-To apply a command to all samples at once, use `--all-samples`:
+To apply a command to all samples at once, use `--all-samples`instead of --sample-id
 
-```bash
-python scripts/procedural_edits.py \
-    --hypergraphs-file results_test_hypergraphs.json \
-    --all-samples \
-    --command "increase kitchen" \
-    --increase-factor 2.0 \
-    --test-dir dataset/wmr24/test
-```
+
 
 #### Automatic post-processing (bulk add/remove + rotate)
 
-`scripts/procedural_edits.py` requires you to name each command. To fix up a
+ To process a
 **whole results file automatically**, use `scripts/postprocessing.py`: it
 inspects each predicted hypergraph, decides *which* rooms to add or remove (and
 how to reorient), and applies the edits in bulk. It has two modes via
@@ -449,23 +442,15 @@ For gradient-descent split optimization over all samples, use
 RESULTS=path/to/results_test_hypergraphs.json
 TEST_DIR=dataset/rplan/eval_access/test
 
-# (a) Plan add/remove for every sample WITHOUT editing — just writes the plan
-python scripts/postprocessing.py \
-    --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
-    --output-json parametric_commands.json
-# parametric_commands.json holds, per id, the chosen command + multiset_command_chain
-# (the missing/extra room diff that drove the decision).
 
-# (b) Plan AND apply the add/remove chain in bulk (procedural edits)
-python scripts/postprocessing.py \
+# (a) Plan and apply the add/remove chain in bulk (procedural edits)
+python scripts/postprocessing.py \ --pp-mode addremove \
     --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
     --apply-procedural-step1 \
-    --procedural-steps 5 \
-    --increase-factor 2.0 \
     --workers 16 \
     --output-step1-hypergraphs results_hypergraphs_step1_procedural.json
 
-# (c) Bulk rotate/reflect: pick the best orientation per sample
+# (b) Bulk rotate/reflect: pick the best orientation per sample
 python scripts/postprocessing.py --pp-mode orientation \
     --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
     --workers 16 \
@@ -533,13 +518,6 @@ python scripts/score_results.py \
     --test-dir dataset/hypergraph/test \
     --output-dir eval_output \
     --metrics ged accuracy delta area_proportion_error
-
-# Just GED (access-graph correction applied by default)
-python scripts/score_results.py \
-    --results-file path/to/results_test_hypergraphs.json \
-    --test-dir dataset/hypergraph/test \
-    --output-dir eval_output \
-    --metrics ged
 ```
 
 ### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
@@ -547,6 +525,7 @@ python scripts/score_results.py \
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
 dataset.
+
 
 ### 7. Visualize results
 
@@ -565,7 +544,7 @@ python -m utils.visualize_results --generated_data --sample-id 19764 \
 
 # RPLAN ground truth: mesh built from room_polygons, access graph from the
 # stored "accessgraph" key (needs a test dir that has room_polygons).
-python -m utils.visualize_results --gt_rplan --sample-id 19764 \
+python -m utils.visualize_results --gt_rplan --sample-id 10018 \
     --test-dir dataset/rplan/eval_access_mid/test --output-dir /tmp/viz
 
 # WMR24 ground truth: mesh + corrected access graph from the embedded hypergraph.
@@ -629,6 +608,7 @@ python scripts/evaluator.py --mode fewshot-gpt \
     --model gpt-4-turbo \
     --dataset-dir dataset/wmr24/test \
     --output outputs/results_fewshot_gpt_wmr24.json
+
 ```
 
 ---
