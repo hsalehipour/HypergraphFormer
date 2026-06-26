@@ -40,11 +40,11 @@ git clone https://github.com/hsalehipour/HypergraphFormer.git
 cd HypergraphFormer
 
 # (Recommended) Start a Docker container with CUDA 12.4 + Python 3.11 and mount the repo.
-# Replace /path/to/HypergraphFormer with the absolute path to the cloned repo.
+# Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
 
 docker run -it --gpus all --name hypergraphformer \
-    -v /path/to/HypergraphFormer:/workspace \
-    -w /workspace \
+    -v "$(pwd)":/workspace \
+    -w /workspace/HypergraphFormer \
     nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
     bash
 
