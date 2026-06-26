@@ -39,11 +39,25 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 git clone https://github.com/hsalehipour/HypergraphFormer.git
 cd HypergraphFormer
 
+# (Recommended) Start a Docker container with CUDA 12.4 + Python 3.11 and mount the repo.
+# Replace /path/to/HypergraphFormer with the absolute path to the cloned repo.
+
+docker run -it --gpus all --name hypergraphformer \
+    -v /path/to/HypergraphFormer:/workspace \
+    -w /workspace \
+    nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
+    bash
+
+# Install Python 3.11
+apt update && apt install -y python3.11 python3.11-venv python3-dev python3-pip
+
+
+
 # System dependencies (required to build pygraphviz and the C# geometry library)
-apt update && apt install -y --no-install-recommends gcc graphviz libgraphviz-dev git mono-complete nuget curl wget unzip
+apt install -y --no-install-recommends gcc graphviz libgraphviz-dev git mono-complete nuget curl wget unzip
 
 # Virtual environment
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 
 # Python packages
