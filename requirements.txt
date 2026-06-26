@@ -52,7 +52,7 @@ openai==2.32.0
 networkx==3.6.1
 shapely==2.1.2
 pythonnet==3.0.5        # C# interop (clr) for hypergraph geometry library
-pygraphviz==1.14        # graph layout/rendering
+pygraphviz==1.14        # graph layout/rendering; requires: apt install gcc graphviz libgraphviz-dev
 # alphashape            # optional: concave-hull in msd/graph.py (lazy import; not installed by default)
 
 # ── Image processing & evaluation ────────────────────────────────

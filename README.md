@@ -39,6 +39,9 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 git clone https://github.com/hsalehipour/HypergraphFormer.git
 cd HypergraphFormer
 
+# System dependencies (required to build pygraphviz and the C# geometry library)
+apt update && apt install -y --no-install-recommends gcc graphviz libgraphviz-dev git mono-complete nuget curl wget unzip
+
 # Virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
@@ -94,7 +97,7 @@ from peft import PeftModel
 
 base_id = "Qwen/Qwen3-4B-Instruct-2507"
 repo_id = "NikitaKlimenko/HypergraphFormer"
-subfolder = "qwen_hypergraphformer_25000_samples/checkpoint-3900"
+subfolder = "qwen_hypergraphformer/checkpoint-8700"
 
 tok = AutoTokenizer.from_pretrained(repo_id, subfolder=subfolder)
 base = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="auto", device_map="auto")
@@ -278,7 +281,10 @@ adjacent rooms, (2) balanced area splits, and (3) reasonable aspect ratios.
 
 ```bash
 # Visualize specific samples (BSP + RGL mesh side by side)
-python rplan/visualize_rplan_hypergraph.py --sample 3951 57395
+# Output saved to rplan_rgl_vis/rplan_hg_{id}.png
+python rplan/visualize_rplan_hypergraph.py \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed \
+    --sample 3951 57395
 
 # Visualize disconnected access graphs in a dataset
 python rplan/visualize_disconnected_accessgraphs.py \
@@ -286,8 +292,8 @@ python rplan/visualize_disconnected_accessgraphs.py \
 
 # Compare before/after access graph fixes
 python rplan/visualize_fixed_accessgraphs.py \
-    --before-dir dataset/rplan/dataset_hypergraph_la0 \
-    --after-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug_fixed
+    --original-dir dataset/rplan/dataset_hypergraph_la0 \
+    --fixed-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug_fixed
 ```
 
 ### RPLAN Dataset Statistics
@@ -321,25 +327,28 @@ This produces `train.jsonl`, `validation.jsonl`, and `test.jsonl` in
 
 ```bash
 # Single GPU (default: 3 epochs, LoRA r=64, alpha=128)
-python scripts/sft_pipeline.py --gpu 0
+python scripts/sft_pipeline.py --gpu 0 \
+    --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 
 # Multi-GPU with Accelerate
-accelerate launch --num_processes=2 scripts/sft_pipeline.py --multi-gpu
+accelerate launch --num_processes=2 scripts/sft_pipeline.py --multi-gpu \
+    --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 
 # Custom settings
 python scripts/sft_pipeline.py \
-    --epochs 5 --lora-r 128 --lora-alpha 256 --gpu 0
+    --epochs 5 --lora-r 128 --lora-alpha 256 --gpu 0 \
+    --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 ```
 
 Checkpoints are written to
-`checkpoints/qwen_hypergraph_filtered/epochs{N}_lora_r{R}_alpha{A}/`.
+`checkpoints/qwen_hypergraphformer/epochs{N}_lora_r{R}_alpha{A}/`.
 
 ### 3. Evaluate the fine-tuned model
 
 Prepare the eval-format directory (one `{id}.txt` per sample):
 
 ```bash
-python scripts/data_preparation.py --mode eval \
+python scripts/data_preparation.py --mode eval --data-format hypergraph \
     --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
     --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test
 ```
@@ -348,9 +357,17 @@ Optionally pass `--aggregate` to merge same-type, spatially adjacent,
 access-connected rooms into single nodes in the output access graphs:
 
 ```bash
-python scripts/data_preparation.py --mode eval --aggregate \
+python scripts/data_preparation.py --mode eval --data-format hypergraph --aggregate \
     --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
     --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated
+```
+
+Prepare WMR24 test data:
+
+```bash
+python scripts/data_preparation.py --mode eval --data-format hypergraph \
+    --input-file dataset/wmr24/wmr24.json \
+    --output-dir dataset/wmr24/test
 ```
 
 Run evaluation (generates hypergraphs + inline scoring):
@@ -358,39 +375,28 @@ Run evaluation (generates hypergraphs + inline scoring):
 ```bash
 # From a local checkpoint (single GPU)
 python scripts/evaluator.py --mode trained \
-    --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
+    --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated \
     --noged --shuffle \
     --output results_eval.json
 
 # From a local checkpoint (multi-GPU)
-accelerate launch --num_processes=8 scripts/evaluator.py --mode trained \
-    --model checkpoints/qwen_hypergraph_filtered/checkpoint-300 \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
-    --noged --shuffle
+torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained \
+    --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated \
+    --noged --shuffle \
+    --vllm-prompt-batch-size 8
 
-# From Hugging Face Hub (full-dataset adapter, default subfolder)
-python scripts/evaluator.py --mode trained --hub \
+# From Hugging Face Hub (full-dataset adapter, default subfolder), with multi-GPU:
+torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
     --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
-    --hub-subfolder qwen_hypergraphformer/checkpoint-8700
-    --noged --shuffle
-
+    --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
+    --noged --shuffle \
+    --vllm-prompt-batch-size 8
 ```
 
-### 4. Evaluate the base model (few-shot, no fine-tuning)
 
-```bash
-# Qwen few-shot (single GPU)
-python scripts/evaluator.py --mode fewshot-qwen \
-    --model Qwen/Qwen3-4B-Instruct-2507 \
-    --dataset-dir eval_format/test
-
-# GPT few-shot (OpenAI API)
-python scripts/evaluator.py --mode fewshot-gpt \
-    --model gpt-4-turbo --dataset-dir eval_format/test
-```
-
-### 5. Procedural Editing and Optimization
+### 4. Procedural Editing and Optimization
 
 After inference, generated hypergraphs can be (a) **procedurally edited** with
 high-level room commands and (b) **parametrically optimized** to refine room
@@ -399,47 +405,31 @@ geometry. Both operate on a `*_hypergraphs.json` file produced by
 
 #### Procedural editing
 
-`scripts/procedural_edits.py` applies a single natural-language-style command to
-one sample or to every sample in the file, validating each edited hypergraph
-before writing it out. Supported commands:
-
-| Command | Effect |
-|---|---|
-| `increase <room>` / `reduce <room>` | Scale a room's area by `--increase-factor` (reduce uses `1/factor`) |
-| `add <new_room> by <anchor_room>` | Split the anchor room's leaf to insert a new room |
-| `delete <room>` | Remove a room and promote its sibling subtree |
-| `swap <room1> and <room2>` | Exchange the two rooms' types and areas |
-| `reorient <deg_ccw> <reflect_mode>` | Rigidly rotate/reflect the BSP (e.g. `reorient 90 normal`, `reorient 0 flip_x`) |
+`scripts/procedural_edits.py` applies a natural-language-style command to one
+sample or all samples. Supported commands: `increase <room>`, `reduce <room>`,
+`add <new_room> by <anchor_room>`, `delete <room>`, `swap <room1> and <room2>`,
+`reorient <deg_ccw> <reflect_mode>`.
 
 ```bash
-# Edit a single sample (writes <sample-id>_<command>.json beside the input)
+# Edit a single sample (writes s-r-0009_increase_kitchen.json beside the input)
 python scripts/procedural_edits.py \
-    --hypergraphs-file path/to/results_test_hypergraphs.json \
-    --sample-id b-0001 \
+    --hypergraphs-file results_test_hypergraphs.json \
+    --sample-id s-r-0009 \
     --command "increase kitchen" \
     --increase-factor 2.0 \
-    --test-dir dataset/rplan/dataset_hypergraph_la0_fixed/test
-
+    --test-dir dataset/wmr24/test
 ```
 
-Each run applies **one** command (via `--command`) to all samples. Run the
-script once per operation, pointing `--output` at a per-operation file. The
-`--all-samples` examples below cover every supported command:
+To apply a command to all samples at once, use `--all-samples`:
 
 ```bash
-TEST_DIR=dataset/rplan/dataset_hypergraph_la0_fixed/test
-HG=path/to/results_test_hypergraphs.json
-
-# add / remove a room
-python scripts/procedural_edits.py --hypergraphs-file $HG --all-samples \
-    --command "add bathroom by bedroom" --test-dir $TEST_DIR \
-    --output edited_add_bathroom.json
-
+python scripts/procedural_edits.py \
+    --hypergraphs-file results_test_hypergraphs.json \
+    --all-samples \
+    --command "increase kitchen" \
+    --increase-factor 2.0 \
+    --test-dir dataset/wmr24/test
 ```
-
-By default the output is written beside the input
-(`<input_stem>_<command>.json` for `--all-samples`, or
-`<sample-id>_<command>.json` for a single sample); override it with `--output`.
 
 #### Automatic post-processing (bulk add/remove + rotate)
 
@@ -533,7 +523,7 @@ merged, optimized hypergraphs are written to
 `metric_progress.csv` convergence trace. The optimized JSON can then be scored
 with `score_results.py` (next section).
 
-### 6. Score saved results (post-inference)
+### 5. Score saved results (post-inference)
 
 Compute any combination of GED, accuracy, delta, and area proportion error
 metrics on saved `*_hypergraphs.json` files:
@@ -562,13 +552,13 @@ python scripts/score_results.py \
     --correct-accessgraph
 ```
 
-### 7. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
+### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
 
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
 dataset.
 
-### 8. Evaluate a single hypergraph (quick test)
+### 7. Evaluate a single hypergraph (quick test)
 
 ```bash
 # Few-shot Qwen on one sample
@@ -580,7 +570,7 @@ python scripts/evaluator.py --mode fewshot-gpt \
     --dataset-dir eval_format/train --max-samples 1
 ```
 
-### 9. Visualize results
+### 8. Visualize results
 
 `utils/visualize_results.py` renders a single sample as two PNGs: a blueprint-style
 floor-plan **mesh** (walls, interior door gaps, entry door, apartment boundary) and
@@ -626,6 +616,21 @@ python scripts/partition_dataset.py -n 1000 \
     --input-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 # → writes sft_1000/ alongside sft/ with subsampled train.jsonl
 #   and unchanged validation.jsonl / test.jsonl
+```
+
+
+
+### Evaluate the base model in few-shot mode (no fine-tuning)
+
+```bash
+# Qwen few-shot (single GPU)
+python scripts/evaluator.py --mode fewshot-qwen \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset-dir eval_format/test
+
+# GPT few-shot (OpenAI API)
+python scripts/evaluator.py --mode fewshot-gpt \
+    --model gpt-4-turbo --dataset-dir eval_format/test
 ```
 
 ---

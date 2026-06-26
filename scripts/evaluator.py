@@ -837,19 +837,45 @@ class TrainedModelEvaluator(Evaluator):
             logger.warning("vLLM not installed; using HuggingFace generate (pip install vllm)")
 
         if use_hub:
-            # ── Hub mode: load LoRA adapter from NikitaKlimenko/HypergraphFormer ──
+            # ── Hub mode: download LoRA adapter files then route through VllmQwenGenerator ──
             HUB_REPO = "NikitaKlimenko/HypergraphFormer"
-            BASE_ID = "Qwen/Qwen3-4B-Instruct-2507"
             subfolder = self.args.hub_subfolder
-            logger.info(f"Loading adapter from Hub: {HUB_REPO}/{subfolder}")
-            if use_vllm:
-                logger.warning("vLLM does not support Hub-based LoRA loading; falling back to HuggingFace generate")
-            from peft import PeftModel
-            tokenizer = AutoTokenizer.from_pretrained(HUB_REPO, subfolder=subfolder)
-            base_model = AutoModelForCausalLM.from_pretrained(BASE_ID, torch_dtype="auto", device_map="auto")
-            model = PeftModel.from_pretrained(base_model, HUB_REPO, subfolder=subfolder)
-            self._raw_model = model
-            self.generator = QwenGenerator(model=model, tokenizer=tokenizer)
+            from huggingface_hub import snapshot_download
+            import os, torch.distributed as dist
+            # Only rank 0 downloads; others wait — avoids 8-way concurrent Hub requests
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if local_rank == 0:
+                logger.info(f"Downloading adapter from Hub: {HUB_REPO}/{subfolder}")
+                local_adapter_dir = snapshot_download(
+                    repo_id=HUB_REPO,
+                    allow_patterns=[f"{subfolder}/*"],
+                )
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if local_rank != 0:
+                local_adapter_dir = snapshot_download(
+                    repo_id=HUB_REPO,
+                    allow_patterns=[f"{subfolder}/*"],
+                    local_files_only=True,
+                )
+            adapter_path = Path(local_adapter_dir) / subfolder
+            with open(adapter_path / "adapter_config.json") as f:
+                cfg = json.load(f)
+            base_name = cfg.get("base_model_name_or_path")
+            if not base_name:
+                raise ValueError("Missing base_model_name_or_path in adapter_config.json")
+            logger.info(f"Hub adapter downloaded to {adapter_path}, base model: {base_name}")
+            self.generator = VllmQwenGenerator(
+                base_name,
+                lora_path=adapter_path,
+                max_tokens=self.args.max_tokens,
+                temperature=self.args.temperature,
+                gpu_memory_utilization=self.args.vllm_gpu_memory,
+                max_model_len=self.args.vllm_max_model_len,
+                tensor_parallel_size=self.args.tensor_parallel,
+                enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+            )
+            self._raw_model = None
             return
 
         # ── Local mode: load from --model path ──
@@ -1378,8 +1404,8 @@ def cli():
     vllm.add_argument(
         "--vllm-max-model-len",
         type=int,
-        default=6900,
-        help="vLLM max_model_len (default: 6900)",
+        default=8192,
+        help="vLLM max_model_len (default: 8192)",
     )
     vllm.add_argument(
         "--tensor-parallel",

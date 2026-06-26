@@ -11,7 +11,7 @@ IMPORTANT: This script runs in offline mode (HF_HUB_OFFLINE=1).
 Make sure the model is cached locally before running:
     python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('Qwen/Qwen3-4B-Instruct-2507')"
 
-Models are saved to: checkpoints/qwen_hypergraph_filtered/epochs{N}_lora_r{R}_alpha{ALPHA}/
+Models are saved to: checkpoints/qwen_hypergraphformer/epochs{N}_lora_r{R}_alpha{ALPHA}/
 
 Usage:
     # Basic training (single GPU, default: 3 epochs, r=64, alpha=128)
@@ -243,7 +243,7 @@ def main():
             lora_suffix = f"epochs{args.epochs}_lora_r{args.lora_r}_alpha{args.lora_alpha}"
         else:
             lora_suffix = f"epochs{args.epochs}_full_finetune"
-        args.output_dir = f"checkpoints/qwen_rplan_filtered/{lora_suffix}"
+        args.output_dir = f"checkpoints/qwen_hypergraphformer/{lora_suffix}"
         logger.info(f"Using default output directory: {args.output_dir}")
     
     # Set CUDA_VISIBLE_DEVICES for single-GPU mode only
