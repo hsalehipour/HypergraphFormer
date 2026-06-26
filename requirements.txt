@@ -5,18 +5,14 @@
 # incompatible combination). Regenerate with `pip freeze` after upgrades.
 
 # ── Core numerics ────────────────────────────────────────────────
-numpy==2.2.6            # NOTE: env uses NumPy 2.x (do not pin <2)
+numpy==1.26.4           # matches the known-good env (vLLM/numba want <2.3 anyway)
 scipy==1.17.1
 
-# ── PyTorch (install the matching CUDA build FIRST) ──────────────
-#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-#       --index-url https://download.pytorch.org/whl/cu124
-# Generic PyPI `torch` is often the wrong CUDA build; install the line above,
-# then `pip install -r requirements.txt`.
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
-triton==3.2.0           # torch/vLLM kernel backend — version is torch-coupled
+# ── PyTorch (CUDA 12.4 build) ────────────────────────────────────
+torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+triton==3.2.0           # torch/vLLM kernel backend (pulled in by torch; pinned for reproducibility)
 
 # ── HuggingFace LLM stack (mutually version-locked) ──────────────
 transformers==4.57.6
@@ -39,6 +35,7 @@ tensorboard==2.20.0
 # is strict about xformers / outlines / xgrammar / torch versions, so pin them
 # together. Requires a CUDA GPU.
 vllm==0.8.5
+flashinfer-python==0.2.5  --find-links https://flashinfer.ai/whl/cu124/torch2.6/  # vLLM LoRA on A100; cu124+torch2.6 build
 xformers==0.0.29.post2  # attention kernels; version must match torch + vllm
 outlines==0.1.11        # structured/guided decoding (vLLM-pinned)
 xgrammar==0.1.18        # grammar-constrained decoding (vLLM-pinned)

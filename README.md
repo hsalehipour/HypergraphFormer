@@ -27,7 +27,7 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 
 | Requirement | Notes |
 |---|---|
-| Python 3.9+ | Tested with 3.11 |
+| Python 3.11 |  |
 | CUDA GPU(s) | Training and evaluation require GPU |
 | .NET Runtime (Mono 6.12+) | Only for the C# hypergraph geometry library |
 | Git | For cloning external dependencies |
@@ -37,27 +37,23 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 ```bash
 # Clone
 git clone https://github.com/hsalehipour/HypergraphFormer.git
-cd HypergraphFormer
 
-# (Recommended) Start a Docker container with CUDA 12.4 + Python 3.11 and mount the repo.
+
+# (If using Docker) Start a Docker container and mount the repo. The pytorch
+# base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed.
 # Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
 
-docker run -it --gpus all --name hypergraphformer \
+docker run -it --gpus all --name hypergraphformer2 \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
-    nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
+    pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
     bash
 
-# Install Python 3.11
-apt update && apt install -y python3.11 python3.11-venv python3-dev python3-pip
-
-
-
 # System dependencies (required to build pygraphviz and the C# geometry library)
-apt install -y --no-install-recommends gcc graphviz libgraphviz-dev git mono-complete nuget curl wget unzip
+apt update && apt install -y --no-install-recommends gcc graphviz libgraphviz-dev git mono-complete nuget curl wget unzip
 
 # Virtual environment
-python3.11 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 
 # Python packages
@@ -74,9 +70,6 @@ cd benchmark && ./setup_houseganpp.sh && cd ..
 ### Download the base model (one-time)
 
 The training script runs in offline mode.  Cache the model first.
-
-`transformers` 5.x requires **PyTorch ≥ 2.4**; if you use CUDA 12.1 wheels (e.g. driver max **CUDA 12.2**), install PyTorch before the snippet:  
-`pip install "torch>=2.4" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
 
 ```bash
 python -c "
@@ -340,17 +333,14 @@ This produces `train.jsonl`, `validation.jsonl`, and `test.jsonl` in
 ### 2. Train with SFT (LoRA fine-tuning)
 
 ```bash
-# Single GPU (default: 3 epochs, LoRA r=64, alpha=128)
+# Single GPU
 python scripts/sft_pipeline.py --gpu 0 \
+    --epochs 5 --lora-r 128 --lora-alpha 256 \
     --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 
 # Multi-GPU with Accelerate
 accelerate launch --num_processes=2 scripts/sft_pipeline.py --multi-gpu \
-    --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
-
-# Custom settings
-python scripts/sft_pipeline.py \
-    --epochs 5 --lora-r 128 --lora-alpha 256 --gpu 0 \
+    --epochs 5 --lora-r 128 --lora-alpha 256 \
     --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 ```
 
@@ -382,23 +372,25 @@ Run evaluation (generates hypergraphs + inline scoring):
 # From a local checkpoint (single GPU)
 python scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated \
+    --dataset-dir dataset/rplan/eval_test \
     --noged --shuffle \
     --output results_eval.json
 
 # From a local checkpoint (multi-GPU)
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated \
+    --dataset-dir dataset/rplan/eval_test \
     --noged --shuffle \
-    --vllm-prompt-batch-size 8
+    --vllm-prompt-batch-size 64 \
+    --output results_eval.json
 
 # From Hugging Face Hub (full-dataset adapter, default subfolder), with multi-GPU:
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
+    --dataset-dir dataset/rplan/eval_test \
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
     --noged --shuffle \
-    --vllm-prompt-batch-size 8
+    --vllm-prompt-batch-size 8 \
+    --output results_eval.json
 ```
 
 
@@ -741,6 +733,12 @@ VLLM_USE_V1=0 torchrun ...
 All evaluation commands in this README already include this flag. If you
 observe high JSON extraction failure rates (>5%) with a LoRA checkpoint,
 check that `VLLM_USE_V1=0` is set.
+
+### Segmentation fault in Triton during vLLM LoRA load
+
+Caused by a release-candidate Python (e.g. Ubuntu 22.04's `python3.11` is
+`3.11.0rc1`). Run `python --version`; if it shows `rc1`, use the pytorch base
+image from [Install](#install), which ships a stable Python 3.11.
 
 ---
 
