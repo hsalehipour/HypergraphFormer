@@ -348,19 +348,11 @@ Checkpoints are written to
 Prepare the eval-format directory (one `{id}.txt` per sample):
 
 ```bash
-python scripts/data_preparation.py --mode eval --data-format hypergraph \
-    --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
-    --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test
+python scripts/data_preparation.py --mode eval --data-format access \
+    --input-file dataset/rplan/dataset_access/data_test.json \
+    --output-dir dataset/rplan/eval_test
 ```
-
-Optionally pass `--aggregate` to merge same-type, spatially adjacent,
-access-connected rooms into single nodes in the output access graphs:
-
-```bash
-python scripts/data_preparation.py --mode eval --data-format hypergraph --aggregate \
-    --input-file dataset/rplan/dataset_hypergraph_la0_fixed/test.json \
-    --output-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated
-```
+See scripts/data_preparation.py for other options to prepare test data directly from the hypergraph format.
 
 Prepare WMR24 test data:
 
