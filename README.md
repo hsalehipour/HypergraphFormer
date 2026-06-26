@@ -381,14 +381,14 @@ python scripts/evaluator.py --mode trained \
     --output results_eval.json
 
 # From a local checkpoint (multi-GPU)
-torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained \
+VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
     --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test_aggregated \
     --noged --shuffle \
     --vllm-prompt-batch-size 8
 
 # From Hugging Face Hub (full-dataset adapter, default subfolder), with multi-GPU:
-torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
+VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
     --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
     --noged --shuffle \
@@ -721,6 +721,20 @@ Required for `pythonnet` to interface with C# DLLs.
 ```bash
 cd benchmark && ./setup_houseganpp.sh
 ```
+
+### Batched LoRA inference produces garbled / invalid JSON outputs
+
+vLLM 0.8.x introduced a V1 engine that has a known bug with batched LoRA
+generation — single-sample inference works correctly but batches of ≥16
+prompts produce corrupt outputs. The fix is to force the stable V0 engine:
+
+```bash
+VLLM_USE_V1=0 torchrun ...
+```
+
+All evaluation commands in this README already include this flag. If you
+observe high JSON extraction failure rates (>5%) with a LoRA checkpoint,
+check that `VLLM_USE_V1=0` is set.
 
 ---
 
