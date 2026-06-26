@@ -96,6 +96,7 @@ class OptimConfig:
     batch_workers: int = 1
     batch_output_dir: str | None = None
     merged_hypergraphs_json: str | None = None
+    quiet: bool = False
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> tuple["OptimConfig", str | None, bool]:
@@ -153,6 +154,8 @@ class OptimConfig:
             "--merged-hypergraphs-json", dest="merged_hypergraphs_json", default=None,
             help="--all only: path for merged optimized hypergraphs.",
         )
+        p.add_argument("--quiet", action="store_true",
+                       help="Suppress per-sample verbose output; only show batch progress.")
         ns = p.parse_args(argv)
 
         if int(ns.batch_workers) < 1:
@@ -178,6 +181,7 @@ class OptimConfig:
             batch_workers=int(ns.batch_workers),
             batch_output_dir=ns.batch_output_dir,
             merged_hypergraphs_json=ns.merged_hypergraphs_json,
+            quiet=bool(ns.quiet),
         )
 
         apt_id = _validate_apt_id(str(ns.apt_id)) if ns.apt_id and not ns.all else None

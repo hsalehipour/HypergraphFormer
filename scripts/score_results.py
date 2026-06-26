@@ -478,7 +478,13 @@ def cli():
     parser.add_argument(
         "--correct-accessgraph",
         action="store_true",
-        help="Apply correct_accessgraph before GED (only affects ged metric).",
+        default=True,
+        help="Apply correct_accessgraph before GED (default: on). Use --no-correct-accessgraph to disable.",
+    )
+    parser.add_argument(
+        "--no-correct-accessgraph",
+        dest="correct_accessgraph",
+        action="store_false",
     )
     parser.add_argument(
         "--ged-timeout", type=float, default=20.0,
