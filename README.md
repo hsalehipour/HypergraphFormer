@@ -43,7 +43,7 @@ git clone https://github.com/hsalehipour/HypergraphFormer.git
 # base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed.
 # Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
 
-docker run -it --gpus all --name hypergraphformer2 \
+docker run -it --gpus all --name hypergraphformer_image \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
     pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
@@ -389,7 +389,7 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evalua
     --dataset-dir dataset/rplan/eval_test \
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
     --noged --shuffle \
-    --vllm-prompt-batch-size 8 \
+    --vllm-prompt-batch-size 64 \
     --output results_eval.json
 ```
 
@@ -418,20 +418,13 @@ python scripts/procedural_edits.py \
     --test-dir dataset/wmr24/test
 ```
 
-To apply a command to all samples at once, use `--all-samples`:
+To apply a command to all samples at once, use `--all-samples`instead of --sample-id
 
-```bash
-python scripts/procedural_edits.py \
-    --hypergraphs-file results_test_hypergraphs.json \
-    --all-samples \
-    --command "increase kitchen" \
-    --increase-factor 2.0 \
-    --test-dir dataset/wmr24/test
-```
+
 
 #### Automatic post-processing (bulk add/remove + rotate)
 
-`scripts/procedural_edits.py` requires you to name each command. To fix up a
+ To process a
 **whole results file automatically**, use `scripts/postprocessing.py`: it
 inspects each predicted hypergraph, decides *which* rooms to add or remove (and
 how to reorient), and applies the edits in bulk. It has two modes via
@@ -439,7 +432,7 @@ how to reorient), and applies the edits in bulk. It has two modes via
 
 | `--pp-mode` | What it does |
 |---|---|
-| `parametric` (default) | Compares each prediction's room multiset against the GT access graph, greedily **plans an add/remove chain** (which room type is missing/extra), and — with `--apply-procedural-step1` — applies it through `procedural_edits`. The `add` anchor is chosen from GT-neighbor room types automatically. |
+| `addremove` (default) | Compares each prediction's room multiset against the GT access graph, greedily **plans an add/remove chain** (which room type is missing/extra), and — with `--apply-procedural-step1` — applies it through `procedural_edits`. The `add` anchor is chosen from GT-neighbor room types automatically. |
 | `orientation` | Bulk **rotate/reflect** search: for every sample tries all 3 mirrors × 4 rotations (90° steps) and keeps the orientation with the lowest δ_sq compactness, subject to the access-graph edge check. |
 
 For gradient-descent split optimization over all samples, use
@@ -449,23 +442,15 @@ For gradient-descent split optimization over all samples, use
 RESULTS=path/to/results_test_hypergraphs.json
 TEST_DIR=dataset/rplan/eval_access/test
 
-# (a) Plan add/remove for every sample WITHOUT editing — just writes the plan
-python scripts/postprocessing.py \
-    --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
-    --output-json parametric_commands.json
-# parametric_commands.json holds, per id, the chosen command + multiset_command_chain
-# (the missing/extra room diff that drove the decision).
 
-# (b) Plan AND apply the add/remove chain in bulk (procedural edits)
-python scripts/postprocessing.py \
+# (a) Plan and apply the add/remove chain in bulk (procedural edits)
+python scripts/postprocessing.py \ --pp-mode addremove \
     --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
     --apply-procedural-step1 \
-    --procedural-steps 5 \
-    --increase-factor 2.0 \
     --workers 16 \
     --output-step1-hypergraphs results_hypergraphs_step1_procedural.json
 
-# (c) Bulk rotate/reflect: pick the best orientation per sample
+# (b) Bulk rotate/reflect: pick the best orientation per sample
 python scripts/postprocessing.py --pp-mode orientation \
     --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
     --workers 16 \
@@ -533,21 +518,6 @@ python scripts/score_results.py \
     --test-dir dataset/hypergraph/test \
     --output-dir eval_output \
     --metrics ged accuracy delta area_proportion_error
-
-# Just GED
-python scripts/score_results.py \
-    --results-file path/to/results_test_hypergraphs.json \
-    --test-dir dataset/hypergraph/test \
-    --output-dir eval_output \
-    --metrics ged
-
-# GED with corrected access graph (mesh-adjacency corrected)
-python scripts/score_results.py \
-    --results-file path/to/results_test_hypergraphs.json \
-    --test-dir dataset/hypergraph/test \
-    --output-dir eval_output \
-    --metrics ged \
-    --correct-accessgraph
 ```
 
 ### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
@@ -556,19 +526,8 @@ See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
 dataset.
 
-### 7. Evaluate a single hypergraph (quick test)
 
-```bash
-# Few-shot Qwen on one sample
-python scripts/evaluator.py --mode fewshot-qwen \
-    --dataset-dir eval_format/train --max-samples 1
-
-# Few-shot GPT on one sample (requires OPENAI_API_KEY in .env)
-python scripts/evaluator.py --mode fewshot-gpt \
-    --dataset-dir eval_format/train --max-samples 1
-```
-
-### 8. Visualize results
+### 7. Visualize results
 
 `utils/visualize_results.py` renders a single sample as two PNGs: a blueprint-style
 floor-plan **mesh** (walls, interior door gaps, entry door, apartment boundary) and
@@ -585,7 +544,7 @@ python -m utils.visualize_results --generated_data --sample-id 19764 \
 
 # RPLAN ground truth: mesh built from room_polygons, access graph from the
 # stored "accessgraph" key (needs a test dir that has room_polygons).
-python -m utils.visualize_results --gt_rplan --sample-id 19764 \
+python -m utils.visualize_results --gt_rplan --sample-id 10018 \
     --test-dir dataset/rplan/eval_access_mid/test --output-dir /tmp/viz
 
 # WMR24 ground truth: mesh + corrected access graph from the embedded hypergraph.
@@ -618,17 +577,38 @@ python scripts/partition_dataset.py -n 1000 \
 
 
 
+### Predict access-graph edges for an input room set
+
+`scripts/qwen_predict_accessgraph_edges.py` uses the fine-tuned LoRA adapter to
+predict `accessgraph.edges` given only the room-type node list in each
+`<eval-test-dir>/<id>.txt`. It writes updated `.txt` files (identical to the
+input, with only the edges replaced) to `--output-dir`, which can then be used
+as a custom eval set.
+
+```bash
+VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+    scripts/qwen_predict_accessgraph_edges.py \
+    --eval-test-dir dataset/wmr24/test \
+    --output-dir dataset/wmr24/test_predicted_edges \
+    --checkpoint checkpoints/qwen_hypergraphformer/checkpoint-8700
+```
+
 ### Evaluate the base model in few-shot mode (no fine-tuning)
 
 ```bash
 # Qwen few-shot (single GPU)
-python scripts/evaluator.py --mode fewshot-qwen \
+VLLM_USE_V1=0 python scripts/evaluator.py --mode fewshot-qwen \
     --model Qwen/Qwen3-4B-Instruct-2507 \
-    --dataset-dir eval_format/test
+    --dataset-dir dataset/wmr24/test \
+    --output outputs/results_fewshot_qwen_wmr24.json
 
-# GPT few-shot (OpenAI API)
+# GPT few-shot (OpenAI API) — requires OPENAI_API_KEY to be set
+export OPENAI_API_KEY=sk-...
 python scripts/evaluator.py --mode fewshot-gpt \
-    --model gpt-4-turbo --dataset-dir eval_format/test
+    --model gpt-4-turbo \
+    --dataset-dir dataset/wmr24/test \
+    --output outputs/results_fewshot_gpt_wmr24.json
+
 ```
 
 ---

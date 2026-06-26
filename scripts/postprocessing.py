@@ -2,7 +2,7 @@
 """
 Post-processing for predicted hypergraphs: two modes via ``--pp-mode``.
 
-* ``parametric`` (default) — greedy add/remove multiset planning + optional procedural edits
+* ``addremove`` (default) — greedy add/remove multiset planning + optional procedural edits
   (``--apply-procedural-step1``). Default ``--procedural-steps 5``.
 * ``orientation`` — BSP reorientation search (3 mirrors × 4 rotations), picks min δ_sq.
 
@@ -640,6 +640,30 @@ def _hypergraph_from_results_value(v: Any) -> dict[str, Any]:
     return v
 
 
+def _parse_jsonish(val):
+    if isinstance(val, str):
+        return json.loads(val)
+    return val
+
+
+def load_eval_access_gt(test_dir: Path, sample_id: str) -> tuple[dict, dict, dict]:
+    path = test_dir / f"{sample_id}.txt"
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    bounds = _parse_jsonish(raw.get("bounds", "{}"))
+    hg = raw.get("hypergraph")
+    if isinstance(hg, str):
+        hg = json.loads(hg)
+    if not isinstance(hg, dict):
+        hg = {}
+    ag = raw.get("accessgraph") or {}
+    if isinstance(ag, str):
+        ag = json.loads(ag)
+    if not isinstance(ag, dict):
+        ag = {}
+    return bounds, hg, ag
+
+
 def run_orientation_mode(
     results: dict[str, dict],
     test_dir: Path,
@@ -649,7 +673,6 @@ def run_orientation_mode(
     workers: int,
     show_progress: bool,
 ) -> None:
-    from scripts.visualize_procedural_edited import load_eval_access_gt
 
     ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
     if max_samples is not None:
@@ -704,7 +727,7 @@ def main() -> int:
     parser.add_argument("--test-dir", type=Path,
         default=REPO_ROOT / "dataset" / "rplan" / "eval_access" / "test")
     parser.add_argument("--output-json", type=Path, default=None,
-        help="Output for parametric commands (default: parametric_commands.json beside --results-hypergraphs).")
+        help="Output for addremove commands (default: addremove_commands.json beside --results-hypergraphs).")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--apply-procedural-step1", action="store_true",
         help="Apply multiset add/remove plan via procedural_edits; writes hypergraph JSON.")
@@ -716,9 +739,9 @@ def main() -> int:
         help="Scaling factor for increase/reduce commands.")
     parser.add_argument("--workers", type=int, default=16, metavar="N",
         help="Parallel spawn processes for procedural/orientation (default: %(default)s).")
-    parser.add_argument("--pp-mode", type=str, default="parametric",
-        choices=("parametric", "orientation"),
-        help="parametric (default) or orientation (BSP 3×4 search). "
+    parser.add_argument("--pp-mode", type=str, default="addremove",
+        choices=("addremove", "orientation"),
+        help="addremove (default) or orientation (BSP 3×4 search). "
              "For GD split optimization use scripts.run_parametric --all.")
     parser.add_argument("--output-orientation", type=Path, default=None,
         help="Orientation output (default: results_hypergraphs_orientation.json).")
@@ -736,8 +759,8 @@ def main() -> int:
             max_samples=args.max_samples, workers=int(args.workers), show_progress=not args.quiet)
         return 0
 
-    # --- parametric mode ---
-    out_path = args.output_json or (args.results_hypergraphs.parent / "parametric_commands.json")
+    # --- addremove mode ---
+    out_path = args.output_json or (args.results_hypergraphs.parent / "addremove_commands.json")
     ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
     if args.max_samples is not None:
         ids = ids[:args.max_samples]
