@@ -29,7 +29,7 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 
 | Requirement | Notes |
 |---|---|
-| Python 3.11 |  |
+| Python 3.11 | Tested with 3.11.11 |
 | CUDA GPU(s) | Training and evaluation require GPU |
 | .NET Runtime (Mono 6.12+) | Only for the C# hypergraph geometry library |
 | Git | For cloning external dependencies |
@@ -41,13 +41,11 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 git clone https://github.com/hsalehipour/HypergraphFormer.git
 
 
-# (If using Docker) Start a Docker container and mount the repo. The pytorch
-# base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed.
-# Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
+# (If using Docker) Start a Docker container and mount the repo. The pytorch base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed. This image is created to be configured with a desired Pytorch and Python version, ensuring that it does not default to Python 3.11.0rc1. If Docker image is not used, the required Pytorch version is specified in the requirements.txt, so it will be installed later regardless. Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
 docker run -it --gpus all --name hypergraphformer_image \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
-    pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
+    pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime \
     bash
 
 # System dependencies (required to build pygraphviz and the C# geometry library)
@@ -225,7 +223,9 @@ HypergraphFormer/
 
 ---
 
-## Preparing the RPLAN Dataset
+## Workflow
+
+### 1. Prepare the RPLAN Dataset
 
 The RPLAN pipeline converts the raw [RPLAN](https://wutomwu.github.io/particulars.html?id=1)
 floor-plan images into BSP-tree hypergraphs.  The automated script handles
@@ -234,18 +234,6 @@ downloading, building, and exporting:
 ```bash
 # Full pipeline (downloads data, exports hypergraphs, fixes access graphs)
 ./prepare_rplan_hypergraph.sh --access
-
-# Reuse existing dataset_access (faster, skips step 3)
-./prepare_rplan_hypergraph.sh
-
-# Clean rebuild of hypergraph data only
-./prepare_rplan_hypergraph.sh --clean
-
-# Also generate debug visualizations of remaining disconnections
-./prepare_rplan_hypergraph.sh --debug
-
-# Override worker count (default: nproc)
-./prepare_rplan_hypergraph.sh -j 32
 ```
 
 The pipeline runs the following steps:
@@ -266,45 +254,9 @@ The pipeline runs the following steps:
 6. **Debug visualization** (`--debug`) — Renders remaining disconnected samples
    for manual inspection → `debug/`
 
-### BSP Conversion Details
+There are options that can be passed to `./prepare_rplan_hypergraph.sh` to run the steps separately to debug. See comments in the `.sh` script.
 
-The native Python BSP converter (`rplan/rplan_to_hypergraph.py`) supports
-several split-selection strategies:
-
-```bash
-# Greedy (fastest)
-python rplan/rplan_to_hypergraph.py --export --lookahead 0 -j 64
-
-# 1-step look-ahead (default)
-python rplan/rplan_to_hypergraph.py --export --lookahead 1 -j 64
-
-# Evolutionary search (slowest, highest quality)
-python rplan/rplan_to_hypergraph.py --export --evolve --evo-pop 100 --evo-gens 30 -j 64
-```
-
-The split selection optimizes for: (1) minimizing the number of cuts through
-adjacent rooms, (2) balanced area splits, and (3) reasonable aspect ratios.
-
-### Visualization
-
-```bash
-# Visualize specific samples (BSP + RGL mesh side by side)
-# Output saved to rplan_rgl_vis/rplan_hg_{id}.png
-python rplan/visualize_rplan_hypergraph.py \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed \
-    --sample 3951 57395
-
-# Visualize disconnected access graphs in a dataset
-python rplan/visualize_disconnected_accessgraphs.py \
-    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug
-
-# Compare before/after access graph fixes
-python rplan/visualize_fixed_accessgraphs.py \
-    --original-dir dataset/rplan/dataset_hypergraph_la0 \
-    --fixed-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug_fixed
-```
-
-### RPLAN Dataset Statistics
+#### RPLAN Dataset Statistics
 
 | Split | Samples |
 |---|---|
@@ -313,11 +265,7 @@ python rplan/visualize_fixed_accessgraphs.py \
 | Test | 12,002 |
 | **Total** | **80,073** |
 
----
-
-## Workflow
-
-### 1. Prepare training data
+### 2. Prepare training data
 
 The RPLAN dataset is pre-split into `train.json`, `validation.json`,
 `test.json` by `prepare_rplan_hypergraph.sh`.  Convert it to the JSONL
@@ -331,7 +279,7 @@ python scripts/data_preparation.py --mode train \
 This produces `train.jsonl`, `validation.jsonl`, and `test.jsonl` in
 `dataset/rplan/dataset_hypergraph_la0_fixed/sft/`.
 
-### 2. Train with SFT (LoRA fine-tuning)
+### 3. Train with SFT (LoRA fine-tuning)
 
 ```bash
 # Single GPU
@@ -348,23 +296,22 @@ accelerate launch --num_processes=2 scripts/sft_pipeline.py --multi-gpu \
 Checkpoints are written to
 `checkpoints/qwen_hypergraphformer/epochs{N}_lora_r{R}_alpha{A}/`.
 
-### 3. Evaluate the fine-tuned model
+### 4. Evaluate the fine-tuned model
 
-Prepare the eval-format directory (one `{id}.txt` per sample):
+Prepare the eval-format directory (one `{id}.txt` per sample) for RPLAN:
 
 ```bash
 python scripts/data_preparation.py --mode eval --data-format access \
     --input-file dataset/rplan/dataset_access/data_test.json \
     --output-dir dataset/rplan/eval_test
 ```
-See scripts/data_preparation.py for other options to prepare test data directly from the hypergraph format.
 
-Prepare WMR24 test data:
+Prepare the eval-format directory for WMR24:
 
 ```bash
 python scripts/data_preparation.py --mode eval --data-format hypergraph \
     --input-file dataset/wmr24/wmr24.json \
-    --output-dir dataset/wmr24/test
+    --output-dir dataset/wmr24/eval_test
 ```
 
 Run evaluation (generates hypergraphs + inline scoring):
@@ -375,7 +322,7 @@ python scripts/evaluator.py --mode trained \
     --model checkpoints/qwen_hypergraphformer/epochs8_lora_r64_alpha128/checkpoint-8700 \
     --dataset-dir dataset/rplan/eval_test \
     --noged --shuffle \
-    --output results_eval.json
+    --output outputs/results_eval.json
 
 # From a local checkpoint (multi-GPU)
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained \
@@ -383,7 +330,7 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evalua
     --dataset-dir dataset/rplan/eval_test \
     --noged --shuffle \
     --vllm-prompt-batch-size 64 \
-    --output results_eval.json
+    --output outputs/results_eval.json
 
 # From Hugging Face Hub (full-dataset adapter, default subfolder), with multi-GPU:
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
@@ -391,18 +338,18 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evalua
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
     --noged --shuffle \
     --vllm-prompt-batch-size 64 \
-    --output results_eval.json
+    --output outputs/results_eval.json
 ```
 
 
-### 4. Procedural Editing and Optimization
+### 5. Procedural Editing and Optimization
 
 After inference, generated hypergraphs can be (a) **procedurally edited** with
 high-level room commands and (b) **parametrically optimized** to refine room
 geometry. Both operate on a `*_hypergraphs.json` file produced by
 `evaluator.py` (a `sample_id → hypergraph` mapping).
 
-#### Procedural editing
+#### 5.1 Procedural editing
 
 `scripts/procedural_edits.py` applies a natural-language-style command to one
 sample or all samples. Supported commands: `increase <room>`, `reduce <room>`,
@@ -416,14 +363,14 @@ python scripts/procedural_edits.py \
     --sample-id s-r-0009 \
     --command "increase kitchen" \
     --increase-factor 2.0 \
-    --test-dir dataset/wmr24/test
+    --test-dir dataset/wmr24/eval_test
 ```
 
 To apply a command to all samples at once, use `--all-samples`instead of --sample-id
 
 
 
-#### Automatic post-processing (bulk add/remove + rotate)
+##### Automatic post-processing (bulk add/remove + rotate)
 
  To process a
 **whole results file automatically**, use `scripts/postprocessing.py`: it
@@ -437,7 +384,7 @@ how to reorient), and applies the edits in bulk. It has two modes via
 | `orientation` | Bulk **rotate/reflect** search: for every sample tries all 3 mirrors × 4 rotations (90° steps) and keeps the orientation with the lowest δ_sq compactness, subject to the access-graph edge check. |
 
 For gradient-descent split optimization over all samples, use
-`run_parametric.py --all` ([Parametric optimization](#parametric-optimization) below).
+`scripts/run_parametric.py --all` ([Parametric optimization](#parametric-optimization) below).
 
 ```bash
 RESULTS=path/to/results_test_hypergraphs.json
@@ -463,11 +410,11 @@ sample (`0` = greedily continue until the room multiset matches GT). Use
 `--max-samples` to dry-run on a handful of ids, and `-q/--quiet` to reduce
 logging. Each mode writes a `sample_id → hypergraph` JSON in the same format as
 the inference results, so the output can be fed straight into
-`score_results.py` (next section) or back into another post-processing pass.
+`scripts/score_results.py` (next section) or back into another post-processing pass.
 For gradient-descent split optimization over all samples, use
-`run_parametric.py --all` (below).
+`scripts/run_parametric.py --all` (below).
 
-#### Parametric optimization
+#### 5.2 Parametric optimization
 
 `scripts/run_parametric.py` refines the BSP area-split fractions of a generated
 hypergraph via projected gradient descent against ground-truth geometry. Three
@@ -486,13 +433,13 @@ or `--all` for batch mode over every id in the results file:
 # Single apartment
 python -m scripts.run_parametric b-0001 \
     --results-hypergraphs path/to/results_test_hypergraphs.json \
-    --test-dir dataset/wmr24/test \
+    --test-dir dataset/wmr24/eval_test \
     --objective delta_epsilon --maxiter 80
 
 # Batch over all samples (parallel), writing a merged optimized JSON
 python -m scripts.run_parametric --all \
     --results-hypergraphs path/to/results_test_hypergraphs.json \
-    --test-dir dataset/wmr24/test \
+    --test-dir dataset/wmr24/eval_test \
     --objective delta_epsilon \
     --batch-workers 64 --gd-lr 0.15 --maxiter 200 \
     --batch-output-dir INFERENCE_RESULTS/<EXPERIMENT>/optimize_delta_epsilon
@@ -505,9 +452,9 @@ merged, optimized hypergraphs are written to
 `<batch-output-dir>/<input_stem>_optimized.json` (override with
 `--merged-hypergraphs-json`), alongside a per-sample metrics CSV and a
 `metric_progress.csv` convergence trace. The optimized JSON can then be scored
-with `score_results.py` (next section).
+with `scripts/score_results.py` (next section).
 
-### 5. Score saved results (post-inference)
+### 6. Score saved results (post-inference)
 
 Compute any combination of GED, accuracy, delta, and area proportion error
 metrics on saved `*_hypergraphs.json` files:
@@ -521,14 +468,14 @@ python scripts/score_results.py \
     --metrics ged accuracy delta area_proportion_error
 ```
 
-### 6. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
+### 7. Benchmark against baselines (HouseGAN++, House-Diffusion, DiffPlanner, iPlan)
 
 See [`benchmark/README.md`](benchmark/README.md) for setting up and evaluating
 the HouseGAN++, House-Diffusion, DiffPlanner, and iPlan baselines on the WMR24
 dataset.
 
 
-### 7. Visualize results
+### 8. Visualize results
 
 `utils/visualize_results.py` renders a single sample as two PNGs: a blueprint-style
 floor-plan **mesh** (walls, interior door gaps, entry door, apartment boundary) and
@@ -540,22 +487,22 @@ pick one flag:
 # generated hypergraph. Bounds are read from <test-dir>/<id>.txt.
 python -m utils.visualize_results --generated_data --sample-id 19764 \
     --hypergraph .../results_hypergraphs.json \
-    --test-dir dataset/rplan/dataset_hypergraph_la0_fixed/test \
-    --output-dir /tmp/viz
+    --test-dir dataset/rplan/eval_test \
+    --output-dir tmp/viz
 
 # RPLAN ground truth: mesh built from room_polygons, access graph from the
 # stored "accessgraph" key (needs a test dir that has room_polygons).
 python -m utils.visualize_results --gt_rplan --sample-id 10018 \
-    --test-dir dataset/rplan/eval_access_mid/test --output-dir /tmp/viz
+    --test-dir dataset/rplan/eval_test --output-dir tmp/viz
 
 # WMR24 ground truth: mesh + corrected access graph from the embedded hypergraph.
 python -m utils.visualize_results --gt_wmr24 --sample-id b-0001 \
-    --test-dir dataset/wmr24/test --output-dir /tmp/viz
+    --test-dir dataset/wmr24/eval_test --output-dir tmp/viz
 ```
 
 Outputs are written as `<id>_mesh.png` and `<id>_accessgraph.png` in `--output-dir`.
 
-**Example output (sample 10007):**
+*Example output (RPLAN sample 10018 ground truth):*
 
 ![Visualization example](visualization_example.png)
 
@@ -568,6 +515,44 @@ The module is also importable: `render_mesh`, `render_accessgraph`, and the
 ## Additional Workflows
 
 Miscellaneous routines that complement the main workflow but are not part of the standard training/evaluation pipeline.
+
+### RPLAN BSP Conversion Details
+
+The native Python BSP converter (`rplan/rplan_to_hypergraph.py`) supports
+several split-selection strategies:
+
+```bash
+# Greedy (fastest)
+python rplan/rplan_to_hypergraph.py --export --lookahead 0 -j 64
+
+# 1-step look-ahead (default)
+python rplan/rplan_to_hypergraph.py --export --lookahead 1 -j 64
+
+# Evolutionary search (slowest, highest quality)
+python rplan/rplan_to_hypergraph.py --export --evolve --evo-pop 100 --evo-gens 30 -j 64
+```
+
+The split selection optimizes for: (1) minimizing the number of cuts through
+adjacent rooms, (2) balanced area splits, and (3) reasonable aspect ratios.
+
+### Visualization of converted samples
+
+```bash
+# Visualize specific samples (BSP + RGL mesh side by side)
+# Output saved to rplan_rgl_vis/rplan_hg_{id}.png
+python rplan/visualize_rplan_hypergraph.py \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed \
+    --sample 3951 57395
+
+# Visualize disconnected access graphs in a dataset
+python rplan/visualize_disconnected_accessgraphs.py \
+    --dataset-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug
+
+# Compare before/after access graph fixes
+python rplan/visualize_fixed_accessgraphs.py \
+    --original-dir dataset/rplan/dataset_hypergraph_la0 \
+    --fixed-dir dataset/rplan/dataset_hypergraph_la0_fixed --output-dir debug_fixed
+```
 
 ### Training on a smaller subset of RPLAN
 
@@ -592,11 +577,22 @@ input, with only the edges replaced) to `--output-dir`, which can then be used
 as a custom eval set.
 
 ```bash
+# From a local checkpoint
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     scripts/qwen_predict_accessgraph_edges.py \
-    --eval-test-dir dataset/wmr24/test \
+    --eval-test-dir dataset/wmr24/eval_test \
     --output-dir dataset/wmr24/test_predicted_edges \
-    --checkpoint checkpoints/qwen_hypergraphformer/checkpoint-8700
+    --checkpoint checkpoints/qwen_hypergraphformer/checkpoint-8700 \
+    --example-id b-0001
+
+# From HuggingFace Hub (downloads to ~/.cache/huggingface automatically)
+VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+    scripts/qwen_predict_accessgraph_edges.py \
+    --eval-test-dir dataset/wmr24/eval_test \
+    --output-dir dataset/wmr24/test_predicted_edges \
+    --hf-repo NikitaKlimenko/HypergraphFormer \
+    --hf-subfolder qwen_hypergraphformer/checkpoint-8700 \
+    --example-id b-0001
 ```
 
 ### Evaluate the base model in few-shot mode (no fine-tuning)
@@ -605,14 +601,14 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 # Qwen few-shot (single GPU)
 VLLM_USE_V1=0 python scripts/evaluator.py --mode fewshot-qwen \
     --model Qwen/Qwen3-4B-Instruct-2507 \
-    --dataset-dir dataset/wmr24/test \
+    --dataset-dir dataset/wmr24/eval_test \
     --output outputs/results_fewshot_qwen_wmr24.json
 
 # GPT few-shot (OpenAI API) — requires OPENAI_API_KEY to be set
 export OPENAI_API_KEY=sk-...
 python scripts/evaluator.py --mode fewshot-gpt \
     --model gpt-4-turbo \
-    --dataset-dir dataset/wmr24/test \
+    --dataset-dir dataset/wmr24/eval_test \
     --output outputs/results_fewshot_gpt_wmr24.json
 
 ```

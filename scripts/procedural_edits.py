@@ -1,5 +1,35 @@
 #!/usr/bin/env python3
-"""Procedural BSP edits: add/delete/resize/swap, ``reorient``."""
+"""
+Procedural edits on generated BSP-tree hypergraphs.
+
+This script applies high-level, natural-language-style room commands to a single
+generated hypergraph (identified by ``--sample-id`` in a ``*_hypergraphs.json``
+results file).  It is the per-sample counterpart to ``postprocessing.py``, which
+applies the same edits in bulk across all results.
+
+Supported commands (passed via ``--command``):
+  increase <room>       — grow the target room by splitting its largest neighbour
+  reduce <room>         — shrink the target room by merging it into a neighbour
+  add <room> by <anchor>— insert a new leaf next to an anchor room
+  delete <room>         — remove the target room, redistributing area to neighbours
+  swap <room1> and <room2> — exchange the room types of two leaves
+  reorient              — rotate/mirror the entire BSP to improve compactness (δ_sq)
+
+The output is a single modified ``*_hypergraphs.json`` written beside the input,
+named ``<input_stem>_<command_slug>.json``.
+
+Usage example (single sample, increase kitchen by factor 2):
+  python scripts/procedural_edits.py \\
+      --hypergraphs-file outputs/results_eval_wmr24_hypergraphs.json \\
+      --sample-id b-0001 \\
+      --command "increase kitchen" \\
+      --increase-factor 2.0 \\
+      --test-dir dataset/wmr24/eval_test
+
+NOTE: Activate the venv before running so the ``hypergraph`` C# geometry library
+is importable:
+  source .venv/bin/activate
+"""
 from __future__ import annotations
 
 import argparse
@@ -35,13 +65,15 @@ def load_bounds(test_dir: Path, sample_id: str) -> dict:
     bounds = raw.get("bounds", {})
     return json.loads(bounds) if isinstance(bounds, str) else bounds
 
+# Maps user-facing room name variants to the canonical type used in the BSP tree.
+# Commands like "increase bathroom" and "increase bath" resolve to the same target.
 ROOM_ALIASES = {
     "bath": "bathroom",
     "bathroom": "bathroom",
     "bed": "bedroom",
     "bedroom": "bedroom",
     "living": "living",
-    "livingroom": "living",  # "living room" -> canonical "livingroom"
+    "livingroom": "living",
     "living_room": "living",
     "kitchen": "kitchen",
     "dining": "dining",

@@ -1,12 +1,51 @@
 #!/usr/bin/env python3
 """
-Post-processing for predicted hypergraphs: two modes via ``--pp-mode``.
+Bulk post-processing for predicted hypergraphs.
 
-* ``addremove`` (default) — greedy add/remove multiset planning + optional procedural edits
-  (``--apply-procedural-step1``). Default ``--procedural-steps 5``.
-* ``orientation`` — BSP reorientation search (3 mirrors × 4 rotations), picks min δ_sq.
+Applies two types of correction to a full ``*_hypergraphs.json`` results file
+(the ``sample_id → hypergraph`` mapping produced by ``scripts/evaluator.py``).
+Select the mode with ``--pp-mode``:
 
-For gradient-descent split optimization, use ``scripts.run_parametric --all``.
+addremove (default)
+    Compares each predicted hypergraph's room multiset against the ground-truth
+    access graph, greedily plans a chain of add/remove edits to fix mismatches,
+    and — with ``--apply-procedural-step1`` — applies them via
+    ``scripts/procedural_edits.py``.  The anchor room for ``add`` is chosen
+    automatically from GT-neighbour room types.  ``--procedural-steps N`` caps
+    how many edits are applied per sample (0 = greedy until the multiset matches).
+    Writes a new ``*_hypergraphs.json`` whose samples are the corrected hypergraphs.
+
+orientation
+    Searches all 3 mirrors × 4 rotations (90° steps) for each predicted
+    hypergraph and keeps the orientation with the lowest δ_sq compactness score,
+    subject to an access-graph edge check against the ground truth.
+    Writes a new ``*_hypergraphs.json`` with the best-oriented hypergraphs.
+
+Both modes use ``multiprocessing`` spawn workers for parallelism (``--workers``).
+The output JSON has the same ``sample_id → hypergraph`` format as the input and
+can be fed directly into ``scripts/score_results.py`` or another post-processing pass.
+
+For gradient-descent BSP area-split optimisation, use ``scripts/run_parametric --all``
+on the output of this script.
+
+Typical usage (WMR24 dataset):
+  # Step 1 — fix room multiset mismatches
+  python scripts/postprocessing.py --pp-mode addremove \\
+      --results-hypergraphs outputs/results_eval_wmr24_hypergraphs.json \\
+      --test-dir dataset/wmr24/eval_test \\
+      --apply-procedural-step1 --workers 16 \\
+      --output-step1-hypergraphs outputs/results_eval_wmr24_hypergraphs_step1_procedural.json
+
+  # Step 2 — fix orientation
+  python scripts/postprocessing.py --pp-mode orientation \\
+      --results-hypergraphs outputs/results_eval_wmr24_hypergraphs_step1_procedural.json \\
+      --test-dir dataset/wmr24/eval_test \\
+      --workers 16 \\
+      --output-orientation outputs/results_eval_wmr24_hypergraphs_orientation.json
+
+NOTE: Activate the venv before running so the ``hypergraph`` C# geometry library
+is importable:
+  source .venv/bin/activate
 """
 from __future__ import annotations
 
