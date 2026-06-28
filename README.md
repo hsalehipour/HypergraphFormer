@@ -23,6 +23,38 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 
 ---
 
+## Table of Contents
+
+- [Quick Setup](#quick-setup)
+  - [Prerequisites](#prerequisites)
+  - [Install](#install)
+  - [Download the base model](#download-the-base-model-one-time)
+  - [Load the fine-tuned adapters from the Hub](#load-the-fine-tuned-adapters-from-the-hub)
+- [Repository Structure](#repository-structure)
+- [Workflow](#workflow)
+  - [1. Prepare the RPLAN Dataset](#1-prepare-the-rplan-dataset)
+  - [2. Prepare training data](#2-prepare-training-data)
+  - [3. Train with SFT (LoRA fine-tuning)](#3-train-with-sft-lora-fine-tuning)
+  - [4. Evaluate the fine-tuned model](#4-evaluate-the-fine-tuned-model)
+  - [5. Procedural Editing and Optimization](#5-procedural-editing-and-optimization)
+  - [6. Score saved results](#6-score-saved-results-post-inference)
+  - [7. Benchmark against baselines](#7-benchmark-against-baselines-houseganPP-house-diffusion-diffplanner-iplan)
+  - [8. Visualize results](#8-visualize-results)
+- [Additional Workflows](#additional-workflows)
+  - [RPLAN BSP Conversion Details](#rplan-bsp-conversion-details)
+  - [Visualization of converted samples](#visualization-of-converted-samples)
+  - [Training on a smaller subset of RPLAN](#training-on-a-smaller-subset-of-rplan)
+  - [Predict access-graph edges for an input room set](#predict-access-graph-edges-for-an-input-room-set)
+  - [Evaluate the base model in few-shot mode](#evaluate-the-base-model-in-few-shot-mode-no-fine-tuning)
+- [Key Concepts](#key-concepts)
+- [Shared Modules](#shared-modules)
+- [External Dependencies](#external-dependencies)
+- [Troubleshooting](#troubleshooting)
+- [Datasets](#datasets)
+- [Citation](#citation)
+
+---
+
 ## Quick Setup
 
 ### Prerequisites
@@ -41,7 +73,11 @@ and HouseGAN++ while requiring significantly less training data and allowing con
 git clone https://github.com/hsalehipour/HypergraphFormer.git
 
 
-# (If using Docker) Start a Docker container and mount the repo. The pytorch base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed. This image is created to be configured with a desired Pytorch and Python version, ensuring that it does not default to Python 3.11.0rc1. If Docker image is not used, the required Pytorch version is specified in the requirements.txt, so it will be installed later regardless. Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
+# (If using Docker) Start a container and mount the repo.
+# The pytorch base image ships a stable Python 3.11 + CUDA 12.4.
+# This image avoids defaulting to Python 3.11.0rc1.
+# If not using Docker, the required PyTorch version is in requirements.txt.
+# Run from the parent directory of HypergraphFormer (e.g. your workspace root).
 docker run -it --gpus all --name hypergraphformer_image \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
@@ -58,7 +94,7 @@ source .venv/bin/activate
 # Python packages
 pip install -r requirements.txt
 
-# Editable install (makes utils, scripts, benchmark, msd, rplan importable as packages)
+# Editable install (makes utils, scripts, benchmark, msd, rplan importable)
 pip install -e .
 
 # External repos (geometry library + HouseGAN++ baseline)
@@ -332,7 +368,7 @@ VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evalua
     --vllm-prompt-batch-size 64 \
     --output outputs/results_eval.json
 
-# From Hugging Face Hub (full-dataset adapter, default subfolder), with multi-GPU:
+# From Hugging Face Hub (full-dataset adapter), with multi-GPU:
 VLLM_USE_V1=0 torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/evaluator.py --mode trained --hub \
     --dataset-dir dataset/rplan/eval_test \
     --hub-subfolder qwen_hypergraphformer/checkpoint-8700 \
@@ -392,7 +428,7 @@ TEST_DIR=dataset/rplan/eval_access/test
 
 
 # (a) Plan and apply the add/remove chain in bulk (procedural edits)
-python scripts/postprocessing.py \ --pp-mode addremove \
+python scripts/postprocessing.py --pp-mode addremove \
     --results-hypergraphs $RESULTS --test-dir $TEST_DIR \
     --apply-procedural-step1 \
     --workers 16 \
@@ -495,7 +531,7 @@ python -m utils.visualize_results --generated_data --sample-id 19764 \
 python -m utils.visualize_results --gt_rplan --sample-id 10018 \
     --test-dir dataset/rplan/eval_test --output-dir tmp/viz
 
-# WMR24 ground truth: mesh + corrected access graph from the embedded hypergraph.
+# WMR24 ground truth: mesh + access graph from the embedded hypergraph.
 python -m utils.visualize_results --gt_wmr24 --sample-id b-0001 \
     --test-dir dataset/wmr24/eval_test --output-dir tmp/viz
 ```
