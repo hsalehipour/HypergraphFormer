@@ -2,6 +2,8 @@
 
 **Learning Hypergraph Representation with Large Language Models for Controllable Floor-Plan Generation**
 
+![HypergraphFormer overview](main_figure.png)
+
 This repository contains the code for *HypergraphFormer*, a novel approach to
 automatic floor-plan generation based on learning hypergraph representations
 with large language models.  An instruction-fine-tuned **Qwen 3-4B** model
@@ -42,7 +44,6 @@ git clone https://github.com/hsalehipour/HypergraphFormer.git
 # (If using Docker) Start a Docker container and mount the repo. The pytorch
 # base image ships a stable Python 3.11 + CUDA 12.4, so no Python install needed.
 # Run this from the parent directory of HypergraphFormer (e.g. your workspace root).
-
 docker run -it --gpus all --name hypergraphformer_image \
     -v "$(pwd)":/workspace \
     -w /workspace/HypergraphFormer \
@@ -553,6 +554,11 @@ python -m utils.visualize_results --gt_wmr24 --sample-id b-0001 \
 ```
 
 Outputs are written as `<id>_mesh.png` and `<id>_accessgraph.png` in `--output-dir`.
+
+**Example output (sample 10007):**
+
+![Visualization example](visualization_example.png)
+
 The module is also importable: `render_mesh`, `render_accessgraph`, and the
 `visualize_*` mode functions accept a `save_path` — pass a path to write a PNG, or
 `None` to get the live matplotlib `Figure` back for embedding in other scripts.

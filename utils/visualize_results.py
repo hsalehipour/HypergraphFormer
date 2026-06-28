@@ -896,7 +896,7 @@ def _render_mesh(mesh, polygon, *, door_pairs, entry_idx, face_labels,
         face_labels=[_room_type_label(lbl) for lbl in face_labels],
         door_pairs=door_pairs,
         entry_door_face_idx=entry_idx,
-        show_title=False, show_area=False, show_frame=False,
+        show_title=True, show_area=False, show_frame=False,
     )
     ax.invert_yaxis()
     return _save_or_return(fig, save_path)
@@ -1028,9 +1028,9 @@ def visualize_generated(sample_id: str, hypergraph_json: Path, test_dir: Path, *
     plotter = HypergraphPlotter()
     pfx = f"{sid} " if sid else ""
     mesh = render_mesh(hg_dict, bounds, save_path=mesh_path,
-                       title=f"{pfx}Floor Plan".strip(), plotter=plotter)
+                       title=f"{pfx}Mesh".strip(), plotter=plotter)
     ag = render_accessgraph(hg_dict, bounds, save_path=accessgraph_path,
-                            title=f"{pfx}Corrected Access Graph".strip(), plotter=plotter)
+                            title=f"{pfx}Access Graph".strip(), plotter=plotter)
     return mesh, ag
 
 
@@ -1044,9 +1044,9 @@ def visualize_gt_rplan(sample_id: str, test_dir: Path, *,
     plotter = HypergraphPlotter()
     pfx = f"{sample_id} "
     mesh = render_mesh_from_polygons(rooms, bounds, ag, save_path=mesh_path,
-                                     title=f"{pfx}GT Floor Plan".strip(), plotter=plotter)
+                                     title=f"{pfx}Mesh".strip(), plotter=plotter)
     ag_res = render_accessgraph_from_dict(ag, save_path=accessgraph_path,
-                                          title=f"{pfx}GT Access Graph".strip(),
+                                          title=f"{pfx}Access Graph".strip(),
                                           plotter=plotter)
     return mesh, ag_res
 
@@ -1061,9 +1061,9 @@ def visualize_gt_wmr24(sample_id: str, test_dir: Path, *,
     plotter = HypergraphPlotter()
     pfx = f"{sample_id} "
     mesh = render_mesh(hg_dict, bounds, save_path=mesh_path,
-                       title=f"{pfx}GT Floor Plan".strip(), plotter=plotter)
+                       title=f"{pfx}Mesh".strip(), plotter=plotter)
     ag = render_accessgraph(hg_dict, bounds, save_path=accessgraph_path,
-                            title=f"{pfx}GT Corrected Access Graph".strip(), plotter=plotter)
+                            title=f"{pfx}Access Graph".strip(), plotter=plotter)
     return mesh, ag
 
 
