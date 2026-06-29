@@ -253,7 +253,10 @@ def convert_to_jsonl(args) -> int:
 
     for split in splits:
         logger.info(f"\nProcessing {split} split...")
-        samples = load_json_split(dataset_dir / f"{split}.json")
+        path = dataset_dir / f"{split}.json"
+        if not path.exists() and split == "validation":
+            path = dataset_dir / "val.json"
+        samples = load_json_split(path)
 
         if not samples:
             logger.warning(f"No samples found for {split}")

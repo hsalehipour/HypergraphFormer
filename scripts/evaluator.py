@@ -831,11 +831,56 @@ class TrainedModelEvaluator(Evaluator):
     def load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_path = Path(self.args.model)
-        is_lora = (model_path / "adapter_config.json").exists()
+        use_hub = getattr(self.args, "hub", False)
         use_vllm = not getattr(self.args, "no_vllm", False) and VLLM_AVAILABLE
         if not getattr(self.args, "no_vllm", False) and not VLLM_AVAILABLE:
             logger.warning("vLLM not installed; using HuggingFace generate (pip install vllm)")
+
+        if use_hub:
+            # ── Hub mode: download LoRA adapter files then route through VllmQwenGenerator ──
+            HUB_REPO = "NikitaKlimenko/HypergraphFormer"
+            subfolder = self.args.hub_subfolder
+            from huggingface_hub import snapshot_download
+            import os, torch.distributed as dist
+            # Only rank 0 downloads; others wait — avoids 8-way concurrent Hub requests
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if local_rank == 0:
+                logger.info(f"Downloading adapter from Hub: {HUB_REPO}/{subfolder}")
+                local_adapter_dir = snapshot_download(
+                    repo_id=HUB_REPO,
+                    allow_patterns=[f"{subfolder}/*"],
+                )
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if local_rank != 0:
+                local_adapter_dir = snapshot_download(
+                    repo_id=HUB_REPO,
+                    allow_patterns=[f"{subfolder}/*"],
+                    local_files_only=True,
+                )
+            adapter_path = Path(local_adapter_dir) / subfolder
+            with open(adapter_path / "adapter_config.json") as f:
+                cfg = json.load(f)
+            base_name = cfg.get("base_model_name_or_path")
+            if not base_name:
+                raise ValueError("Missing base_model_name_or_path in adapter_config.json")
+            logger.info(f"Hub adapter downloaded to {adapter_path}, base model: {base_name}")
+            self.generator = VllmQwenGenerator(
+                base_name,
+                lora_path=adapter_path,
+                max_tokens=self.args.max_tokens,
+                temperature=self.args.temperature,
+                gpu_memory_utilization=self.args.vllm_gpu_memory,
+                max_model_len=self.args.vllm_max_model_len,
+                tensor_parallel_size=self.args.tensor_parallel,
+                enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+            )
+            self._raw_model = None
+            return
+
+        # ── Local mode: load from --model path ──
+        model_path = Path(self.args.model)
+        is_lora = (model_path / "adapter_config.json").exists()
 
         if use_vllm:
             if is_lora:
@@ -877,10 +922,9 @@ class TrainedModelEvaluator(Evaluator):
             if not base_name:
                 raise ValueError("Missing base_model_name_or_path in adapter_config.json")
             logger.info(f"LoRA adapter detected, base model: {base_name}")
-
+            from peft import PeftModel
             tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             base_model = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=torch.float16)
-            from peft import PeftModel
             model = PeftModel.from_pretrained(base_model, str(model_path))
         else:
             tokenizer = AutoTokenizer.from_pretrained(self.args.model, local_files_only=True)
@@ -1298,6 +1342,27 @@ def cli():
 
     # Trained / rooms-only
     parser.add_argument("--model", type=str, default=None)
+    parser.add_argument(
+        "--hub",
+        action="store_true",
+        help=(
+            "Load adapter from Hugging Face Hub (NikitaKlimenko/HypergraphFormer) "
+            "instead of a local path. Use --hub-subfolder to select the checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--hub-subfolder",
+        type=str,
+        default="qwen_hypergraphformer/checkpoint-8700",
+        help=(
+            "Subfolder inside NikitaKlimenko/HypergraphFormer to load. "
+            "Default: qwen_hypergraphformer/checkpoint-8700 (full dataset). "
+            "Other options: qwen_hypergraphformer_1000_samples/checkpoint-240, "
+            "qwen_hypergraphformer_5000_samples/checkpoint-750, "
+            "qwen_hypergraphformer_10000_samples/checkpoint-1500, "
+            "qwen_hypergraphformer_25000_samples/checkpoint-3900."
+        ),
+    )
     parser.add_argument("--noged", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
@@ -1339,8 +1404,8 @@ def cli():
     vllm.add_argument(
         "--vllm-max-model-len",
         type=int,
-        default=6900,
-        help="vLLM max_model_len (default: 6900)",
+        default=8192,
+        help="vLLM max_model_len (default: 8192)",
     )
     vllm.add_argument(
         "--tensor-parallel",
@@ -1373,7 +1438,10 @@ def cli():
         elif args.mode == "fewshot-gpt":
             args.model = "gpt-4"
         elif args.mode in ("trained", "rooms-only"):
-            parser.error(f"--model is required for --mode {args.mode}")
+            if getattr(args, "hub", False):
+                args.model = "NikitaKlimenko/HypergraphFormer"  # placeholder for output filename
+            else:
+                parser.error(f"--model is required for --mode {args.mode} (or pass --hub to load from Hugging Face Hub)")
 
     if args.output is None:
         args.output = f"results_{args.mode.replace('-', '_')}_{Path(args.model).name}_{args.seed}.json"

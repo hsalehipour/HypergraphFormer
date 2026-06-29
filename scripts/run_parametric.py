@@ -51,12 +51,12 @@ from utils.metrics import (  # noqa: E402
     produce_room_list_from_polygons,
 )
 
-MIN_SPLIT, MAX_SPLIT = 0.15, 0.85
-ACCESSGRAPH_VIOLATION_WEIGHT = 0.05
-OBJECTIVES = ("delta", "delta_epsilon", "epsilon")
-DEFAULT_WMR24_RESULTS = REPO_ROOT / "inference_8700_on_wmr24_inference_vllm_64" / "results_hypergraphs.json"
-
 from utils_parametric import (  # noqa: E402
+    ACCESSGRAPH_VIOLATION_WEIGHT,
+    DEFAULT_WMR24_RESULTS,
+    MAX_SPLIT,
+    MIN_SPLIT,
+    OBJECTIVES,
     OptimConfig,
     _delta_metric_square_from_room_list,
     _bedroom_group_from_accessgraph,
@@ -179,7 +179,8 @@ def optimize_hypergraph(
         bounds=bounds,
         file_fallback=accessgraph if isinstance(accessgraph, dict) else {},
     )
-    print(f"Accessgraph edge penalty: {len(ag_target.get('edges') or [])} edges")
+    if not config.quiet:
+        print(f"Accessgraph edge penalty: {len(ag_target.get('edges') or [])} edges")
 
     if isinstance(ag_target, dict) and (ag_target.get("nodes") or ag_target.get("edges")):
         bedroom_group = _bedroom_group_from_accessgraph(ag_target)
@@ -190,7 +191,8 @@ def optimize_hypergraph(
     expected_counts = leaf_counts or _expected_counts_from_accessgraph(
         accessgraph if isinstance(accessgraph, dict) else {}
     )
-    print(f"Bedroom group: {bedroom_group}, leaf counts: {expected_counts}")
+    if not config.quiet:
+        print(f"Bedroom group: {bedroom_group}, leaf counts: {expected_counts}")
 
     # ── RGL meshes for GT + initial ──────────────────────────────────────
     RGL, Collections = init_rgl()
@@ -219,10 +221,11 @@ def optimize_hypergraph(
         original_mesh, group=bedroom_group, expected_counts=expected_counts,
     )
     orig_eps_gt = _epsilon_vs_gt_or_polygons(original_mesh, gt_mesh, room_polygons)
-    print(
-        f"Original  soft_δ={orig_delta_gt:.6f}  δ_sq={orig_delta_sq:.6f}  "
-        f"ε(ref)={orig_eps_ref:.6f}  ε(GT)={orig_eps_gt:.6f}"
-    )
+    if not config.quiet:
+        print(
+            f"Original  soft_δ={orig_delta_gt:.6f}  δ_sq={orig_delta_sq:.6f}  "
+            f"ε(ref)={orig_eps_ref:.6f}  ε(GT)={orig_eps_gt:.6f}"
+        )
 
     delta_scale: float = 1.0
     if objective == "delta":
@@ -232,15 +235,17 @@ def optimize_hypergraph(
     else:  # delta_epsilon
         delta_scale = float(orig_eps_ref) / max(float(orig_delta_sq), 1e-9)
         original_metric = 0.5 * (delta_scale * orig_delta_sq) + 0.5 * orig_eps_ref
-        print(f"delta_epsilon: delta_scale={delta_scale:.3f}  initial={original_metric:.6f}")
+        if not config.quiet:
+            print(f"delta_epsilon: delta_scale={delta_scale:.3f}  initial={original_metric:.6f}")
 
     # ── Collect splits ────────────────────────────────────────────────────
     annotate_area_splits(original_hg)
     _, split_vals = collect_area_splits(original_hg)
-    if split_vals:
-        print(f"\n{len(split_vals)} area_split params, range=[{min(split_vals):.3f}, {max(split_vals):.3f}]")
-    else:
-        print("\nNo area_split params; nothing to optimize.")
+    if not config.quiet:
+        if split_vals:
+            print(f"\n{len(split_vals)} area_split params, range=[{min(split_vals):.3f}, {max(split_vals):.3f}]")
+        else:
+            print("\nNo area_split params; nothing to optimize.")
 
     # ── Eval closure (objective + accessgraph penalty) ───────────────────
     ag_eval_counter = 0
@@ -274,11 +279,12 @@ def optimize_hypergraph(
                     ag_fail_count += 1
                     if ag_first_fail_eval is None:
                         ag_first_fail_eval = ag_eval_counter
-                        print(
-                            f"Accessgraph violation at eval#{ag_eval_counter}: "
-                            f"penalty=+{penalty:.3f} ({n_failed} edge(s) failing)",
-                            flush=True,
-                        )
+                        if not config.quiet:
+                            print(
+                                f"Accessgraph violation at eval#{ag_eval_counter}: "
+                                f"penalty=+{penalty:.3f} ({n_failed} edge(s) failing)",
+                                flush=True,
+                            )
                     if len(ag_fail_evals_sample) < 50:
                         ag_fail_evals_sample.append(ag_eval_counter)
 
@@ -320,11 +326,12 @@ def optimize_hypergraph(
         metric_trace = [float(f0)]
         best_trace = [float(f0)]
 
-        print(
-            f"\nGD: steps={n_steps} lr={lr:.4f} fd_eps={fd_eps:.4f} "
-            f"patience={patience} ftol={ftol:g}",
-            flush=True,
-        )
+        if not config.quiet:
+            print(
+                f"\nGD: steps={n_steps} lr={lr:.4f} fd_eps={fd_eps:.4f} "
+                f"patience={patience} ftol={ftol:g}",
+                flush=True,
+            )
         xk = x0.copy()
         since_improved = 0
         steps_taken = 0
@@ -341,20 +348,23 @@ def optimize_hypergraph(
             metric_trace.append(float(f))
             best_trace.append(float(best["f"]))
             if patience > 0 and since_improved >= patience:
-                print(
-                    f"GD early-stop at step {steps_taken}: "
-                    f"best f={best['f']:.6f} stable for {patience} steps "
-                    f"(saved {n_steps - steps_taken} steps).",
-                    flush=True,
-                )
+                if not config.quiet:
+                    print(
+                        f"GD early-stop at step {steps_taken}: "
+                        f"best f={best['f']:.6f} stable for {patience} steps "
+                        f"(saved {n_steps - steps_taken} steps).",
+                        flush=True,
+                    )
                 break
         else:
-            print(f"GD done at maxiter={n_steps}: best f={best['f']:.6f}")
+            if not config.quiet:
+                print(f"GD done at maxiter={n_steps}: best f={best['f']:.6f}")
 
         _, best_hg = _eval(best["x"])
         leaf_stats = validate_leaf_area_floor(best_hg)[1]
 
-    print(f"Leaf-area floor: min_observed={leaf_stats.get('min_observed_leaf_frac', 0):.4f}")
+    if not config.quiet:
+        print(f"Leaf-area floor: min_observed={leaf_stats.get('min_observed_leaf_frac', 0):.4f}")
 
     # ── Final metrics on the best hypergraph ─────────────────────────────
     best_mesh = hypergraph_bounds_to_mesh(
@@ -400,12 +410,13 @@ def optimize_hypergraph(
     }
 
     fmt = lambda v: format(v, ".2g") if math.isfinite(v) else "nan"  # noqa: E731
-    print("\n=== Metrics (lower is better) ===")
-    for k, lbl in (("delta_metric", "soft_δ(GT)"), ("delta_metric_square", "δ_sq"),
-                   ("epsilon_metric", "ε(GT)"), ("epsilon_metric_ref", "ε(ref)")):
-        o, n = metrics_original[k], metrics_optimized[k]
-        print(f"  {lbl:<14}  orig={fmt(o)}  opt={fmt(n)}  Δ={fmt(n - o)}")
-    print(f"Objective {objective}: best={best_metric:.6f} (Δ {best_metric - original_metric:+.6f})")
+    if not config.quiet:
+        print("\n=== Metrics (lower is better) ===")
+        for k, lbl in (("delta_metric", "soft_δ(GT)"), ("delta_metric_square", "δ_sq"),
+                       ("epsilon_metric", "ε(GT)"), ("epsilon_metric_ref", "ε(ref)")):
+            o, n = metrics_original[k], metrics_optimized[k]
+            print(f"  {lbl:<14}  orig={fmt(o)}  opt={fmt(n)}  Δ={fmt(n - o)}")
+        print(f"Objective {objective}: best={best_metric:.6f} (Δ {best_metric - original_metric:+.6f})")
 
     return (
         best_hg, float(best_metric), float(original_metric), gt_hg,
@@ -423,11 +434,16 @@ def optimize_hypergraph(
 _POOL_RGL: tuple[object, object] = (None, None)
 
 
-def _pool_init() -> None:
+def _pool_init(quiet: bool = False) -> None:
     """ProcessPool initializer: one RGL per worker, single-threaded BLAS."""
     global _POOL_RGL
+    import logging
+    import warnings
     for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(k, "1")
+    if quiet:
+        logging.disable(logging.WARNING)
+        warnings.filterwarnings("ignore")
     try:
         _POOL_RGL = init_rgl()
     except Exception:
@@ -548,13 +564,13 @@ def _run_batch(config: OptimConfig) -> None:
             all_traces.append((_id, mt, bt))
 
     if workers == 1:
-        rgl, col = init_rgl() if True else (None, None)
+        rgl, col = init_rgl()
         for k, _id in enumerate(ids, start=1):
             print(f"\n[{k}/{len(ids)}] {_id}")
             _accumulate(*_process_one_apt(_id, config, results[_id], grpo_file_path, rgl, col))
     else:
         tasks = [(_id, config, results[_id], str(grpo_file_path), str(batch_root)) for _id in ids]
-        with ProcessPoolExecutor(max_workers=workers, initializer=_pool_init) as ex:
+        with ProcessPoolExecutor(max_workers=workers, initializer=_pool_init, initargs=(config.quiet,)) as ex:
             for k, result in enumerate(ex.map(_pool_entry, tasks), start=1):
                 print(f"\n[{k}/{len(ids)}] done {result[0].get('id','')} status={result[0].get('status','')}", flush=True)
                 _accumulate(*result)
@@ -596,7 +612,12 @@ def _run_single(config: OptimConfig, apt_id: str) -> None:
 
 
 def main() -> None:
+    import logging
+    import warnings
     config, apt_id, run_all = OptimConfig.from_args()
+    if config.quiet:
+        logging.disable(logging.WARNING)
+        warnings.filterwarnings("ignore")
     if run_all:
         _run_batch(config)
     elif apt_id:

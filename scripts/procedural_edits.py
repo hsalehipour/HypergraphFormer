@@ -1,5 +1,35 @@
 #!/usr/bin/env python3
-"""Procedural BSP edits: add/delete/resize/swap, ``reorient``."""
+"""
+Procedural edits on generated BSP-tree hypergraphs.
+
+This script applies high-level, natural-language-style room commands to a single
+generated hypergraph (identified by ``--sample-id`` in a ``*_hypergraphs.json``
+results file).  It is the per-sample counterpart to ``postprocessing.py``, which
+applies the same edits in bulk across all results.
+
+Supported commands (passed via ``--command``):
+  increase <room>       — grow the target room by splitting its largest neighbour
+  reduce <room>         — shrink the target room by merging it into a neighbour
+  add <room> by <anchor>— insert a new leaf next to an anchor room
+  delete <room>         — remove the target room, redistributing area to neighbours
+  swap <room1> and <room2> — exchange the room types of two leaves
+  reorient              — rotate/mirror the entire BSP to improve compactness (δ_sq)
+
+The output is a single modified ``*_hypergraphs.json`` written beside the input,
+named ``<input_stem>_<command_slug>.json``.
+
+Usage example (single sample, increase kitchen by factor 2):
+  python scripts/procedural_edits.py \\
+      --hypergraphs-file outputs/results_eval_wmr24_hypergraphs.json \\
+      --sample-id b-0001 \\
+      --command "increase kitchen" \\
+      --increase-factor 2.0 \\
+      --test-dir dataset/wmr24/eval_test
+
+NOTE: Activate the venv before running so the ``hypergraph`` C# geometry library
+is importable:
+  source .venv/bin/activate
+"""
 from __future__ import annotations
 
 import argparse
@@ -16,18 +46,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.zero_shot_edits import load_bounds, load_hypergraph
 from utils.hypergraph import Hypergraph
 
 logger = logging.getLogger(__name__)
 
+
+def load_hypergraph(path: Path, sample_id: str) -> dict:
+    """Load one ``sample_id`` entry from a ``sample_id→hypergraph`` JSON file."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data[str(sample_id)]
+
+
+def load_bounds(test_dir: Path, sample_id: str) -> dict:
+    """Load ``bounds`` from ``<test_dir>/<sample_id>.txt`` (a JSON record)."""
+    with open(test_dir / f"{sample_id}.txt", encoding="utf-8") as f:
+        raw = json.load(f)
+    bounds = raw.get("bounds", {})
+    return json.loads(bounds) if isinstance(bounds, str) else bounds
+
+# Maps user-facing room name variants to the canonical type used in the BSP tree.
+# Commands like "increase bathroom" and "increase bath" resolve to the same target.
 ROOM_ALIASES = {
     "bath": "bathroom",
     "bathroom": "bathroom",
     "bed": "bedroom",
     "bedroom": "bedroom",
     "living": "living",
-    "livingroom": "living",  # "living room" -> canonical "livingroom"
+    "livingroom": "living",
     "living_room": "living",
     "kitchen": "kitchen",
     "dining": "dining",
@@ -282,50 +328,6 @@ def reorient_hypergraph_bsp(hypergraph: dict, deg_ccw: float, reflect_mode: str)
     _apply_bsp_orientation_inplace(out, float(deg_ccw), code)
     recompute_areas(out)
     return out
-
-
-def swap_l_r_letters_in_string(s: str) -> str:
-    """
-    Map every ``L`` to ``R`` and every ``R`` to ``L`` in the string (ASCII, uppercase
-    only). Used for structural BSP identifiers, not for natural-language room ``mergeid``\ s.
-    """
-    return str(s).translate(str.maketrans("LR", "RL"))
-
-
-def apply_hypergraph_path_lr_name_swap_in_place(root: dict) -> None:
-    """
-    In-place: on each node, every ``L``/``R`` in ``name`` is swapped; ``connected``\ s
-    are remapped the same way; internal ``mergeid`` follows the new ``name`` (structural
-    ids), same idea as :func:`repair_bsp_tree_names`. Leaf room-type ``mergeid`` is
-    **not** character-swapped. ``angle``\ s and ``children`` order are unchanged. The
-    special neighbor ``outside`` in ``connected`` is case-insensitive and left as-is.
-    """
-    all_nodes = list(iter_nodes(root))
-    old_to_new: dict[str, str] = {}
-    for n in all_nodes:
-        old = str(n.get("name", ""))
-        if old not in old_to_new:
-            old_to_new[old] = swap_l_r_letters_in_string(old)
-
-    for n in all_nodes:
-        new_name = old_to_new[str(n.get("name", ""))]
-        n["name"] = new_name
-        if not n.get("final", False):
-            n["mergeid"] = new_name
-
-    def _remap_ref(x: object) -> str:
-        xs = str(x)
-        if xs.strip().lower() == "outside":
-            return xs
-        return old_to_new.get(xs, xs)
-
-    for n in all_nodes:
-        if not n.get("final", False):
-            continue
-        conn = n.get("connected")
-        if not conn:
-            continue
-        n["connected"] = [_remap_ref(c) for c in conn]
 
 
 def _polygon_signed_area_xy(pts: list[tuple[float, float]]) -> float:
@@ -615,17 +617,6 @@ def delete_room_at_path(root: dict, path: list[dict]) -> tuple[str, str]:
     remap_connectivity(root, deleted_name=deleted_name, rename_map=rename_map)
     recompute_areas(root)
     return deleted_name, sibling.get("name", "")
-
-
-def eligible_delete_paths(root: dict, room_name: str) -> list[list[dict]]:
-    """Paths to final leaves for *room_name* that are valid delete targets (non-root)."""
-    paths = collect_matching_leaf_paths(root, room_name)
-    eligible = [p for p in paths if len(p) >= 2]
-    if not paths:
-        raise ValueError(f"No leaf found with room identifier {room_name!r}")
-    if not eligible:
-        raise ValueError("Cannot delete the root node")
-    return eligible
 
 
 def split_leaf_for_add_on_path(

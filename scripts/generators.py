@@ -259,6 +259,9 @@ class VllmQwenGenerator(HypergraphGenerator):
         from transformers import AutoTokenizer
 
         _local = bool(self._lora_path) or (Path(model_name).exists() and Path(model_name).is_dir())
+        # use resolved absolute path to avoid huggingface_hub repo-id validation on relative paths
+        if _local and not tokenizer_src.startswith("/"):
+            tokenizer_src = str(Path(tokenizer_src).resolve())
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, local_files_only=_local)
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token

@@ -306,7 +306,16 @@ def main(argv=None) -> int:
                    default=REPO_ROOT / "checkpoints" / "qwen_rplan_filtered_2"
                            / "epochs8_lora_r64_alpha128" / "checkpoint-8700",
                    help="LoRA adapter dir (must contain adapter_config.json + "
-                        "adapter_model.safetensors).")
+                        "adapter_model.safetensors). Ignored when --hf-repo is set.")
+    p.add_argument("--hf-repo", type=str, default=None,
+                   help="HuggingFace repo id to download the LoRA adapter from "
+                        "(e.g. username/my-lora-repo). Takes precedence over "
+                        "--checkpoint. Use --hf-subfolder to point at a "
+                        "subdirectory within the repo.")
+    p.add_argument("--hf-subfolder", type=str, default=None,
+                   help="Subfolder inside the HF repo containing the LoRA adapter "
+                        "(e.g. qwen_hypergraphformer/checkpoint-8700). Only used "
+                        "when --hf-repo is set.")
     p.add_argument("--base-model", type=str, default=None,
                    help="HF id of the base model. Default: read from "
                         "adapter_config.json (Qwen/Qwen3-4B-Instruct-2507).")
@@ -386,13 +395,31 @@ def main(argv=None) -> int:
         log.info("nothing to do for this rank")
         return 0
 
+    # Resolve checkpoint: HF hub download takes precedence over local --checkpoint.
+    checkpoint = args.checkpoint
+    if args.hf_repo:
+        from huggingface_hub import snapshot_download
+        log.info("downloading LoRA from HF hub: repo=%s subfolder=%s",
+                 args.hf_repo, args.hf_subfolder or "(root)")
+        prefix = args.hf_subfolder.rstrip("/") + "/" if args.hf_subfolder else ""
+        patterns = [f"{prefix}{f}" for f in [
+            "adapter_config.json", "adapter_model.safetensors",
+            "adapter_model.bin", "tokenizer*", "special_tokens_map.json",
+        ]]
+        repo_root = Path(snapshot_download(
+            repo_id=args.hf_repo,
+            allow_patterns=patterns,
+        ))
+        checkpoint = repo_root / args.hf_subfolder if args.hf_subfolder else repo_root
+        log.info("LoRA cached at %s", checkpoint)
+
     # Lazy import after GPU is bound and torchrun env is stripped, so each
     # rank initialises its own vLLM engine on its assigned card.
     from scripts.generators import VllmQwenGenerator
     from vllm import SamplingParams  # type: ignore[import-not-found]
     gen = VllmQwenGenerator(
         model_name=args.base_model or "Qwen/Qwen3-4B-Instruct-2507",
-        lora_path=args.checkpoint,
+        lora_path=checkpoint,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         enforce_eager=True,
