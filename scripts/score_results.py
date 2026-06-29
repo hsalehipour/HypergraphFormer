@@ -476,15 +476,11 @@ def cli():
         help="Metrics to compute (ged, accuracy, delta, area_proportion_error)",
     )
     parser.add_argument(
-        "--correct-accessgraph",
-        action="store_true",
-        default=True,
-        help="Apply correct_accessgraph before GED (default: on). Use --no-correct-accessgraph to disable.",
-    )
-    parser.add_argument(
         "--no-correct-accessgraph",
         dest="correct_accessgraph",
         action="store_false",
+        default=True,
+        help="Disable access-graph correction before GED (correction is on by default).",
     )
     parser.add_argument(
         "--ged-timeout", type=float, default=20.0,
