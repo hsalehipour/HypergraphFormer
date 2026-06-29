@@ -15,7 +15,7 @@ and geometric subdivisions, enabling generation of floor plans for arbitrary,
 user-specified boundaries.
 
 Evaluated on the **WMR24** dataset (~1,000 architect-designed floor
-plans from Zurich, New York, and Singapore), and **RPLAN** dataset (Converted to the Hyperrgaph format), HypergraphFormer outperforms HouseDiffusion
+plans from Zurich, New York, and Singapore), and **RPLAN** dataset (Converted to the Hypergraph format), HypergraphFormer outperforms HouseDiffusion
 and HouseGAN++ while requiring significantly less training data and allowing controllable edits of generated floorplans.
 
 > **Paper:** Submitted to NeurIPS 2026.  Preprint available on
