@@ -1,17 +1,35 @@
 """
 Metric functions for evaluating hypergraph generation quality.
 
-Provides three canonical metrics:
+Provides canonical metrics:
 - GED (Graph Edit Distance): structural similarity between access graphs
 - Delta metric: shape regularity deviation between room lists
+- Area proportion error: mean absolute difference between room-area proportions
+  (each room's area / total apartment area), paired 1-to-1 within each type
 - Room-type accuracy: multiset comparison of room types
 """
 
+# Defer evaluation of ``defaultdict[str, ...]`` annotations etc. so this
+# module can be imported by the iPLAN evaluator under Python 3.8 too.
+from __future__ import annotations
+
 import math
+import warnings
 
 from .hypergraph import Hypergraph
 
 ROOM_ORDER = ['kitchen', 'living', 'dining', 'bathroom', 'bed', 'foyer', 'storage', 'extra']
+
+
+def _room_sort_key(room_tuple):
+    """Sort key for room tuples whose first element is a room-type string."""
+    roomname = room_tuple[0].lower()
+    if 'bath' in roomname:
+        roomname = 'bathroom'
+    try:
+        return ROOM_ORDER.index(roomname)
+    except ValueError:
+        return len(ROOM_ORDER)
 
 
 def produce_room_list(generated_mesh):
@@ -26,16 +44,107 @@ def produce_room_list(generated_mesh):
         square_perimeter = 4 * math.sqrt(face.Area)
         room_data.append((face.merge_id, face.Perimeter, square_perimeter))
 
-    def _sort_key(room_tuple):
-        roomname = room_tuple[0].lower()
-        if 'bath' in roomname:
-            roomname = 'bathroom'
-        try:
-            return ROOM_ORDER.index(roomname)
-        except ValueError:
-            return len(ROOM_ORDER)
+    return sorted(room_data, key=_room_sort_key)
 
-    return sorted(room_data, key=_sort_key)
+
+def produce_room_area_list(generated_mesh):
+    """Extract a sorted list of ``(room_name, area)`` tuples from an RGL mesh.
+
+    The ordering follows :data:`ROOM_ORDER` and is intended for metrics that
+    pair rooms by category, similar to :func:`produce_room_list`.
+    """
+    room_data = []
+    for i in range(generated_mesh.faceList.Count):
+        face = generated_mesh.faceList[i]
+        room_data.append((face.merge_id, face.Area))
+
+    return sorted(room_data, key=_room_sort_key)
+
+
+def produce_room_list_from_polygons(room_polygons):
+    """Like :func:`produce_room_list` but from pre-computed polygon dicts.
+
+    Each item in *room_polygons* must have ``mergeid`` (str) and ``coords``
+    (list of ``[x, y]`` points) -- the format written by
+    ``data_preparation.py --data-format access``.
+    """
+    from shapely.geometry import Polygon
+
+    room_data = []
+    for rp in room_polygons:
+        coords = rp.get("coords", [])
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_empty or poly.area < 1e-6:
+            continue
+        area = poly.area
+        perimeter = poly.length
+        square_perimeter = 4 * math.sqrt(area)
+        room_data.append((rp["mergeid"], perimeter, square_perimeter))
+
+    return sorted(room_data, key=_room_sort_key)
+
+
+def produce_room_area_list_from_polygons(room_polygons):
+    """Like :func:`produce_room_area_list` but from pre-computed polygon dicts.
+
+    See :func:`produce_room_list_from_polygons` for the expected input format.
+    """
+    from shapely.geometry import Polygon
+
+    room_data = []
+    for rp in room_polygons:
+        coords = rp.get("coords", [])
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_empty or poly.area < 1e-6:
+            continue
+        room_data.append((rp["mergeid"], poly.area))
+
+    return sorted(room_data, key=_room_sort_key)
+
+
+def _canonical_room_type_key(merge_id) -> str:
+    """Map a mesh ``merge_id`` string to a canonical room-type key for area aggregation.
+
+    Aligns loosely with :func:`produce_room_area_list` ordering (``bath`` → ``bathroom``,
+    longest-prefix match against :data:`ROOM_ORDER`).
+    """
+    s = str(merge_id).lower().strip()
+    if "bath" in s:
+        return "bathroom"
+    if s in ROOM_ORDER:
+        return s
+    best = None
+    best_len = 0
+    for r in ROOM_ORDER:
+        if r == "extra":
+            continue
+        if s.startswith(r) and len(r) >= best_len:
+            best, best_len = r, len(r)
+    if best is not None:
+        return best
+    return s
+
+
+def _aggregate_area_by_room_type(room_area_list):
+    """Sum areas per canonical room type.
+
+    Args:
+        room_area_list: ``[(merge_id, area), ...]`` as from :func:`produce_room_area_list`.
+
+    Returns:
+        ``dict`` mapping canonical room-type string → total area.
+    """
+    from collections import defaultdict
+
+    sums: defaultdict[str, float] = defaultdict(float)
+    for merge_id, area in room_area_list:
+        key = _canonical_room_type_key(merge_id)
+        sums[key] += float(area)
+    return dict(sums)
 
 
 def accessgraph_dict_to_nx(ag):
@@ -51,7 +160,7 @@ def accessgraph_dict_to_nx(ag):
     return g
 
 
-def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeout_capture_best=False):
+def ged_between_graphs(G_pred, G_true, _id, timeout=20000, upper_bound=40, timeout_capture_best=False):
     """Core GED computation on pre-built NetworkX graphs.
 
     This is the low-level algorithm shared by
@@ -63,7 +172,7 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeo
         G_pred: Predicted NetworkX graph (nodes must have a ``label`` attribute).
         G_true: Ground-truth NetworkX graph (nodes must have a ``label`` attribute).
         _id: Sample identifier for log messages.
-        timeout: Timeout in milliseconds (default: 10 000).
+        timeout: Timeout in milliseconds (default: 20 000).
         upper_bound: Upper bound passed to ``nx.optimize_graph_edit_distance``.
         timeout_capture_best: If *True*, return the best value found
             before timeout instead of ``None``.
@@ -73,8 +182,17 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeo
         computation times out without improvement.
     """
     import networkx as nx
+    import threading
 
-    result_holder = [upper_bound]
+    # ``result_holder`` carries (best_dist_so_far, num_gt_nodes_or_None,
+    # finished_normally). The worker thread updates it in place; the caller
+    # reads it after either a normal join or a timed-out join.
+    result_holder = {
+        "best": upper_bound,
+        "n_true": None,
+        "done": False,
+        "error": None,
+    }
 
     def _inner():
         try:
@@ -83,34 +201,48 @@ def ged_between_graphs(G_pred, G_true, _id, timeout=10000, upper_bound=40, timeo
                 node_match=lambda n1, n2: n1.get('label') == n2.get('label'),
                 upper_bound=upper_bound,
             ):
-                result_holder[0] = dist
-            return result_holder[0], len(G_true.nodes())
+                result_holder["best"] = dist
+            result_holder["n_true"] = len(G_true.nodes())
+            result_holder["done"] = True
         except Exception as e:
-            print(f"⚠️  Error computing GED for sample {_id}: {e}")
-            return None, None
+            result_holder["error"] = e
 
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+    # Daemon thread: when the parent script finishes, Python will exit even
+    # if this thread is still grinding on a non-cancellable C/Python loop
+    # inside ``nx.optimize_graph_edit_distance``. The previous implementation
+    # used a ThreadPoolExecutor whose workers default to non-daemon, so a
+    # timed-out GED job would keep the interpreter alive for many minutes
+    # after the rest of the run had completed (see fewshot_diffplanner
+    # parallel runs hanging in teardown).
+    worker = threading.Thread(
+        target=_inner,
+        name=f"ged-{_id}",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=timeout / 1000.0)
 
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_inner)
-    try:
-        return future.result(timeout=timeout / 1000.0)
-    except FuturesTimeoutError:
-        if not timeout_capture_best:
-            print(f'⚠️  GED timed out for sample {_id}, returning None')
-            return None, None
-        best_value = result_holder[0]
-        if best_value < upper_bound:
-            print(f'⚠️  GED timed out for sample {_id}, returning best found: {best_value:.1f}')
-            return best_value, len(G_true.nodes())
-        else:
-            print(f'⚠️  GED timed out for sample {_id}, no improvement found')
-            return None, None
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    if result_holder["error"] is not None:
+        print(f"⚠️  Error computing GED for sample {_id}: {result_holder['error']}")
+        return None, None
+
+    if result_holder["done"]:
+        return result_holder["best"], result_holder["n_true"]
+
+    # Timed out. The worker thread is still running but is daemonized, so
+    # interpreter shutdown will not block on it.
+    if not timeout_capture_best:
+        print(f'⚠️  GED timed out for sample {_id}, returning None')
+        return None, None
+    best_value = result_holder["best"]
+    if best_value < upper_bound:
+        print(f'⚠️  GED timed out for sample {_id}, returning best found: {best_value:.1f}')
+        return best_value, len(G_true.nodes())
+    print(f'⚠️  GED timed out for sample {_id}, no improvement found')
+    return None, None
 
 
-def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=10000,
+def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=20000,
                                 upper_bound=40, timeout_capture_best=False,
                                 correct_accessgraph=False, bounds=None):
     """Compute GED between an access-graph dict and a hypergraph dict.
@@ -128,7 +260,7 @@ def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=10000,
         accessgraph: Access graph dict with ``nodes`` and ``edges``.
         hypergraph: Hypergraph BSP-tree dict.
         _id: Sample identifier for log messages.
-        timeout: Timeout in milliseconds (default: 10 000).
+        timeout: Timeout in milliseconds (default: 20 000).
         upper_bound: Upper bound for GED computation.
         timeout_capture_best: If *True*, return the best partial result
             on timeout.
@@ -140,12 +272,22 @@ def compute_ged_from_hypergraph(accessgraph, hypergraph, _id, timeout=10000,
     Returns:
         ``(min_dist, num_gt_nodes)`` -- see :func:`ged_between_graphs`.
     """
+    if correct_accessgraph and not (isinstance(bounds, dict) and bounds.get("corners")):
+        raise ValueError(
+            f"correct_accessgraph=True requires bounds with 'corners' for sample {_id}"
+        )
+
     try:
         hg = Hypergraph(hypergraph)
 
         if correct_accessgraph:
             pred_ag = hg.correct_accessgraph(bounds)
         else:
+            warnings.warn(
+                f"Access graph correction skipped for sample {_id} "
+                f"(correct_accessgraph=False); GED uses raw leaf connectivity",
+                stacklevel=2,
+            )
             pred_ag = hg.access_graph
 
         if not pred_ag.get("nodes"):
@@ -188,7 +330,7 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
 
     Returns:
         float: Mean sigma across all paired rooms. In strict mode returns 0.25
-        on mismatch; in soft mode returns 0.6 when no pairs can be formed.
+        on mismatch; in soft mode returns NaN when no pairs can be formed.
     """
     if strict:
         rooms_A = [t[0] for t in room_list_A]
@@ -241,11 +383,111 @@ def compute_room_similarity_score(room_list_A, room_list_B, strict=False, duplic
             list_of_sigmas.append(sigma)
 
     if len(list_of_sigmas) == 0:
-        return 0.6
+        return float('nan')
     return sum(list_of_sigmas) / len(list_of_sigmas)
 
 
-def room_type_accuracy(expected_room_types, generated_room_types):
+def compute_room_area_proportion_error(room_list_A, room_list_B, aggregate=False):
+    """Compute mean area-proportion error between two apartment meshes.
+
+    Each room list is a list of ``(merge_id, area)`` tuples from
+    :func:`produce_room_area_list`.
+
+    Proportions are computed as ``area_i / total_area`` for each room (or
+    room-type sum when *aggregate* is True).  The error is the mean of
+    ``|prop_pred_i - prop_gt_i|`` and is bounded in ``[0, 1]``.
+
+    Args:
+        room_list_A: Predicted rooms -- ``[(merge_id, area), ...]``.
+        room_list_B: Ground-truth rooms -- ``[(merge_id, area), ...]``.
+        aggregate: If ``True``, sum all room areas per canonical type before
+            computing proportions (one term per type).  If ``False``
+            (default), keep individual rooms: within each canonical type,
+            rooms are sorted by area and paired 1-to-1; unmatched rooms
+            on either side contribute their full proportion as error.
+
+    Returns:
+        dict with keys:
+
+        - ``area_proportion_error`` (float): mean absolute proportion
+          error (NaN if both apartments have zero total area).
+        - ``num_terms`` (int): number of proportion-error terms averaged.
+        - ``per_term_errors`` (list[float]): individual absolute
+          proportion errors.
+        - ``types_only_in_pred`` (list[str]): canonical type keys present
+          only in pred.
+        - ``types_only_in_gt`` (list[str]): canonical type keys present
+          only in GT.
+    """
+    import numpy as np
+    from collections import defaultdict
+
+    total_A = sum(area for _, area in room_list_A)
+    total_B = sum(area for _, area in room_list_B)
+
+    if total_A == 0 and total_B == 0:
+        warnings.warn(
+            "compute_room_area_proportion_error: both apartments have zero "
+            "total area; returning nan",
+            stacklevel=2,
+        )
+        return {
+            'area_proportion_error': float('nan'),
+            'num_terms': 0,
+            'per_term_errors': [],
+            'types_only_in_pred': [],
+            'types_only_in_gt': [],
+        }
+
+    if aggregate:
+        sums_A = _aggregate_area_by_room_type(room_list_A)
+        sums_B = _aggregate_area_by_room_type(room_list_B)
+
+        all_types = sorted(set(sums_A.keys()) | set(sums_B.keys()))
+        only_in_A = sorted(set(sums_A.keys()) - set(sums_B.keys()))
+        only_in_B = sorted(set(sums_B.keys()) - set(sums_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            prop_A = sums_A.get(category, 0.0) / total_A if total_A > 0 else 0.0
+            prop_B = sums_B.get(category, 0.0) / total_B if total_B > 0 else 0.0
+            per_term_errors.append(abs(prop_A - prop_B))
+    else:
+        rooms_A: defaultdict[str, list[float]] = defaultdict(list)
+        rooms_B: defaultdict[str, list[float]] = defaultdict(list)
+        for merge_id, area in room_list_A:
+            rooms_A[_canonical_room_type_key(merge_id)].append(float(area))
+        for merge_id, area in room_list_B:
+            rooms_B[_canonical_room_type_key(merge_id)].append(float(area))
+
+        all_types = sorted(set(rooms_A.keys()) | set(rooms_B.keys()))
+        only_in_A = sorted(set(rooms_A.keys()) - set(rooms_B.keys()))
+        only_in_B = sorted(set(rooms_B.keys()) - set(rooms_A.keys()))
+
+        per_term_errors = []
+        for category in all_types:
+            areas_a = sorted(rooms_A.get(category, []), reverse=True)
+            areas_b = sorted(rooms_B.get(category, []), reverse=True)
+            n = max(len(areas_a), len(areas_b))
+            for i in range(n):
+                a = areas_a[i] if i < len(areas_a) else 0.0
+                b = areas_b[i] if i < len(areas_b) else 0.0
+                prop_a = a / total_A if total_A > 0 else 0.0
+                prop_b = b / total_B if total_B > 0 else 0.0
+                per_term_errors.append(abs(prop_a - prop_b))
+
+    avg_error = float(np.mean(per_term_errors)) if per_term_errors else float('nan')
+
+    return {
+        'area_proportion_error': avg_error,
+        'num_terms': len(per_term_errors),
+        'per_term_errors': per_term_errors,
+        'types_only_in_pred': only_in_A,
+        'types_only_in_gt': only_in_B,
+    }
+
+
+def room_type_accuracy(expected_room_types, generated_room_types, strict=True):
     """Core room-type multiset comparison on two flat lists.
 
     This is the low-level function shared by
@@ -253,23 +495,29 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     hypergraph dicts) and the benchmark evaluation scripts (which
     extract lists from pixel masks or polygon outputs).
 
+    The continuous definitions are always used internally:
+
+    - ``accuracy`` = ``overlap / max(|E|, |G|)``
+    - ``room_count_accuracy`` = ``min(|E|, |G|) / max(|E|, |G|)``
+    - ``room_type_accuracy`` = ``overlap / min(|E|, |G|)``
+
+    where ``overlap`` is the multiset intersection size.
+
     Args:
         expected_room_types: List of expected room-type labels.
         generated_room_types: List of generated room-type labels.
+        strict: When ``True`` (default), the continuous values are
+            thresholded to binary: 1.0 if the continuous value equals
+            1.0, else 0.0.  When ``False``, the raw continuous values
+            in ``[0, 1]`` are returned.
 
     Returns:
         dict with keys:
 
-        - ``room_count_match`` (bool)
-        - ``room_types_match`` (bool)
-        - ``accuracy`` (float): 1.0 if both match, else 0.0
-        - ``expected_rooms`` / ``generated_rooms`` (int)
-        - ``expected_types`` / ``generated_types`` (dict)
-        - ``missing_types`` / ``extra_types`` (list)
-        - ``count_error`` (int): absolute count difference
-        - ``type_error`` (int): number of mismatched room slots
-        - ``relative_count_error`` (float)
-        - ``excess_rooms`` (int): positive = too many, negative = too few
+        - ``accuracy`` (float): combined accuracy (count **and** types).
+        - ``room_count_accuracy`` (float): room-count accuracy only.
+        - ``room_type_accuracy`` (float): room-type-set accuracy only
+          (among the rooms that could potentially match, how many do).
     """
     from collections import Counter
 
@@ -279,41 +527,38 @@ def room_type_accuracy(expected_room_types, generated_room_types):
     n_expected = len(expected_room_types)
     n_generated = len(generated_room_types)
 
-    room_count_match = n_expected == n_generated
-    room_types_match = expected_counter == generated_counter
+    all_keys = set(expected_counter) | set(generated_counter)
 
-    missing_types = []
-    extra_types = []
-    for room_type, count in expected_counter.items():
-        diff = count - generated_counter.get(room_type, 0)
-        if diff > 0:
-            missing_types.extend([room_type] * diff)
-    for room_type, count in generated_counter.items():
-        diff = count - expected_counter.get(room_type, 0)
-        if diff > 0:
-            extra_types.extend([room_type] * diff)
+    denom = max(n_expected, n_generated)
+    if denom == 0:
+        return {
+            'accuracy': float('nan'),
+            'room_count_accuracy': float('nan'),
+            'room_type_accuracy': float('nan'),
+        }
 
-    count_error = abs(n_generated - n_expected)
-    type_error = (len(missing_types) + len(extra_types)) // 2
+    overlap = sum(min(expected_counter[k], generated_counter[k])
+                  for k in all_keys)
+    accuracy = overlap / denom
+    rc_accuracy = min(n_expected, n_generated) / denom
+    min_count = min(n_expected, n_generated)
+    rt_accuracy = (overlap / min_count) if min_count > 0 else float('nan')
+
+    if strict:
+        import math
+        accuracy = 1.0 if accuracy == 1.0 else 0.0
+        rc_accuracy = 1.0 if rc_accuracy == 1.0 else 0.0
+        if not math.isnan(rt_accuracy):
+            rt_accuracy = 1.0 if rt_accuracy == 1.0 else 0.0
 
     return {
-        'room_count_match': room_count_match,
-        'room_types_match': room_types_match,
-        'accuracy': 1.0 if (room_count_match and room_types_match) else 0.0,
-        'expected_rooms': n_expected,
-        'generated_rooms': n_generated,
-        'expected_types': dict(expected_counter),
-        'generated_types': dict(generated_counter),
-        'missing_types': missing_types,
-        'extra_types': extra_types,
-        'count_error': count_error,
-        'type_error': type_error,
-        'relative_count_error': count_error / n_expected if n_expected > 0 else 0.0,
-        'excess_rooms': n_generated - n_expected,
+        'accuracy': accuracy,
+        'room_count_accuracy': rc_accuracy,
+        'room_type_accuracy': rt_accuracy,
     }
 
 
-def compute_room_type_accuracy(accessgraph, hypergraph):
+def compute_room_type_accuracy(accessgraph, hypergraph, strict=True):
     """Compare room-type multisets between an access-graph dict and a hypergraph dict.
 
     Extracts room-type lists from the raw dictionaries and delegates to
@@ -322,6 +567,7 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     Args:
         accessgraph: Access graph dict with ``nodes`` mapping id -> room_type.
         hypergraph: Hypergraph BSP-tree dict.
+        strict: Passed through to :func:`room_type_accuracy`.
 
     Returns:
         dict -- see :func:`room_type_accuracy`.
@@ -329,96 +575,4 @@ def compute_room_type_accuracy(accessgraph, hypergraph):
     expected_room_types = list(accessgraph.get('nodes', {}).values())
     leaves = Hypergraph(hypergraph).leaves
     generated_room_types = [leaf['mergeid'] for leaf in leaves]
-    return room_type_accuracy(expected_room_types, generated_room_types)
-
-
-def bucketed_room_accuracy(accessgraphs, hypergraphs, buckets,
-                           skip_ids=None):
-    """Compute room-type accuracy grouped into room-count buckets.
-
-    Args:
-        accessgraphs: ``{sample_id: accessgraph_dict}``
-        hypergraphs:  ``{sample_id: hypergraph_dict}``
-        buckets: Ordered list of bucket boundaries.  Each entry is an
-            ``int`` or a string like ``'<=4'`` / ``'>=9'``.  Integers
-            create an exact-match bucket; ``'<=N'`` catches everything
-            at or below *N*; ``'>=N'`` catches everything at or above *N*.
-        skip_ids: Optional set of sample IDs to exclude.
-
-    Returns:
-        dict with keys:
-
-        - ``categories``: ``{label: {matches, total}}``
-        - ``category_order``: list of bucket labels in input order
-        - ``overall_matches``: int
-        - ``overall_total``: int
-        - ``skipped``: int
-    """
-    from tqdm import tqdm
-
-    skip_ids = skip_ids or set()
-
-    lower_bound = None
-    upper_bound = None
-    exact_values = []
-
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            lower_bound = int(s.lstrip("<=≤"))
-        elif s.startswith(">=") or s.startswith("≥"):
-            upper_bound = int(s.lstrip(">=≥"))
-        else:
-            exact_values.append(int(s))
-
-    def _bucket_label(n):
-        if lower_bound is not None and n <= lower_bound:
-            return f"<={lower_bound}"
-        if upper_bound is not None and n >= upper_bound:
-            return f">={upper_bound}"
-        if n in exact_values:
-            return str(n)
-        return None
-
-    category_labels = []
-    for b in buckets:
-        s = str(b)
-        if s.startswith("<=") or s.startswith("≤"):
-            category_labels.append(f"<={s.lstrip('<=≤')}")
-        elif s.startswith(">=") or s.startswith("≥"):
-            category_labels.append(f">={s.lstrip('>=≥')}")
-        else:
-            category_labels.append(s)
-
-    categories = {label: {"matches": 0, "total": 0} for label in category_labels}
-    overall_matches = 0
-    overall_total = 0
-    skipped = 0
-
-    for sample_id in tqdm(hypergraphs, desc="Comparing rooms"):
-        if sample_id in skip_ids:
-            skipped += 1
-            continue
-        if sample_id not in accessgraphs:
-            continue
-
-        result = compute_room_type_accuracy(
-            accessgraphs[sample_id], hypergraphs[sample_id]
-        )
-        label = _bucket_label(result["expected_rooms"])
-        if label is None:
-            continue
-
-        categories[label]["total"] += 1
-        overall_total += 1
-        if result["room_types_match"]:
-            categories[label]["matches"] += 1
-            overall_matches += 1
-
-    return {
-        "categories": categories,
-        "category_order": category_labels,
-        "overall_matches": overall_matches,
-        "overall_total": overall_total,
-        "skipped": skipped,
-    }
+    return room_type_accuracy(expected_room_types, generated_room_types, strict=strict)

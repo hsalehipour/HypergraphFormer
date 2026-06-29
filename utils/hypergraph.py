@@ -17,6 +17,140 @@ from typing import Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 
+def _parse_first_json_object(s: str):
+    """Parse the first top-level JSON object from *s*, ignoring trailing text.
+
+    Models often emit valid hypergraph JSON followed by commentary or extra tokens,
+    which makes ``json.loads`` fail with "Extra data: ...".  ``JSONDecoder.raw_decode``
+    stops after the first complete value.
+    """
+    s = s.strip()
+    dec = json.JSONDecoder()
+    i = s.find("{")
+    if i == -1:
+        return None
+    try:
+        obj, _end = dec.raw_decode(s[i:])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def repair_bsp_tree_names(hypergraph: dict) -> dict:
+    """Reassign every node ``name`` from tree layout (``root``, ``rootL``, ``rootR``, …).
+
+    Model outputs sometimes reuse the same ``name`` on different leaves (e.g. two
+    ``rootRLL``), which breaks :attr:`Hypergraph.access_graph` and mesh ``unique_id``
+    mapping. This walks the BSP tree and sets:
+
+    - ``root`` for the root;
+    - ``<parent>L`` / ``<parent>R`` for the first two children;
+    - ``<parent>_2``, ``_3``, … if a node has more than two children.
+
+    Leaf ``connected`` lists are rewritten to use the new names. When an old name was
+    ambiguous, neighbors are resolved by **symmetric** ``connected`` (each side lists
+    the other’s old name) when possible; otherwise the first matching final leaf is used
+    and a warning is logged.
+
+    Internal nodes get ``mergeid`` set to the new structural name; final leaves keep
+    their room-type ``mergeid``. The special neighbor ``outside`` is left unchanged.
+
+    Args:
+        hypergraph: Root BSP dict (must contain ``children``, ``name``, etc.).
+
+    Returns:
+        Deep copy of *hypergraph* with updated ``name``, ``mergeid`` (internals), and
+        ``connected`` (final nodes only).
+    """
+    if not isinstance(hypergraph, dict):
+        raise TypeError(f"repair_bsp_tree_names expected dict root, got {type(hypergraph)!r}")
+
+    hg = copy.deepcopy(hypergraph)
+    all_nodes: List[dict] = []
+
+    def collect(n: dict) -> None:
+        all_nodes.append(n)
+        for c in n.get("children") or []:
+            collect(c)
+
+    collect(hg)
+
+    def assign_names(node: dict, parent_path: str, idx: int) -> None:
+        if parent_path == "":
+            new_name = "root"
+        elif idx == 0:
+            new_name = parent_path + "L"
+        elif idx == 1:
+            new_name = parent_path + "R"
+        else:
+            new_name = parent_path + f"_{idx}"
+
+        node["_old_name"] = node.get("name")
+        node["name"] = new_name
+        if not node.get("final"):
+            node["mergeid"] = new_name
+        children = node.get("children") or []
+        for i, ch in enumerate(children):
+            assign_names(ch, new_name, i)
+
+    assign_names(hg, "", 0)
+
+    by_old: Dict[str, List[dict]] = {}
+    for n in all_nodes:
+        old = n.get("_old_name")
+        if old is None:
+            continue
+        key = str(old)
+        by_old.setdefault(key, []).append(n)
+
+    for n in all_nodes:
+        if not n.get("final"):
+            continue
+        con = n.get("connected")
+        if not con:
+            continue
+        new_con: List[str] = []
+        my_old = n.get("_old_name")
+        for s in con:
+            st = str(s).strip()
+            if st.lower() == "outside":
+                new_con.append(st)
+                continue
+            cands = by_old.get(st, [])
+            if len(cands) == 1:
+                new_con.append(cands[0]["name"])
+            elif len(cands) == 0:
+                logger.warning(
+                    "repair_bsp_tree_names: leaf %r connected to unknown name %r",
+                    my_old,
+                    st,
+                )
+                new_con.append(st)
+            else:
+                sym = [c for c in cands if my_old in (c.get("connected") or [])]
+                if len(sym) == 1:
+                    new_con.append(sym[0]["name"])
+                else:
+                    finals = [c for c in cands if c.get("final")]
+                    chosen = finals[0] if finals else cands[0]
+                    if len(sym) != 1:
+                        logger.warning(
+                            "repair_bsp_tree_names: ambiguous neighbor %r for leaf %r "
+                            "(%d candidates); picked %r",
+                            st,
+                            my_old,
+                            len(cands),
+                            chosen.get("name"),
+                        )
+                    new_con.append(chosen["name"])
+        n["connected"] = new_con
+
+    for n in all_nodes:
+        n.pop("_old_name", None)
+
+    return hg
+
+
 class Hypergraph:
     """A BSP-tree hypergraph representing a spatial floor plan subdivision.
 
@@ -53,6 +187,13 @@ class Hypergraph:
 
     def to_json(self) -> str:
         return json.dumps(self._data)
+
+    def with_repaired_names(self) -> "Hypergraph":
+        """Copy of this hypergraph with :func:`repair_bsp_tree_names` applied to the tree."""
+        return Hypergraph(
+            repair_bsp_tree_names(copy.deepcopy(self._data)),
+            bounds=self._bounds,
+        )
 
     def __repr__(self) -> str:
         name = self._data.get("name", "?")
@@ -114,6 +255,25 @@ class Hypergraph:
                         edges.append([edge[0], edge[1]])
 
         return {"nodes": nodes, "edges": edges}
+
+    def access_graph_components(self) -> list:
+        """Connected components of the access graph.
+
+        Returns a list of sets, each containing node-id strings that
+        belong to the same connected component.  A fully connected
+        access graph returns a single-element list.
+        """
+        import networkx as nx
+        from .metrics import accessgraph_dict_to_nx
+
+        g = accessgraph_dict_to_nx(self.access_graph)
+        if g.number_of_nodes() == 0:
+            return []
+        return list(nx.connected_components(g))
+
+    def is_access_graph_connected(self) -> bool:
+        """True if the access graph is a single connected component."""
+        return len(self.access_graph_components()) <= 1
 
     # -- validation ----------------------------------------------------------
 
@@ -308,7 +468,7 @@ class Hypergraph:
 
     @staticmethod
     def _validate_quick(node, _depth=0):
-        """Fast recursive structural validation for hot loops (RL training)."""
+        """Fast recursive structural validation for hot loops."""
         if not isinstance(node, dict):
             return False, [], [f"Node at depth {_depth} is {type(node).__name__}, not dict"], None
 
@@ -536,104 +696,241 @@ class Hypergraph:
         data_node = RGL.DataNode.deserializeDataNode(json.dumps(hg_ratio))
         return RGL.DataNode.subdivideWithMeshRatio(data_node, boundary_mesh)
 
-    def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
-        """Correct access graph to match mesh adjacency. Returns {nodes, edges} dict."""
-        import networkx as nx
-        from shapely.geometry import Polygon
-        from shapely.affinity import scale as _scale
+    def mesh_face_labels(self, mesh, distinct=None) -> list:
+        """Build display labels for each face in an assembled RGL mesh.
 
-        ag = copy.deepcopy(self.access_graph or {})
-        if not isinstance(ag, dict):
-            ag = {}
-        mesh = self.to_mesh(bounds=bounds)
+        Uses ``unique_id`` metadata on each face to map it back to the
+        corresponding BSP leaf / access-graph node, then produces a
+        human-readable label (e.g. ``living1``, ``kitchen``).
+
+        Args:
+            mesh: RGL NMesh returned by :meth:`to_mesh`.
+            distinct: Optional dict mapping access-graph node-id to
+                label string (as returned by
+                :meth:`HypergraphPlotter.make_distinct_labels`).
+                When *None*, labels are built automatically from
+                :pyattr:`access_graph`.
+
+        Returns:
+            List of label strings, one per face in ``mesh.faceList``.
+        """
+        leaf_name_to_ag_id = {
+            leaf["name"]: str(i + 1)
+            for i, leaf in enumerate(self.leaves)
+        }
+
+        if distinct is None:
+            ag = self.access_graph
+            ag_rooms = {
+                "nodes": {k: v for k, v in ag.get("nodes", {}).items()
+                          if k != "outside"},
+                "edges": [e for e in ag.get("edges", [])
+                          if "outside" not in e],
+            }
+            distinct = HypergraphPlotter.make_distinct_labels(ag_rooms)
 
         n = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
-        if n <= 0:
-            return ag
-        face_types, polys = [], []
+        labels = []
         for i in range(n):
-            f = mesh.faceList[i]
-            face_types.append(str(getattr(f, "merge_id", "unknown")).strip().lower())
-            pts = f.getPoints()
-            corners = [(float(pts[j].X), float(pts[j].Y)) for j in range(int(getattr(pts, "Count", 0) or 0))]
-            polys.append(Polygon(corners) if len(corners) >= 3 else Polygon())
-        polys = [_scale(p, xfact=scale_factor, yfact=scale_factor, origin="centroid") if not p.is_empty else p for p in polys]
+            face = mesh.faceList[i]
+            uid = getattr(face, 'unique_id', '')
+            ag_id = leaf_name_to_ag_id.get(uid, '')
+            labels.append(
+                distinct.get(ag_id, getattr(face, 'merge_id', 'unknown')))
+        return labels
 
-        adj_pairs = set()
-        for i in range(n):
-            if polys[i].is_empty:
-                continue
-            for j in range(i + 1, n):
-                if polys[j].is_empty:
-                    continue
-                try:
-                    if polys[i].intersection(polys[j]).area > 1e-12:
-                        adj_pairs.add(tuple(sorted([face_types[i], face_types[j]])))
-                except Exception:
-                    pass
+    def correct_accessgraph(self, bounds: dict, *, scale_factor: float = 1.05) -> dict:
+        """Correct the leaf access graph using **mesh adjacency between access node ids**.
 
-        nodes = (ag.get("nodes") or {}).copy()
-        edges = list((ag.get("edges") or []))
-        failed, lost = set(), set()
-        for e in edges:
+        Pipeline (all geometric reasoning uses ids, not room types):
+
+        1. Start from :attr:`access_graph` edges as pairs of node ids ``\"1\"``…``\"N\"``.
+        2. Build mesh adjacency: each face’s ``unique_id`` is the BSP leaf ``name``; map that to
+           the same access id as :attr:`access_graph`. Two ids are mesh-adjacent if some pair of
+           their faces has a shared wall / non-sliver contact (see below).
+        3. Drop predicted edges that are not mesh-adjacent; add mesh edges (sorted by id) until the
+           graph is connected when possible.
+        4. **Only then** fill ``nodes`` with each id’s ``mergeid`` (room type) from the hypergraph
+           leaves — edges stay id–id pairs.
+
+        Args:
+            bounds: Passed to :meth:`to_mesh` (e.g. dataset ``corners``).
+            scale_factor: Uniform scale of face polygons about the centroid before adjacency tests.
+                Default ``1.05`` matches the prior heuristic (bridges small mesh gaps); use ``1.0`` for
+                no inflation (stricter contact).
+        """
+        from shapely.affinity import scale as _scale
+        from shapely.geometry import Polygon
+
+        def _geoms_from_collection(geom) -> list:
+            if geom.geom_type == "GeometryCollection":
+                return list(geom.geoms)
+            return [geom]
+
+        def _polygons_adjacent(a: Polygon, b: Polygon) -> bool:
+            if a.is_empty or b.is_empty:
+                return False
+            try:
+                inter = a.intersection(b)
+            except Exception:
+                return False
+            if inter.is_empty:
+                return False
+            if inter.geom_type == "Point":
+                return False
+            if inter.geom_type in ("LineString", "LinearRing"):
+                return inter.length > 1e-4
+            if inter.geom_type == "MultiLineString":
+                return inter.length > 1e-4
+            if inter.geom_type == "Polygon":
+                return inter.area > max(1e-4, 1e-3 * min(a.area, b.area))
+            if inter.geom_type == "GeometryCollection":
+                for g in _geoms_from_collection(inter):
+                    if g.geom_type == "Point":
+                        continue
+                    if g.geom_type in ("LineString", "LinearRing") and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "MultiLineString" and g.length > 1e-4:
+                        return True
+                    if g.geom_type == "Polygon" and g.area > max(
+                        1e-4, 1e-3 * min(a.area, b.area)
+                    ):
+                        return True
+            return False
+
+        leaves = self.leaves
+        if not leaves:
+            return {"nodes": {}, "edges": []}
+
+        leaf_name_to_id = {leaf["name"]: str(i + 1) for i, leaf in enumerate(leaves)}
+        node_ids = set(leaf_name_to_id.values())
+
+        ag = self.access_graph or {}
+        if not isinstance(ag, dict):
+            ag = {}
+
+        raw_edges: list[list[str]] = []
+        for e in (ag.get("edges") or []):
             if not isinstance(e, (list, tuple)) or len(e) != 2:
                 continue
             u, v = str(e[0]), str(e[1])
-            a, b = sorted([str(nodes.get(u, "unknown")).strip().lower(), str(nodes.get(v, "unknown")).strip().lower()])
-            if (a, b) not in adj_pairs:
-                failed.add(tuple(sorted([u, v])))
-                lost.update([u, v])
-        edges = [[u, v] for u, v in edges if tuple(sorted([str(u), str(v)])) not in failed]
+            if u not in node_ids or v not in node_ids or u == v:
+                continue
+            raw_edges.append([u, v])
 
-        g = nx.Graph()
-        for nid, t in nodes.items():
-            g.add_node(str(nid), type=str(t).strip().lower())
-        for u, v in edges:
-            u, v = str(u), str(v)
-            if u in g and v in g and u != v:
-                g.add_edge(u, v)
+        def _edge_pair(u: str, v: str) -> tuple[str, str]:
+            return tuple(sorted((str(u), str(v)), key=int))
 
-        def adj_for(t):
-            t = str(t).strip().lower()
-            return {b if a == t else a for a, b in adj_pairs if t in (a, b)}
+        mesh = self.to_mesh(bounds=bounds)
+        n_faces = int(getattr(getattr(mesh, "faceList", None), "Count", 0) or 0)
+        if n_faces <= 0:
+            id_to_mergeid = {
+                str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+            }
+            return {
+                "nodes": {k: id_to_mergeid[k] for k in node_ids if k in id_to_mergeid},
+                "edges": [
+                    [p[0], p[1]]
+                    for p in sorted({_edge_pair(u, v) for u, v in raw_edges})
+                ],
+            }
 
-        for nid in [n for n in g.nodes() if g.degree(n) == 0]:
-            at = adj_for(g.nodes[nid].get("type", "unknown"))
-            for o in g.nodes():
-                if o != nid and str(g.nodes[o].get("type", "unknown")).strip().lower() in at:
-                    g.add_edge(nid, o)
-                    edges.append([nid, o])
-                    break
+        polys: list[Polygon] = []
+        face_node: list[str | None] = []
+        for i in range(n_faces):
+            face = mesh.faceList[i]
+            uid = getattr(face, "unique_id", "") or ""
+            face_node.append(leaf_name_to_id.get(uid))
+            pts = face.getPoints()
+            corners = [
+                (float(pts[j].X), float(pts[j].Y))
+                for j in range(int(getattr(pts, "Count", 0) or 0))
+            ]
+            poly = Polygon(corners) if len(corners) >= 3 else Polygon()
+            if not poly.is_empty and abs(float(scale_factor) - 1.0) > 1e-9:
+                poly = _scale(
+                    poly,
+                    xfact=float(scale_factor),
+                    yfact=float(scale_factor),
+                    origin="centroid",
+                )
+            polys.append(poly)
 
-        while True:
-            comps = list(nx.connected_components(g))
-            if len(comps) <= 1:
-                break
-            merged = False
-            for comp in comps:
-                cand = next((n for n in comp if n in lost), next(iter(comp)))
-                at = adj_for(g.nodes[cand].get("type", "unknown"))
-                for o in g.nodes():
-                    if o in comp or str(g.nodes[o].get("type", "unknown")).strip().lower() not in at:
-                        continue
-                    g.add_edge(cand, o)
-                    edges.append([cand, o])
-                    merged = True
-                    break
-                if merged:
-                    break
-            if not merged:
-                break
+        mesh_adj: set[tuple[str, str]] = set()
+        for i in range(n_faces):
+            u = face_node[i]
+            if u is None or polys[i].is_empty:
+                continue
+            for j in range(i + 1, n_faces):
+                v = face_node[j]
+                if v is None or polys[j].is_empty or u == v:
+                    continue
+                try:
+                    if _polygons_adjacent(polys[i], polys[j]):
+                        mesh_adj.add(_edge_pair(u, v))
+                except Exception:
+                    continue
 
-        return {"nodes": {str(n): str(g.nodes[n].get("type", "unknown")) for n in g.nodes()}, "edges": [[str(u), str(v)] for u, v in g.edges()]}
+        kept: list[tuple[str, str]] = []
+        seen_kept: set[tuple[str, str]] = set()
+        for u, v in raw_edges:
+            ep = _edge_pair(u, v)
+            if ep in mesh_adj and ep not in seen_kept:
+                seen_kept.add(ep)
+                kept.append(ep)
+
+        parent = {n: n for n in node_ids}
+
+        def _find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(x: str, y: str) -> bool:
+            px, py = _find(x), _find(y)
+            if px == py:
+                return False
+            parent[px] = py
+            return True
+
+        final_pairs: list[tuple[str, str]] = list(kept)
+        for u, v in kept:
+            _union(u, v)
+
+        for u, v in sorted(mesh_adj, key=lambda e: (int(e[0]), int(e[1]))):
+            if u not in node_ids or v not in node_ids:
+                continue
+            if _union(u, v):
+                final_pairs.append((u, v))
+
+        out_edges: list[list[str]] = []
+        seen_out: set[tuple[str, str]] = set()
+        for u, v in final_pairs:
+            ep = _edge_pair(u, v)
+            if ep not in seen_out:
+                seen_out.add(ep)
+                out_edges.append([ep[0], ep[1]])
+
+        out_edges.sort(key=lambda e: (int(e[0]), int(e[1])))
+
+        id_to_mergeid = {
+            str(i + 1): leaves[i].get("mergeid", "Unknown") for i in range(len(leaves))
+        }
+        return {
+            "nodes": {nid: id_to_mergeid[nid] for nid in sorted(node_ids, key=int)},
+            "edges": out_edges,
+        }
 
     def to_apartment(self, polygon, apt_id="generated",
                      RGL=None, Collections=None, verbose=False):
         """Convert this hypergraph + polygon boundary to an RGL Apartment.
 
-        Fixes area consistency (parent = sum of children) and scales
-        absolute areas to match the polygon's actual area before handing
-        the data to the RGL apartment loader.
+        Builds the Apartment shell via ``ReadApartmentsFromJson`` (which
+        populates bounds, facade, circulation, adjacency, and metadata),
+        then **replaces** the room mesh with the output of :meth:`to_mesh`
+        so that the geometry is identical regardless of whether the caller
+        uses ``to_mesh`` or ``to_apartment``.
 
         Args:
             polygon: list of ``(x, y)`` tuples defining the apartment boundary.
@@ -651,37 +948,6 @@ class Hypergraph:
         if RGL is None or Collections is None:
             RGL, Collections = self._init_rgl()
 
-        def _fix_areas(node):
-            node = copy.deepcopy(node)
-            children = node.get("children", [])
-            if not children:
-                return node
-            fixed = [_fix_areas(c) for c in children]
-            node["children"] = fixed
-            node["area"] = sum(c.get("area", 0) for c in fixed)
-            return node
-
-        def _scale_areas(node, scale):
-            node = copy.deepcopy(node)
-            node["area"] = node.get("area", 0) * scale
-            node["children"] = [_scale_areas(c, scale) for c in node.get("children", [])]
-            return node
-
-        def _count_rooms(node, room_type):
-            count = 1 if node.get("mergeid") == room_type and node.get("final") else 0
-            return count + sum(_count_rooms(c, room_type) for c in node.get("children", []))
-
-        n = len(polygon)
-        total_area = abs(sum(
-            polygon[i][0] * polygon[(i + 1) % n][1]
-            - polygon[(i + 1) % n][0] * polygon[i][1]
-            for i in range(n)
-        )) / 2
-
-        fixed_hg = _fix_areas(self._data)
-        root_area = fixed_hg.get("area", 1)
-        fixed_hg = _scale_areas(fixed_hg, total_area / root_area if root_area > 0 else 1)
-
         corners = [
             {"X": float(x), "Y": float(y), "Z": 0, "Mag": math.sqrt(x * x + y * y)}
             for x, y in polygon
@@ -693,13 +959,13 @@ class Hypergraph:
         entry = {
             "database": "generated",
             "id": apt_id,
-            "area": total_area,
-            "bedrooms": _count_rooms(self._data, "bed"),
-            "bathrooms": _count_rooms(self._data, "bath"),
+            "area": 0,
+            "bedrooms": 0,
+            "bathrooms": 0,
             "bounds": json.dumps({"corners": corners}),
             "facade": json.dumps(facade),
             "circulation": "[]",
-            "split": json.dumps(fixed_hg),
+            "split": json.dumps(self._data),
             "country": "None",
             "city": "None",
             "name": apt_id,
@@ -712,9 +978,14 @@ class Hypergraph:
         os.unlink(tmp_path)
 
         apt = apartments[0]
+
+        rooms_mesh = self.to_mesh(polygon=polygon, RGL=RGL, Collections=Collections)
+        apt.rooms = rooms_mesh
+        apt.rooms.UpdateAdjacencyListWithFaceStrings()
+
         if verbose:
-            print(f"🏠 Loaded: {apt_id} - {apt.rooms.faceList.Count} rooms, "
-                  f"{apt.bounds.Area:.1f}m²")
+            print(f"Loaded: {apt_id} - {apt.rooms.faceList.Count} rooms, "
+                  f"{apt.bounds.Area:.1f}m\u00b2")
         return apt, apt_id
 
     # -- class methods (constructors) ----------------------------------------
@@ -747,30 +1018,42 @@ class Hypergraph:
             if end_idx != -1:
                 json_section = json_section[:end_idx]
             json_section = _strip_fences(json_section)
+            obj = None
+            used_first_object_only = False
             try:
                 obj = json.loads(json_section)
-                if isinstance(obj, dict) and "name" in obj and "children" in obj:
-                    if not silent:
-                        logger.info("✅ Successfully extracted JSON from assistant section")
-                    return cls(obj)
-                else:
-                    if not silent:
-                        logger.warning("Parsed JSON but missing required fields ('name' or 'children')")
             except json.JSONDecodeError as e:
-                if not silent:
+                obj = _parse_first_json_object(json_section)
+                if obj is not None:
+                    used_first_object_only = True
+                elif not silent:
                     logger.warning(f"Found assistant section but failed to parse JSON: {e}")
                     logger.debug(f"Attempted to parse: {json_section[:200]}...")
 
+            if obj is not None and isinstance(obj, dict) and "name" in obj and "children" in obj:
+                if not silent:
+                    if used_first_object_only:
+                        logger.info(
+                            "✅ Extracted hypergraph JSON from assistant section "
+                            "(first JSON object only; trailing model text ignored)"
+                        )
+                    else:
+                        logger.info("✅ Successfully extracted JSON from assistant section")
+                return cls(obj)
+            if obj is not None and isinstance(obj, dict) and not silent:
+                logger.warning("Parsed JSON but missing required fields ('name' or 'children')")
+
         if allow_raw_json_fallback:
             json_section = _strip_fences(response)
+            obj = None
             try:
                 obj = json.loads(json_section)
-                if isinstance(obj, dict) and "name" in obj and "children" in obj:
-                    if not silent:
-                        logger.info("✅ Successfully extracted JSON from raw response")
-                    return cls(obj)
             except json.JSONDecodeError:
-                pass
+                obj = _parse_first_json_object(json_section)
+            if isinstance(obj, dict) and "name" in obj and "children" in obj:
+                if not silent:
+                    logger.info("✅ Successfully extracted JSON from raw response")
+                return cls(obj)
 
         if not silent:
             logger.error("❌ Could not find valid JSON in response")
@@ -899,14 +1182,29 @@ class HypergraphPlotter:
         'storage': '#5254a3',
         'storeroom': '#5254a3',
         'stairs': '#72246c',
+        'outside': '#FF0000',
     }
 
     ROOM_COLOR_MAP = ROOM_COLORS  # legacy alias
+
+    MESH_SLIVER_FRAC = 1e-3  # faces < 0.1 % of total mesh area are Clipper noise
 
     def __init__(self, color_map=None):
         self.color_map = color_map if color_map is not None else self.ROOM_COLORS
 
     # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _mesh_min_area(face_list):
+        """Return the minimum visible face area for *face_list*.
+
+        Sums every face's area, then returns
+        ``total * MESH_SLIVER_FRAC``.  Faces below this value are
+        Clipper numerical artifacts and should be skipped when rendering.
+        """
+        total = sum(getattr(face_list[i], 'Area', 0)
+                    for i in range(face_list.Count))
+        return total * HypergraphPlotter.MESH_SLIVER_FRAC
 
     @staticmethod
     def create_color_map_with_roomtype(graph):
@@ -977,7 +1275,8 @@ class HypergraphPlotter:
 
     # -- main plotting methods -----------------------------------------------
 
-    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8)):
+    def plot_hypergraph(self, json_data, title=None, figsize=(10, 8),
+                        node_scale=1):
         """Plot a hypergraph from JSON data. Returns the NetworkX graph."""
         import networkx as nx
         import matplotlib.pyplot as plt
@@ -1024,7 +1323,7 @@ class HypergraphPlotter:
                     nx.draw_networkx_edges(graph, pos=layout, edgelist=[(u, v)],
                                            edge_color='black', width=1.5, style='dotted')
 
-        node_sizes = [nd.get('area', 0.5) * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd.get('area', 0.5) * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5, node_size=node_sizes)
 
@@ -1043,6 +1342,136 @@ class HypergraphPlotter:
         plt.show()
         return graph
 
+    @staticmethod
+    def _layout_by_component(g, components):
+        """Lay out each connected component independently, then tile them.
+
+        Produces much cleaner results than a single global layout because
+        disconnected components no longer compete for the same space.
+        """
+        import networkx as nx
+
+        def _layout_one(sub):
+            if sub.number_of_nodes() == 1:
+                n = list(sub.nodes())[0]
+                return {n: (0.0, 0.0)}
+            return nx.kamada_kawai_layout(sub, scale=2.0)
+
+        if len(components) <= 1:
+            return _layout_one(g)
+
+        pos = {}
+        comp_boxes = []
+        for comp in sorted(components, key=len, reverse=True):
+            sub = g.subgraph(comp)
+            sub_pos = _layout_one(sub)
+
+            if len(sub_pos) > 1:
+                xs = [p[0] for p in sub_pos.values()]
+                ys = [p[1] for p in sub_pos.values()]
+                w = max(xs) - min(xs)
+                h = max(ys) - min(ys)
+                cx = (max(xs) + min(xs)) / 2
+                cy = (max(ys) + min(ys)) / 2
+            else:
+                w, h, cx, cy = 0.0, 0.0, 0.0, 0.0
+
+            centred = {n: (p[0] - cx, p[1] - cy) for n, p in sub_pos.items()}
+            comp_boxes.append((centred, w, h))
+
+        gap = 1.0
+        x_cursor = 0.0
+        for centred, w, h in comp_boxes:
+            offset_x = x_cursor + max(w, 0.5) / 2
+            for n, (px, py) in centred.items():
+                pos[n] = (px + offset_x, py)
+            x_cursor += max(w, 0.5) + gap
+
+        return pos
+
+    @staticmethod
+    def make_distinct_labels(ag_dict: dict) -> dict[str, str]:
+        """Build distinct labels like ``foyer1``, ``foyer2`` for each node.
+
+        When a room type appears only once, the label is just the type
+        (e.g. ``living``).  When it appears more than once, a 1-based
+        index is appended (e.g. ``bed1``, ``bed2``).
+
+        Args:
+            ag_dict: Access-graph dict with ``nodes`` mapping
+                     node-id -> room-type.
+
+        Returns:
+            Dict mapping node-id -> distinct label string.
+        """
+        from collections import Counter
+
+        nodes = ag_dict.get("nodes", {})
+        type_counts: Counter = Counter(nodes.values())
+        type_seen: dict[str, int] = {}
+        labels: dict[str, str] = {}
+        for nid in sorted(nodes, key=lambda x: int(x)):
+            rtype = nodes[nid]
+            if type_counts[rtype] > 1:
+                type_seen[rtype] = type_seen.get(rtype, 0) + 1
+                labels[nid] = f"{rtype}{type_seen[rtype]}"
+            else:
+                labels[nid] = rtype
+        return labels
+
+    def plot_access_graph_on_axis(self, ag_dict, ax, title=None,
+                                  components=None, node_labels=None):
+        """Plot an access graph on a specific *ax*.
+
+        Args:
+            ag_dict: Access-graph dict with ``nodes`` and ``edges`` keys
+                     (as returned by :pyattr:`Hypergraph.access_graph`).
+            ax: Matplotlib axis to draw on.
+            title: Optional axis title.
+            components: Optional list of node-id sets (connected
+                        components).  Used to lay out each component
+                        independently for a cleaner graph.
+            node_labels: Optional dict mapping node-id -> label string.
+                         When provided, labels are drawn on the nodes.
+        """
+        import networkx as nx
+        from .metrics import accessgraph_dict_to_nx
+
+        g = accessgraph_dict_to_nx(ag_dict)
+        if g.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "No nodes", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=14)
+            ax.axis("off")
+            return
+
+        if components is None:
+            components = list(nx.connected_components(g))
+
+        node_fill = [
+            self.ROOM_COLORS.get(g.nodes[n].get("label", ""), "#CCCCCC")
+            for n in g.nodes()
+        ]
+
+        pos = self._layout_by_component(g, components)
+
+        nx.draw_networkx_edges(
+            g, pos, edge_color='#b8b5b4', width=4.0,
+            style='dotted', ax=ax)
+
+        nx.draw_networkx_nodes(
+            g, pos, node_color=node_fill,
+            edgecolors='blue', linewidths=0.0,
+            node_size=1000, ax=ax)
+
+        if node_labels is not None:
+            nx.draw_networkx_labels(
+                g, pos, labels=node_labels,
+                font_size=7, font_weight="bold", ax=ax)
+
+        if title:
+            ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.axis("off")
+
     def display_single_graph(self, dfX, i):
         """Display a single graph from a DataFrame row."""
         import matplotlib.pyplot as plt
@@ -1055,7 +1484,8 @@ class HypergraphPlotter:
         )
         plt.show()
 
-    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax):
+    def display_graph(self, graph, subd, adj, id_val, city, area, bedrooms, ax,
+                      node_scale=1):
         """Display a graph with detailed information on *ax*."""
         import networkx as nx
 
@@ -1086,7 +1516,7 @@ class HypergraphPlotter:
                                            edge_color='black', width=1.5,
                                            style='dotted', ax=ax)
 
-        node_sizes = [nd['area'] * 2000 for _, nd in graph.nodes(data=True)]
+        node_sizes = [nd['area'] * node_scale for _, nd in graph.nodes(data=True)]
         nx.draw_networkx_nodes(graph, pos=layout, node_color=color_map,
                                edgecolors='black', linewidths=0.5,
                                node_size=node_sizes, ax=ax)
@@ -1119,10 +1549,13 @@ class HypergraphPlotter:
         room_types_plotted = set()
 
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_counts[room_type] = room_counts.get(room_type, 0) + 1
 
@@ -1203,10 +1636,13 @@ class HypergraphPlotter:
 
         total_area = 0
         if hasattr(apartment, 'rooms') and apartment.rooms:
+            min_area = self._mesh_min_area(apartment.rooms.faceList)
             for i in range(apartment.rooms.faceList.Count):
                 face = apartment.rooms.faceList[i]
-                room_type = getattr(face, 'merge_id', 'unknown')
                 area_val = getattr(face, 'Area', 0)
+                if area_val < min_area:
+                    continue
+                room_type = getattr(face, 'merge_id', 'unknown')
                 total_area += area_val
                 room_corners = []
                 for j in range(face.getPoints().Count):
@@ -1250,8 +1686,11 @@ class HypergraphPlotter:
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 10))
+        min_area = self._mesh_min_area(mesh.faceList)
         for i in range(mesh.faceList.Count):
             face = mesh.faceList[i]
+            if getattr(face, 'Area', 0) < min_area:
+                continue
             room_type = getattr(face, 'merge_id', 'unknown')
             points = face.getPoints()
             corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
@@ -1267,3 +1706,58 @@ class HypergraphPlotter:
         plt.tight_layout()
         plt.show()
         return fig, ax
+
+    def plot_mesh_on_axis(self, mesh, ax, boundary_polygon=None,
+                          title="Floor Plan", face_labels=None):
+        """Plot a generated mesh on a specific *ax* (for subplots).
+
+        Same visual style as :meth:`simple_plot_generated_mesh` and
+        :meth:`plot_complex_apartment_on_axis` but renders onto an
+        existing Matplotlib axis.
+
+        Args:
+            mesh: RGL NMesh with room faces.
+            ax: Matplotlib axis to draw on.
+            boundary_polygon: Optional list of (x, y) tuples for the
+                apartment boundary outline.
+            title: Optional axis title.
+            face_labels: Optional list of label strings, one per face
+                (indexed same as ``mesh.faceList``).  When provided,
+                these labels are drawn instead of the raw room type.
+        """
+        import numpy as np
+        from shapely.geometry import Polygon
+
+        if boundary_polygon:
+            bx = [p[0] for p in boundary_polygon] + [boundary_polygon[0][0]]
+            by = [p[1] for p in boundary_polygon] + [boundary_polygon[0][1]]
+            ax.plot(bx, by, 'k-', linewidth=2)
+
+        min_area = self._mesh_min_area(mesh.faceList)
+        total_area = 0
+        for i in range(mesh.faceList.Count):
+            face = mesh.faceList[i]
+            room_type = getattr(face, 'merge_id', 'unknown')
+            area_val = getattr(face, 'Area', 0)
+            if area_val < min_area:
+                continue
+            total_area += area_val
+            points = face.getPoints()
+            corners = [(points[j].X, points[j].Y) for j in range(points.Count)]
+            if len(corners) < 3:
+                continue
+            poly = Polygon(corners)
+            x, y = poly.exterior.xy
+            color = self.color_map.get(room_type, '#D3D3D3')
+            ax.fill(x, y, color=color, edgecolor='black', linewidth=0.5, alpha=1)
+            label = (face_labels[i]
+                     if face_labels is not None and i < len(face_labels)
+                     else room_type)
+            ax.text(np.mean(list(x)), np.mean(list(y)), label,
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+
+        ax.set_aspect('equal')
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.text(0.02, 0.98, f"Area: {total_area:.1f}m\u00b2",
+                transform=ax.transAxes, verticalalignment='top', fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor='lightyellow'))

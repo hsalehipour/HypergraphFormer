@@ -8,6 +8,18 @@ Qwen and GPT generation/evaluation scripts.
 import json
 
 
+_OUTSIDE_RULES_TEXT_1 ="""\
+  The only exception is the Outside node. It is a special node that denotes that the room it is connected to has an outside door.
+  Therefore, it should be located by the boundary of the apartment and not be surrounded by other rooms. 
+  However, this node should not be considered part of the accessgraph or part of the list of rooms.
+  """
+
+
+_OUTSIDE_RULES_TEXT_2 ="""\
+  Make sure that the accessgraph respects the Outside property of one of the rooms.
+  """
+
+
 BSP_RULES_TEXT = """\
 # CRITICAL STRUCTURE RULES:
 
@@ -91,39 +103,51 @@ def create_structured_prompt(examples, target_accessgraph=None):
             When None, produces a generic generation prompt instead.
     """
 
+    has_examples = bool(examples)
+
+    intro_examples_line = (
+        "You will be shown examples of access graphs paired with their corresponding hypergraphs, "
+        "then generate a new hypergraph following the same structure and rules."
+        if has_examples
+        else "Generate a hypergraph for the given access graph following the structure and rules below."
+    )
+
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
 Your task is to learn how to generate a hypergraph from an access graph. An access graph is a simple representation of room connectivity:
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
-You will be shown examples of access graphs paired with their corresponding hypergraphs, then generate a new hypergraph following the same structure and rules.
+{_OUTSIDE_RULES_TEXT_1}
+
+{intro_examples_line}
 
 {BSP_RULES_TEXT}
-
-# TRAINING EXAMPLES (Access Graph → Hypergraph):
-
-Below are examples showing how access graphs map to hypergraphs. Learn from these input-output pairs:
-
 """
 
-    for i, example in enumerate(examples, 1):
-        prompt += f"\n## Example {i} ({example['filename']}):\n\n"
-        prompt += "### Input - Access Graph:\n"
-        prompt += "```json\n"
-        prompt += json.dumps(example['accessgraph'], indent=2)
-        prompt += "\n```\n\n"
-        prompt += "### Output - Hypergraph:\n"
-        prompt += "```json\n"
-        prompt += json.dumps(example['hypergraph'], indent=2)
-        prompt += "\n```\n"
+    if has_examples:
+        prompt += (
+            "\n# TRAINING EXAMPLES (Access Graph → Hypergraph):\n\n"
+            "Below are examples showing how access graphs map to hypergraphs. "
+            "Learn from these input-output pairs:\n\n"
+        )
+        for i, example in enumerate(examples, 1):
+            prompt += f"\n## Example {i} ({example['filename']}):\n\n"
+            prompt += "### Input - Access Graph:\n"
+            prompt += "```json\n"
+            prompt += json.dumps(example['accessgraph'], indent=2)
+            prompt += "\n```\n\n"
+            prompt += "### Output - Hypergraph:\n"
+            prompt += "```json\n"
+            prompt += json.dumps(example['hypergraph'], indent=2)
+            prompt += "\n```\n"
 
     if target_accessgraph:
         prompt += f"""
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph:
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
 
 ### Target Access Graph:
 ```json
@@ -290,42 +314,7 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
-{_SIMPLE_BSP_RULES_TEXT}
-
-{_SIMPLE_CONNECTIVITY_RULES}
-
-{_ANGLE_RULES}
-
-# YOUR TASK:
-
-Generate a hypergraph (BSP tree) for the following access graph.
-
-### Access Graph:
-```json
-{json.dumps(target_accessgraph, indent=2)}
-```
-
-{_SIMPLE_REQUIREMENTS.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
-
-Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
-
-    return prompt
-
-
-def create_simple_prompt_footprint(target_accessgraph, bounds):
-    """
-    Create a prompt with BSP rules, access graph, and apartment footprint.
-    Used by evaluator.py (--mode trained --footprint).
-    """
-    prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
-
-Your task is to generate a hypergraph from an access graph and an apartment footprint.
-
-An access graph is a simple representation of room connectivity:
-- `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
-- `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
-
-An apartment footprint is a representation of the apartment boundaries that the hypergraph must partition.
+{_OUTSIDE_RULES_TEXT_1}
 
 {_SIMPLE_BSP_RULES_TEXT}
 
@@ -335,16 +324,11 @@ An apartment footprint is a representation of the apartment boundaries that the 
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph and apartment footprint.
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
 
 ### Access Graph:
 ```json
 {json.dumps(target_accessgraph, indent=2)}
-```
-
-### Apartment Footprint:
-```json
-{json.dumps(bounds, indent=2)}
 ```
 
 {_SIMPLE_REQUIREMENTS.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
@@ -416,6 +400,8 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 - `nodes`: Dictionary mapping room IDs to room types (e.g., {{"1": "Bedroom", "2": "Kitchen"}})
 - `edges`: List of connections between rooms (e.g., [["1", "2"], ["2", "3"]])
 
+{_OUTSIDE_RULES_TEXT_1}
+
 {_SIMPLE_BSP_RULES_TEXT}
 
 {_SIMPLE_CONNECTIVITY_RULES}
@@ -424,29 +410,24 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph."""
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"""
 
     return prompt
 
 
-def create_training_sample(accessgraph, hypergraph, bounds=None):
+def create_training_sample(accessgraph, hypergraph):
     """
     Create a single training sample in chat format for fine-tuning.
 
     Args:
         accessgraph: Access graph dictionary
         hypergraph: Ground truth hypergraph dictionary
-        bounds: Optional apartment footprint/boundary dictionary. When provided,
-                the user prompt matches the footprint evaluation prompt.
 
     Returns:
         dict: Training sample with 'messages' field in chat format
     """
-    if bounds is not None:
-        user_content = create_simple_prompt_footprint(accessgraph, bounds)
-    else:
-        instruction = create_instruction_prompt()
-        user_content = f"""{instruction}
+    instruction = create_instruction_prompt()
+    user_content = f"""{instruction}
 
 ### Access Graph:
 ```json

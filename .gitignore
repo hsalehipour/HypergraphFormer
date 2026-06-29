@@ -44,6 +44,8 @@ events.out.tfevents*
 *.pdf
 *.jsonl
 *.pth
+*.xlsx
+*.mat
 
 # exclude requirements.txt
 !requirements.txt
@@ -51,8 +53,8 @@ events.out.tfevents*
 # directories
 checkpoints/
 
-dataset/hypergraph/*
-!dataset/hypergraph/train.json
-!dataset/hypergraph/validation.json
-!dataset/hypergraph/test.json
+!dataset/wmr24/wmr24.json
 *.code-workspace
+_debug/
+utils/visualization_helpers.py
+scripts/viz_rplan_qwen_meshes_and_adjacency_comparison.py

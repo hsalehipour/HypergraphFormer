@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Evaluate HouseGAN++ on the Hypergraph1K Dataset.
+Evaluate HouseGAN++ floorplan generation.
 
-Generates floorplans and computes three metrics against ground truth:
+Generates floorplans and computes four metrics against ground truth:
   1. GED  -- Graph Edit Distance between predicted and GT access graphs
   2. Room Accuracy -- Room count and type distribution matching
   3. Delta -- Room shape regularity deviation (geometric similarity)
+  4. Area Proportion Error -- Mean absolute area-proportion difference between paired rooms
+
+Expects an RPLAN pickle file via --data_path.  To convert from
+RPLAN JSON files, use benchmark/utils/convert_json_to_pickle.py first
+(the shell wrapper eval_houseganpp.sh does this automatically).
 
 Supports caching generated outputs for reproducible re-evaluation.
 """
@@ -21,17 +26,16 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import multiprocessing
-from scipy import ndimage
+from collections import defaultdict
 from datetime import datetime
 import webcolors
 import cv2
 from PIL import Image, ImageDraw
 
-from utils.metrics import ged_between_graphs
-from utils.metrics import room_type_accuracy
-from benchmark.src.dataset_loader import Hypergraph1kDataset, collate_fn
-from benchmark.utils.ged_statistics import compute_and_save_ged_statistics
-from benchmark.utils.visualize_hypergraph_pickle import draw_floorplan_from_pickle
+from utils.metrics import ged_between_graphs, room_type_accuracy
+from utils.metrics import compute_room_area_proportion_error as compute_area_prop_metric
+from benchmark.src.dataset_loader import BenchmarkDataset, collate_fn
+from utils.report_results import report_results
 from houseganpp.misc.utils import _init_input
 from houseganpp.models.models import Generator
 
@@ -43,6 +47,13 @@ ROOM_CLASS = {
 }
 CLASS_ROOM = {v: k for k, v in ROOM_CLASS.items()}
 
+
+def _room_geometries_to_area_tuples(room_geometries):
+    """Convert room geometry dicts to ``(merge_id, area)`` tuples for metrics.py."""
+    return [(CLASS_ROOM.get(r['room_type'], str(r['room_type'])), r['area'])
+            for r in room_geometries]
+
+
 # Color scheme for room types matching visualize_hypergraph.ipynb
 ID_COLOR = {
     3: '#5B448C',       # Bedroom; Dark purple
@@ -52,7 +63,43 @@ ID_COLOR = {
     6: '#ED6D87',       # foyer; Pinkish (same as living)
     10: '#FF9FBB',      # extra; Light pink
     17: '#b8b5b4',      # door; light grey
+    -1: 'white',        # outside node (matches original HouseGAN++ script)
 }
+
+def draw_floorplan_from_pickle(sample, output_size=512):
+    """
+    Draw a floor plan visualization from pickle sample data.
+    
+    Args:
+        sample: Dictionary containing 'polygons' and 'room_types'
+        output_size: Output image size in pixels (default: 512 for high quality)
+        
+    Returns:
+        PIL Image object
+    """
+    # Extract data
+    room_types = sample['room_types']
+    polygons = sample['polygons']
+    
+    # Create high-resolution image
+    img = Image.new('RGB', (output_size, output_size), 'white')
+    draw_obj = ImageDraw.Draw(img)
+    
+    # Draw each room/door polygon
+    for i, (room_type, polygon) in enumerate(zip(room_types, polygons)):
+        if len(polygon) < 3:
+            continue
+        
+        # Polygons are in normalized [0, 64] coordinates, scale to output size
+        scaled_poly = [(x * output_size / 64.0, y * output_size / 64.0) for x, y in polygon]
+        
+        # Get color for this room type
+        color = ID_COLOR.get(room_type, '#FFFFFF')
+        
+        # Draw filled polygon with outline
+        draw_obj.polygon(scaled_poly, fill=color, outline='black', width=3)
+    
+    return img
 
 def draw_masks(masks, room_types, image_size=256):
     """
@@ -98,28 +145,6 @@ def draw_masks(masks, room_types, image_size=256):
     
     return bg_img.resize((image_size, image_size))
 
-def mask_to_bb(mask):
-    """
-    Convert binary mask to bounding box.
-    
-    Args:
-        mask: Binary mask (2D numpy array)
-        
-    Returns:
-        Bounding box [x0, y0, x1, y1]
-    """
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    
-    if not rows.any() or not cols.any():
-        # Empty mask
-        return [0, 0, 0, 0]
-    
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    
-    return [rmin, cmin, rmax, cmax]
-
 
 def count_actual_rooms_from_masks(nodes, masks):
     """
@@ -157,11 +182,9 @@ def count_actual_rooms_from_masks(nodes, masks):
             expected_rooms += 1
             expected_room_types.append(int(room_type))
             
-            # Get mask and count connected components
-            mask = masks[k] > 0
-            
-            # Use scipy.ndimage.label to find connected components
-            labeled_mask, num_components = ndimage.label(mask)
+            mask = (masks[k] > 0).astype(np.uint8)
+            num_labels, _ = cv2.connectedComponents(mask)
+            num_components = num_labels - 1  # subtract background label
             
             total_room_regions += num_components
             per_mask_components.append(num_components)
@@ -266,6 +289,33 @@ def extract_room_geometries_from_masks(nodes, masks):
                         })
     
     return room_geometries
+
+
+def compute_spatial_overlap_ratio_from_masks(nodes, masks):
+    """Fraction of total room area that overlaps with other rooms (mask-based).
+
+    Args:
+        nodes: Array of room types (0-indexed from one-hot).
+        masks: Generated masks ``[num_masks, H, W]``.
+
+    Returns:
+        float in ``[0, 1]``, or ``nan`` if no room pixels exist.
+    """
+    room_types = nodes + 1
+    binary_masks = []
+    for k, room_type in enumerate(room_types):
+        if room_type not in [15, 17]:
+            binary_masks.append(masks[k] > 0)
+    if not binary_masks:
+        return float('nan')
+    sum_of_areas = sum(int(np.count_nonzero(m)) for m in binary_masks)
+    if sum_of_areas == 0:
+        return float('nan')
+    union_mask = np.zeros_like(binary_masks[0], dtype=bool)
+    for m in binary_masks:
+        union_mask |= m
+    union_area = int(np.count_nonzero(union_mask))
+    return 1.0 - (union_area / sum_of_areas)
 
 
 def compute_room_similarity_score(pred_nodes, pred_masks, gt_nodes, gt_masks):
@@ -394,163 +444,148 @@ def _infer(graph, model, prev_state=None):
     return masks
 
 
-def is_adjacent(bb1, bb2, threshold=0.05):
+def remove_multiple_components(masks, nodes):
     """
-    Check if two bounding boxes are adjacent.
+    For each mask, keep only the largest connected component.
+    
+    Matches HouseGAN++ misc/utils.py remove_multiple_components().
     
     Args:
-        bb1, bb2: Bounding boxes in format [x0, y0, x1, y1]
-        threshold: Distance threshold for adjacency
+        masks: List or array of masks
+        nodes: Array of 0-indexed room type indices
     
     Returns:
-        True if boxes are adjacent
+        List of cleaned masks
     """
-    x0, y0, x1, y1 = bb1
-    x2, y2, x3, y3 = bb2
-    
-    h1, h2 = x1 - x0, x3 - x2
-    w1, w2 = y1 - y0, y3 - y2
-    
-    xc1, xc2 = (x0 + x1) / 2.0, (x2 + x3) / 2.0
-    yc1, yc2 = (y0 + y1) / 2.0, (y2 + y3) / 2.0
-    
-    delta_x = abs(xc2 - xc1) - (h1 + h2) / 2.0
-    delta_y = abs(yc2 - yc1) - (w1 + w2) / 2.0
-    
-    return delta_x <= threshold and delta_y <= threshold
+    new_masks = []
+    for mk, nd in zip(masks, nodes):
+        m_cv = np.array(mk)
+        m_cv[m_cv > 0] = 255.0
+        m_cv[m_cv < 0] = 0.0
+        m_cv = m_cv.astype('uint8')
+        ret, thresh = cv2.threshold(m_cv, 127, 255, 0)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 1:
+            cnt_m = np.zeros_like(m_cv)
+            c = max(contours, key=cv2.contourArea)
+            cv2.drawContours(cnt_m, [c], 0, (255, 255, 255), -1)
+            cnt_m[cnt_m > 0] = 1.0
+            cnt_m[cnt_m < 0] = -1.0
+            new_masks.append(cnt_m)
+        else:
+            new_masks.append(mk)
+    return new_masks
 
 
 def build_access_graph_from_masks(nodes, masks):
     """
-    Build access graph from generated masks by detecting door connections.
+    Build access graph from generated masks using IoU-based door detection.
     
-    Extracts which rooms are connected through doors in the generated layout.
+    Matches the algorithm from HouseGAN++ misc/utils.py estimate_graph():
+    - Remove multiple components per mask (keep largest)
+    - For each door, compute IoU with every room mask
+    - Accept connections where 0 < IoU < 0.2
+    - Interior doors (type 17): connect the top-2 rooms by IoU
+    - Front doors (type 15): connect the top-1 room to an outside node (-1)
     
     Args:
         nodes: Array of room types (integer indices, 0-indexed from one-hot)
         masks: Generated masks for each room/door
     
     Returns:
-        NetworkX graph with only room nodes and door-based connections
+        NetworkX graph with room nodes, an outside node (-1), and door-based connections
     """
-    # Convert nodes to 1-indexed room types (RPLAN IDs)
-    room_types = nodes + 1
-    
-    # Create graph
+    masks = remove_multiple_components(masks, nodes)
+
     G = nx.Graph()
-    door_connections = {}  # door_idx -> [connected_room_indices]
-    
-    # Identify room and door nodes
-    room_indices = []
-    door_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_indices.append(k)
-            door_connections[k] = []
-    
-    # For each door, find which rooms it connects
-    for door_idx in door_indices:
-        door_mask = masks[door_idx] > 0
-        
-        # Check which rooms are adjacent to this door
-        for room_idx in room_indices:
-            room_mask = masks[room_idx] > 0
-            
-            # Check if door and room are adjacent (share boundary)
-            # Dilate door mask and check for overlap with room
-            dilated_door = ndimage.binary_dilation(door_mask, iterations=2)
-            
-            if np.any(dilated_door & room_mask):
-                door_connections[door_idx].append(room_idx)
-    
-    # Connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if not G.has_edge(room1, room2):
-                    G.add_edge(room1, room2)
-    
+
+    for k, label in enumerate(nodes):
+        _type = label + 1
+        if _type >= 0 and _type not in [15, 17]:
+            G.add_node(k, label=int(_type))
+
+    G.add_node(-1, label=-1)
+
+    doors_inds = np.where((nodes == 14) | (nodes == 16))[0]
+    rooms_inds = np.where((nodes != 14) & (nodes != 16))[0]
+    doors_rooms_map = defaultdict(list)
+    for k in doors_inds:
+        for l in rooms_inds:
+            if k > l:
+                m1 = np.array(masks[k], dtype=float)
+                m2 = np.array(masks[l], dtype=float)
+                m1[m1 > 0] = 1.0
+                m1[m1 <= 0] = 0.0
+                m2[m2 > 0] = 1.0
+                m2[m2 <= 0] = 0.0
+                union = float(np.logical_or(m1, m2).sum())
+                if union > 0:
+                    iou = np.logical_and(m1, m2).sum() / union
+                    if iou > 0 and iou < 0.2:
+                        doors_rooms_map[k].append((l, iou))
+
+    for k in doors_rooms_map.keys():
+        _conn = doors_rooms_map[k]
+        _conn = sorted(_conn, key=lambda tup: tup[1], reverse=True)
+        _conn_top2 = _conn[:2]
+        if nodes[k] + 1 != 15:  # interior door
+            if len(_conn_top2) > 1:
+                l1, l2 = _conn_top2[0][0], _conn_top2[1][0]
+                if not G.has_edge(l1, l2):
+                    G.add_edge(l1, l2)
+        else:  # front door -> connect to outside node
+            if len(_conn) > 0:
+                l1 = _conn[0][0]
+                if not G.has_edge(-1, l1):
+                    G.add_edge(-1, l1)
+
     return G
 
 
 def build_access_graph_from_structure(nodes, edges, masks=None):
     """
-    Build access graph where edges exist only between rooms connected through doors.
+    Build GT access graph from graph structure (triples).
+    
+    Matches the algorithm from HouseGAN++ misc/utils.py draw_graph():
+    - Room nodes for all non-door types
+    - Outside node (-1) connected via front doors (type 15)
+    - Room-room edges where both endpoints are rooms and rel > 0
+    - Front door edges: if one endpoint is type 15 and rel > 0,
+      connect the other (non-door) room to outside (-1)
     
     Args:
         nodes: Array of room types (integer indices, 0-indexed from one-hot)
         edges: Edge triples [node1_idx, relationship, node2_idx]
-        masks: Optional generated masks to check spatial adjacency
-               If provided, validates door connections in generated layout
+        masks: Unused (kept for API compatibility)
     
     Returns:
-        NetworkX graph with only room nodes and door-based connections
+        NetworkX graph with room nodes, outside node (-1), and door-based connections
     """
-    # Convert nodes to 1-indexed room types (RPLAN IDs)
-    room_types = nodes + 1
-    
-    # Create graph
     G = nx.Graph()
-    door_connections = {}  # door_idx -> [room1, room2, ...]
-    
-    # Add only room nodes (exclude doors type 17 and front door type 15)
-    room_indices = []
-    for k, room_type in enumerate(room_types):
-        if room_type not in [15, 17]:
-            G.add_node(k, label=int(room_type))
-            room_indices.append(k)
-        elif room_type == 17:
-            door_connections[k] = []
-    
-    # If masks provided, convert to bounding boxes for adjacency checking
-    bboxes = None
-    if masks is not None:
-        bboxes = []
-        for mask in masks:
-            try:
-                bb = mask_to_bb(mask)
-                # Normalize to [0, 1] range
-                bb = np.array(bb) / float(masks.shape[-1])
-                bboxes.append(bb)
-            except:
-                bboxes.append(np.array([0.0, 0.0, 0.0, 0.0]))
-        bboxes = np.array(bboxes)
-    
-    # Find connections through doors
-    # First pass: identify which rooms connect to which doors
+
+    for k, label in enumerate(nodes):
+        _type = label + 1
+        if _type >= 0 and _type not in [15, 17]:
+            G.add_node(k, label=int(_type))
+
+    G.add_node(-1, label=-1)
+
     for edge in edges:
-        # Handle both numpy arrays and scalars (use .item() for numpy arrays)
-        node1 = int(edge[0].item() if hasattr(edge[0], 'item') else edge[0])
-        rel = int(edge[1].item() if hasattr(edge[1], 'item') else edge[1])
-        node2 = int(edge[2].item() if hasattr(edge[2], 'item') else edge[2])
-        
-        # Only consider adjacent edges (rel > 0)
-        if rel > 0:
-            # Handle numpy arrays in room_types
-            type1 = int(room_types[node1].item() if hasattr(room_types[node1], 'item') else room_types[node1])
-            type2 = int(room_types[node2].item() if hasattr(room_types[node2], 'item') else room_types[node2])
-            
-            # If one node is a door (17) and the other is a room
-            if type1 == 17 and type2 not in [15, 17]:
-                # Check spatial adjacency if masks provided
-                if bboxes is None or is_adjacent(bboxes[node1], bboxes[node2]):
-                    door_connections[node1].append(node2)
-            elif type2 == 17 and type1 not in [15, 17]:
-                if bboxes is None or is_adjacent(bboxes[node1], bboxes[node2]):
-                    door_connections[node2].append(node1)
-    
-    # Second pass: connect rooms that share a door
-    for door_idx, connected_rooms in door_connections.items():
-        # Connect all pairs of rooms that share this door
-        for i, room1 in enumerate(connected_rooms):
-            for room2 in connected_rooms[i+1:]:
-                if room1 in room_indices and room2 in room_indices:
-                    G.add_edge(room1, room2)
-    
+        k = int(edge[0].item() if hasattr(edge[0], 'item') else edge[0])
+        m = int(edge[1].item() if hasattr(edge[1], 'item') else edge[1])
+        l = int(edge[2].item() if hasattr(edge[2], 'item') else edge[2])
+
+        _type_k = int(nodes[k]) + 1
+        _type_l = int(nodes[l]) + 1
+
+        if m > 0 and (_type_k not in [15, 17] and _type_l not in [15, 17]):
+            G.add_edge(k, l)
+        elif m > 0 and (_type_k == 15 or _type_l == 15) and (_type_l != 17 and _type_k != 17):
+            if _type_k == 15:
+                G.add_edge(l, -1)
+            elif _type_l == 15:
+                G.add_edge(k, -1)
+
     return G
 
 
@@ -656,8 +691,9 @@ def parse_args():
                        help="filter by number of rooms (None = no filter)")
     
     # Model parameters
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="path to trained generator checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="path to trained generator checkpoint"
+                            " (required unless --load_generations is used)")
     
     # Evaluation parameters
     parser.add_argument("--batch_size", type=int, default=1,
@@ -716,15 +752,18 @@ def visualize_comparison(
     ax_graph_gt = fig.add_subplot(gs[1, 0])
     ax_graph_gt.set_title('GT: Door Connections', fontsize=10)
     if G_true.number_of_nodes() > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos_true = nx.nx_agraph.graphviz_layout(G_true, prog='neato')
         except:
             pos_true = nx.spring_layout(G_true, seed=42, k=1.5)
-        colors_true = [ID_COLOR[G_true.nodes[n]['label']] for n in G_true.nodes()]
-        nx.draw(G_true, pos_true, node_color=colors_true, node_size=1000,
-                with_labels=False, ax=ax_graph_gt, edge_color='#b8b5b4',
-                style='dotted', width=4.0, edgecolors='blue', linewidths=0.0)
+        node_colors = [ID_COLOR.get(G_true.nodes[n]['label'], '#BEBEBE') for n in G_true.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_true.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_true.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_true.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#D3A2C7' for u, v in G_true.edges()]
+        nx.draw(G_true, pos_true, node_color=node_colors, node_size=node_sizes,
+                edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
+                style='dotted', width=4.0, with_labels=False, ax=ax_graph_gt)
     ax_graph_gt.axis('off')
     
     # Top right: Predicted floorplan
@@ -739,15 +778,18 @@ def visualize_comparison(
     ax_graph_pred = fig.add_subplot(gs[1, 1])
     ax_graph_pred.set_title('Predicted: Door Connections', fontsize=10)
     if len(G_pred.nodes()) > 0:
-        # Use graphviz neato layout for cleaner visualization (matches adjacency graph style)
         try:
             pos_pred = nx.nx_agraph.graphviz_layout(G_pred, prog='neato')
         except:
             pos_pred = nx.spring_layout(G_pred, seed=42, k=1.5)
-        colors_pred = [ID_COLOR[G_pred.nodes[n]['label']] for n in G_pred.nodes()]
-        nx.draw(G_pred, pos_pred, node_color=colors_pred, node_size=1000,
-                with_labels=False, ax=ax_graph_pred, edge_color='#b8b5b4', 
-                style='dotted', width=4.0, edgecolors='blue', linewidths=0.0)
+        node_colors = [ID_COLOR.get(G_pred.nodes[n]['label'], '#BEBEBE') for n in G_pred.nodes()]
+        node_sizes = [750 if n == -1 else 1000 for n in G_pred.nodes()]
+        node_edgecolors = ['black' if n == -1 else 'blue' for n in G_pred.nodes()]
+        node_linewidths = [3.0 if n == -1 else 0.0 for n in G_pred.nodes()]
+        edge_colors = ['#727171' if -1 in (u, v) else '#b8b5b4' for u, v in G_pred.edges()]
+        nx.draw(G_pred, pos_pred, node_color=node_colors, node_size=node_sizes,
+                edgecolors=node_edgecolors, linewidths=node_linewidths, edge_color=edge_colors,
+                style='dotted', width=4.0, with_labels=False, ax=ax_graph_pred)
     ax_graph_pred.axis('off')
     
     # Add room count and similarity info to title
@@ -876,6 +918,10 @@ def main():
             else:
                 G_true = nx.Graph()
             
+            gt_room_type_list = [
+                int(rt) for rt in (real_nodes + 1) if rt not in [15, 17]
+            ]
+
             # Process each variation
             for var_data in sample_data['variations']:
                 gen_masks = var_data['gen_masks']
@@ -887,8 +933,11 @@ def main():
                 # Count actual rooms and get room types
                 room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                                 
-                # Compute room similarity score
+                overlap_ratio = compute_spatial_overlap_ratio_from_masks(real_nodes, gen_masks)
+
+                # Compute room similarity score and area proportion error
                 similarity_result = {'similarity_score': np.nan}
+                area_prop_result = {'area_proportion_error': np.nan}
                 if raw_sample is not None:
                     try:
                         gt_masks = polygon_sample_to_masks(raw_sample, image_size=gen_masks.shape[1])
@@ -896,10 +945,16 @@ def main():
                             real_nodes, gen_masks,
                             real_nodes, gt_masks
                         )
+                        pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
+                        gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
+                        area_prop_result = compute_area_prop_metric(
+                            _room_geometries_to_area_tuples(pred_rooms),
+                            _room_geometries_to_area_tuples(gt_rooms),
+                        )
                     except Exception as e:
-                        print(f"⚠️  Warning: Could not compute similarity score for sample {sample_idx}: {e}")
+                        print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                 
-                graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result))
+                graphs.append((G_pred, G_true, sample_idx, var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                 
                 # Optionally save visualizations
                 if args.save_graphs and var == 0:
@@ -929,7 +984,7 @@ def main():
         
         # Load dataset
         print("\nLoading dataset...")
-        fp_dataset_test = Hypergraph1kDataset(args.data_path, target_set=args.target_set, split='test')
+        fp_dataset_test = BenchmarkDataset(args.data_path, target_set=args.target_set, split='test')
         fp_loader = DataLoader(
             fp_dataset_test,
             batch_size=args.batch_size,
@@ -964,6 +1019,10 @@ def main():
                 eds.detach().cpu().numpy(),
                 masks=None  # Use structure only for ground truth
             )
+
+            gt_room_type_list = [
+                int(rt) for rt in (real_nodes + 1) if rt not in [15, 17]
+            ]
             
             # Get unique room types for incremental generation
             _types = sorted(list(set(real_nodes)))
@@ -988,21 +1047,28 @@ def main():
                     # Count actual rooms in generated masks (accounting for disconnected regions)
                     room_count_info = count_actual_rooms_from_masks(real_nodes, gen_masks)
                     
-                    # Compute room similarity score
-                    similarity_result = {'similarity_score': np.nan}  # Default if GT masks unavailable
+                    overlap_ratio = compute_spatial_overlap_ratio_from_masks(real_nodes, gen_masks)
+
+                    # Compute room similarity score and area proportion error
+                    similarity_result = {'similarity_score': np.nan}
+                    area_prop_result = {'area_proportion_error': np.nan}
                     if raw_sample is not None:
                         try:
-                            # Convert GT polygon data to masks
                             gt_masks = polygon_sample_to_masks(raw_sample, image_size=gen_masks.shape[1])
-                            # Compute similarity
                             similarity_result = compute_room_similarity_score(
                                 real_nodes, gen_masks,
                                 real_nodes, gt_masks
                             )
+                            pred_rooms = extract_room_geometries_from_masks(real_nodes, gen_masks)
+                            gt_rooms = extract_room_geometries_from_masks(real_nodes, gt_masks)
+                            area_prop_result = compute_area_prop_metric(
+                                _room_geometries_to_area_tuples(pred_rooms),
+                                _room_geometries_to_area_tuples(gt_rooms),
+                            )
                         except Exception as e:
-                            print(f"⚠️  Warning: Could not compute similarity score for sample {sample_idx}: {e}")
+                            print(f"⚠️  Warning: Could not compute similarity/area scores for sample {sample_idx}: {e}")
                     
-                    graphs.append((G_pred, G_true, sample_idx, var, room_count_info, similarity_result))
+                    graphs.append((G_pred, G_true, sample_idx, var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio))
                     
                     # Store for caching if enabled
                     if save_mode:
@@ -1056,6 +1122,11 @@ def main():
     
     print(f"\n{'='*60}")
     print(f"Generated {len(graphs)} graph pairs")
+
+    if len(graphs) == 0:
+        print("\n⚠️  No graph pairs to evaluate. Check that the input data is non-empty.")
+        return
+
     print(f"Computing GED in parallel...\n")
     
     # Compute GED in parallel
@@ -1064,35 +1135,40 @@ def main():
     
     results = Parallel(n_jobs=num_cores)(
         delayed(ged_between_graphs)(G_pred, G_true, _id, upper_bound=args.upper_bound)
-        for G_pred, G_true, _id, _var, _room_info, _sim_result in tqdm(graphs, desc="Computing GED")
+        for G_pred, G_true, _id, _var, _gt_types, _room_info, _sim_result, _area_result, _overlap in tqdm(graphs, desc="Computing GED")
     )
     
     # Collect all GED results (with NaN for failed computations to preserve structure)
     all_dists = []
     room_count_accuracies = []
-    room_count_errors = []
-    room_type_errors = []
+    room_count_accuracy_scores = []
+    room_type_accuracy_scores = []
     similarity_scores = []
+    area_proportion_errors = []
+    spatial_overlap_ratios = []
     unmatched_pred_rooms = []
     unmatched_gt_rooms = []
     matched_room_pairs = []
+    per_sample_room_counts = []
     disconnected_count = 0
     
-    for (min_dist, graph_len), (G_pred, G_true, _id, _var, room_count_info, similarity_result) in zip(results, graphs):
+    for (min_dist, graph_len), (G_pred, G_true, _id, _var, gt_room_type_list, room_count_info, similarity_result, area_prop_result, overlap_ratio) in zip(results, graphs):
+        if _var == 0:
+            per_sample_room_counts.append(len(gt_room_type_list))
         if min_dist is not None:
             all_dists.append(min_dist)
         else:
             # Add NaN to preserve num_variations structure
             all_dists.append(np.nan)
         
-        # Compute room count and type accuracy
+        # Compute room count and type accuracy (GT vs predicted visible rooms)
         room_count_metric = room_type_accuracy(
-            room_count_info['expected_room_types'],
+            gt_room_type_list,
             room_count_info['actual_room_types']
         )
         room_count_accuracies.append(room_count_metric['accuracy'])
-        room_count_errors.append(room_count_metric['count_error'])
-        room_type_errors.append(room_count_metric['type_error'])
+        room_count_accuracy_scores.append(room_count_metric['room_count_accuracy'])
+        room_type_accuracy_scores.append(room_count_metric['room_type_accuracy'])
         
         # Collect similarity scores and matching stats
         similarity_scores.append(similarity_result['similarity_score'])
@@ -1100,203 +1176,37 @@ def main():
         unmatched_gt_rooms.append(similarity_result['unmatched_gt'])
         matched_room_pairs.append(similarity_result['matched_pairs'])
         
+        # Collect area proportion errors and spatial overlap
+        area_proportion_errors.append(area_prop_result['area_proportion_error'])
+        spatial_overlap_ratios.append(overlap_ratio)
+        
         # Track disconnected masks
         if len(room_count_info['disconnected_masks']) > 0:
             disconnected_count += 1
     
-    # Print room count accuracy statistics
-    print(f"\n{'='*60}")
-    print("ROOM COUNT AND TYPE ACCURACY STATISTICS")
-    print(f"{'='*60}")
-    
-    room_count_accuracies_array = np.array(room_count_accuracies)
-    room_count_errors_array = np.array(room_count_errors)
-    room_type_errors_array = np.array(room_type_errors)
-    
-    # Overall statistics (across all samples and variations)
-    exact_match_rate = np.mean(room_count_accuracies_array) * 100
-    mean_count_error = np.mean(room_count_errors_array)
-    median_count_error = np.median(room_count_errors_array)
-    max_count_error = np.max(room_count_errors_array)
-    mean_type_error = np.mean(room_type_errors_array)
-    median_type_error = np.median(room_type_errors_array)
-    max_type_error = np.max(room_type_errors_array)
-    disconnected_rate = (disconnected_count / len(graphs)) * 100
-    
-    # Compute STD of variation means (same method as GED statistics)
-    # This measures if different generation runs produce systematically different results
-    std_of_variation_means = 0.0
-    count_error_std_of_variation_means = 0.0
-    type_error_std_of_variation_means = 0.0
-    
-    if args.num_variations > 1:
-        num_samples = len(graphs) // args.num_variations
-        if len(graphs) % args.num_variations == 0:
-            accuracies_reshaped = room_count_accuracies_array.reshape(num_samples, args.num_variations)
-            count_errors_reshaped = room_count_errors_array.reshape(num_samples, args.num_variations)
-            type_errors_reshaped = room_type_errors_array.reshape(num_samples, args.num_variations)
-            
-            # Mean per variation (averaged across all samples) - same as GED calculation
-            means_per_variation = np.mean(accuracies_reshaped, axis=0)
-            count_error_means_per_variation = np.mean(count_errors_reshaped, axis=0)
-            type_error_means_per_variation = np.mean(type_errors_reshaped, axis=0)
-            
-            # STD of variation means with ddof=1 (sample std) - same as GED calculation
-            std_of_variation_means = np.std(means_per_variation, ddof=1)
-            count_error_std_of_variation_means = np.std(count_error_means_per_variation, ddof=1)
-            type_error_std_of_variation_means = np.std(type_error_means_per_variation, ddof=1)
-            
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Accuracy STD of variation means: {std_of_variation_means:.3f} ({std_of_variation_means*100:.1f}%)")
-            print(f"   • Mean per variation: {means_per_variation}")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Count error STD of variation means: {count_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Type error STD of variation means: {type_error_std_of_variation_means:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with disconnected masks: {disconnected_count}/{len(graphs)} ({disconnected_rate:.1f}%)")
-        else:
-            # Fallback if num_variations doesn't divide evenly
-            print(f"\n📊 Room Count and Type Accuracy:")
-            print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-            print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-            print(f"   • Median count error: {median_count_error:.1f} rooms")
-            print(f"   • Max count error: {max_count_error:.0f} rooms")
-            print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-            print(f"   • Median type error: {median_type_error:.1f} rooms")
-            print(f"   • Max type error: {max_type_error:.0f} rooms")
-            print(f"   • Samples with disconnected masks: {disconnected_count}/{len(graphs)} ({disconnected_rate:.1f}%)")
-    else:
-        # Single variation case
-        print(f"\n📊 Room Count and Type Accuracy:")
-        print(f"   • Exact match rate (count + type): {exact_match_rate:.1f}%")
-        print(f"   • Mean count error: {mean_count_error:.2f} rooms")
-        print(f"   • Median count error: {median_count_error:.1f} rooms")
-        print(f"   • Max count error: {max_count_error:.0f} rooms")
-        print(f"   • Mean type error: {mean_type_error:.2f} rooms")
-        print(f"   • Median type error: {median_type_error:.1f} rooms")
-        print(f"   • Max type error: {max_type_error:.0f} rooms")
-        print(f"   • Samples with disconnected masks: {disconnected_count}/{len(graphs)} ({disconnected_rate:.1f}%)")
-    
-    print(f"\n💭 Interpretation:")
-    print(f"   This measures how accurately the model predicts both the number and types of rooms.")
-    print(f"   Accuracy = 1.0 only if both count and type distribution match perfectly.")
-    print(f"   {exact_match_rate:.1f}% of predictions have exactly the right room count.")
-    print(f"   Note: Disconnected masks (single mask → multiple spatial regions) are counted separately.")
-    
-    # Print room similarity score statistics
-    print(f"\n{'='*60}")
-    print("ROOM SIMILARITY SCORE STATISTICS")
-    print(f"{'='*60}")
-    
-    similarity_scores_array = np.array(similarity_scores)
-    # Filter out NaN values (from room count mismatches)
-    valid_similarity_scores = similarity_scores_array[~np.isnan(similarity_scores_array)]
-    
-    if len(valid_similarity_scores) > 0:
-        mean_similarity = np.mean(valid_similarity_scores)
-        median_similarity = np.median(valid_similarity_scores)
-        min_similarity = np.min(valid_similarity_scores)
-        max_similarity = np.max(valid_similarity_scores)
-        std_similarity = np.std(valid_similarity_scores)
-        valid_rate = (len(valid_similarity_scores) / len(similarity_scores_array)) * 100
-        
-        print(f"\n📊 Room Similarity Score (δ = abs(1 - (L_SA * L_B)/(L_A * L_SB))):")
-        print(f"   • Mean: {mean_similarity:.4f} (lower is better, 0 = perfect match)")
-        print(f"   • Median: {median_similarity:.4f}")
-        print(f"   • STD: {std_similarity:.4f}")
-        print(f"   • Range: [{min_similarity:.4f}, {max_similarity:.4f}]")
-        print(f"   • Valid samples: {len(valid_similarity_scores)}/{len(similarity_scores_array)} ({valid_rate:.1f}%)")
-        
-        # Report unmatched room statistics
-        total_unmatched_pred = sum(unmatched_pred_rooms)
-        total_unmatched_gt = sum(unmatched_gt_rooms)
-        total_matched_pairs = sum(matched_room_pairs)
-        avg_unmatched_pred = np.mean(unmatched_pred_rooms)
-        avg_unmatched_gt = np.mean(unmatched_gt_rooms)
-        
-        print(f"\n📊 Room Matching Statistics:")
-        print(f"   • Total matched room pairs: {total_matched_pairs}")
-        print(f"   • Total unmatched pred rooms: {total_unmatched_pred} (avg: {avg_unmatched_pred:.2f} per sample)")
-        print(f"   • Total unmatched GT rooms: {total_unmatched_gt} (avg: {avg_unmatched_gt:.2f} per sample)")
-        
-        print(f"\n💭 Interpretation:")
-        print(f"   This measures geometric similarity between predicted and GT rooms.")
-        print(f"   Lower scores indicate better shape matching (0 = identical shapes).")
-        print(f"   Compares common rooms when counts differ (extras are ignored).")
-        
-        # Compute STD of variation means if applicable
-        similarity_std_of_variation_means = 0.0
-        if args.num_variations > 1:
-            num_samples_processed = len(valid_similarity_scores) // args.num_variations
-            if num_samples_processed > 0 and len(valid_similarity_scores) % args.num_variations == 0:
-                sim_reshaped = valid_similarity_scores.reshape(num_samples_processed, args.num_variations)
-                sim_means_per_variation = np.mean(sim_reshaped, axis=0)
-                similarity_std_of_variation_means = np.std(sim_means_per_variation, ddof=1)
-                print(f"\n   • STD of variation means: {similarity_std_of_variation_means:.4f}")
-                print(f"   • Mean per variation: {sim_means_per_variation}")
-    else:
-        mean_similarity = np.nan
-        median_similarity = np.nan
-        std_similarity = np.nan
-        min_similarity = np.nan
-        max_similarity = np.nan
-        similarity_std_of_variation_means = np.nan
-        valid_rate = 0.0
-        
-        print(f"\n⚠️  No valid similarity scores (no rooms to compare)")
-    
-    # Compute and save statistics using shared function
-    room_count_dict = {
-        'exact_match_rate': float(exact_match_rate),
-        'accuracy_std': float(std_of_variation_means),  # std of variation means (consistency metric)
-        'mean_count_error': float(mean_count_error),
-        'count_error_std': float(count_error_std_of_variation_means),
-        'median_count_error': float(median_count_error),
-        'max_count_error': float(max_count_error),
-        'mean_type_error': float(mean_type_error),
-        'type_error_std': float(type_error_std_of_variation_means),
-        'median_type_error': float(median_type_error),
-        'max_type_error': float(max_type_error),
-        'disconnected_samples': disconnected_count,
-        'disconnected_rate': float(disconnected_rate),
-        'all_accuracies': room_count_accuracies_array.tolist(),
-        'all_count_errors': room_count_errors_array.tolist(),
-        'all_type_errors': room_type_errors_array.tolist()
-    }
-    
-    similarity_dict = {
-        'mean': float(mean_similarity) if not np.isnan(mean_similarity) else None,
-        'median': float(median_similarity) if not np.isnan(median_similarity) else None,
-        'std': float(std_similarity) if not np.isnan(std_similarity) else None,
-        'std_of_variation_means': float(similarity_std_of_variation_means) if not np.isnan(similarity_std_of_variation_means) else None,
-        'min': float(min_similarity) if not np.isnan(min_similarity) else None,
-        'max': float(max_similarity) if not np.isnan(max_similarity) else None,
-        'valid_count': int(len(valid_similarity_scores)),
-        'valid_rate': float(valid_rate),
-        'total_matched_pairs': int(sum(matched_room_pairs)),
-        'total_unmatched_pred': int(sum(unmatched_pred_rooms)),
-        'total_unmatched_gt': int(sum(unmatched_gt_rooms)),
-        'avg_unmatched_pred': float(np.mean(unmatched_pred_rooms)),
-        'avg_unmatched_gt': float(np.mean(unmatched_gt_rooms)),
-        'all_scores': similarity_scores_array.tolist()
-    }
-    
-    compute_and_save_ged_statistics(
-        all_geds=np.array(all_dists),
+    report_results(
+        args.out,
+        metrics={
+            'geds': ('GED', np.array(all_dists)),
+            'accuracies': ('Room Accuracy', np.array(room_count_accuracies)),
+            'room_count_accuracies': ('Room Count Accuracy', np.array(room_count_accuracy_scores)),
+            'room_type_accuracies': ('Room Type Accuracy', np.array(room_type_accuracy_scores)),
+            'similarity_scores': ('Room Similarity (delta)', np.array(similarity_scores)),
+            'area_proportion_errors': ('Area Proportion Error', np.array(area_proportion_errors)),
+            'spatial_overlap_ratios': ('Spatial Overlap Ratio', np.array(spatial_overlap_ratios)),
+        },
+        room_counts=np.array(per_sample_room_counts),
         num_variations=args.num_variations,
-        output_dir=args.out,
         checkpoint_path=args.checkpoint,
         data_path=args.data_path,
-        additional_info={
+        extra={
             'target_set': args.target_set,
-            'room_count_accuracy': room_count_dict,
-            'room_similarity': similarity_dict
-        }
+            'disconnected_count': disconnected_count,
+            'total_samples': len(graphs),
+            'matched_room_pairs': matched_room_pairs,
+            'unmatched_pred_rooms': unmatched_pred_rooms,
+            'unmatched_gt_rooms': unmatched_gt_rooms,
+        },
     )
 
 

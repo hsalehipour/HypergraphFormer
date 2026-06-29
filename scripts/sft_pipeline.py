@@ -11,7 +11,7 @@ IMPORTANT: This script runs in offline mode (HF_HUB_OFFLINE=1).
 Make sure the model is cached locally before running:
     python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('Qwen/Qwen3-4B-Instruct-2507')"
 
-Models are saved to: checkpoints/qwen_hypergraph_filtered/epochs{N}_lora_r{R}_alpha{ALPHA}/
+Models are saved to: checkpoints/qwen_hypergraphformer/epochs{N}_lora_r{R}_alpha{ALPHA}/
 
 Usage:
     # Basic training (single GPU, default: 3 epochs, r=64, alpha=128)
@@ -198,7 +198,7 @@ def main():
                        help='Output directory for fine-tuned model (default: checkpoints/qwen_hypergraph/lora_r{R}_alpha{ALPHA})')
     
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=8,
                        help='Number of training epochs (default: 3)')
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size per device (default: 1)')
@@ -243,7 +243,7 @@ def main():
             lora_suffix = f"epochs{args.epochs}_lora_r{args.lora_r}_alpha{args.lora_alpha}"
         else:
             lora_suffix = f"epochs{args.epochs}_full_finetune"
-        args.output_dir = f"checkpoints/qwen_hypergraph_filtered/{lora_suffix}"
+        args.output_dir = f"checkpoints/qwen_hypergraphformer/{lora_suffix}"
         logger.info(f"Using default output directory: {args.output_dir}")
     
     # Set CUDA_VISIBLE_DEVICES for single-GPU mode only
@@ -348,7 +348,7 @@ def main():
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         report_to=["tensorboard"],
-        save_total_limit=10,  # Keep only last 10 checkpoints
+        save_total_limit=50,  # Keep only last 10 checkpoints
         # DDP-specific settings for better multi-GPU stability
         ddp_find_unused_parameters=False,  # Set to True if you get DDP errors with LoRA
         ddp_backend="nccl" if args.multi_gpu and torch.cuda.is_available() else None,
@@ -399,8 +399,8 @@ def main():
     
     logger.info("="*80)
     
-    logger.info("\n💡 To use the fine-tuned model:")
-    logger.info(f"   python scripts/fewshot_generator.py --backend qwen --model {args.output_dir} --from-dataset")
+    logger.info("\n💡 To evaluate the fine-tuned model:")
+    logger.info(f"   python scripts/evaluator.py --mode trained --model {args.output_dir} --dataset-dir <test_dir>")
     logger.info(f"\n💡 To resume training from a checkpoint:")
     logger.info(f"   python scripts/sft_pipeline.py --output-dir {args.output_dir}")
     

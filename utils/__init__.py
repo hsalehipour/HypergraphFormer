@@ -1,5 +1,5 @@
 from .hypergraph import HypergraphPlotter
-from .hypergraph import Hypergraph
+from .hypergraph import Hypergraph, repair_bsp_tree_names
 from .utils import (
     remove_mergeid_suffixes,
     extract_room_type,
@@ -19,8 +19,12 @@ from .metrics import (
     ged_between_graphs,
     compute_ged_from_hypergraph,
     compute_room_similarity_score,
+    compute_room_area_proportion_error,
     room_type_accuracy,
     compute_room_type_accuracy,
-    bucketed_room_accuracy,
     produce_room_list,
+    produce_room_area_list,
+    produce_room_list_from_polygons,
+    produce_room_area_list_from_polygons,
 )
+from .report_results import report_results

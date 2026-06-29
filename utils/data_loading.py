@@ -37,6 +37,10 @@ def load_example_hypergraphs(examples_dir, num_examples=3, exclude_file=None, se
               When None, uses the global random state.
     """
     examples_dir = Path(examples_dir)
+
+    if num_examples is not None and num_examples <= 0:
+        return []
+
     example_files = list(examples_dir.glob("*.txt"))
 
     if not example_files:
@@ -129,8 +133,7 @@ def save_training_data(samples, output_path, dataset_type="train"):
     Each line is a JSON object with 'messages' field.
 
     Args:
-        samples: List of (identifier, accessgraph, hypergraph) tuples, or
-                 (identifier, accessgraph, hypergraph, bounds) tuples.
+        samples: List of (identifier, accessgraph, hypergraph) tuples.
                  The first element (identifier) can be a filename or item id;
                  it is not written to the output.
         output_path: Path to output .jsonl file
@@ -141,15 +144,10 @@ def save_training_data(samples, output_path, dataset_type="train"):
 
     with open(output_path, 'w') as f:
         for sample in samples:
-            if len(sample) == 3:
-                _identifier, accessgraph, hypergraph = sample
-                bounds = None
-            elif len(sample) == 4:
-                _identifier, accessgraph, hypergraph, bounds = sample
-            else:
+            if len(sample) != 3:
                 raise ValueError(f"Unexpected sample tuple length: {len(sample)}")
-
-            training_sample = create_training_sample(accessgraph, hypergraph, bounds=bounds)
+            _identifier, accessgraph, hypergraph = sample
+            training_sample = create_training_sample(accessgraph, hypergraph)
             f.write(json.dumps(training_sample) + '\n')
 
     logger.info(f"Saved {len(samples)} {dataset_type} samples to {output_path}")
@@ -161,18 +159,17 @@ class HypergraphDataset(Dataset):
 
     Args:
         file_paths: List of Path objects pointing to .txt JSON files
-        include_ground_truth: If True, each item includes 'ground_truth'
-                              parsed from the file's 'hypergraph' field.
-                              Set to False for rooms-only evaluation where
-                              ground truth comparison is not applicable.
+        include_ground_truth: If True, each item includes 'ground_truth' from the
+                              file's 'hypergraph' field when present; otherwise
+                              ``None`` (e.g. access-only eval files).
+                              Set to False to omit the key (rooms-only).
         include_bounds: If True, each item includes 'bounds' parsed from the
                         file's 'bounds' field (apartment footprint).
     """
 
-    def __init__(self, file_paths, include_ground_truth=True, *, include_bounds=False):
+    def __init__(self, file_paths, include_ground_truth=True):
         self.file_paths = file_paths
         self.include_ground_truth = include_ground_truth
-        self.include_bounds = include_bounds
 
     def __len__(self):
         return len(self.file_paths)
@@ -192,15 +189,12 @@ class HypergraphDataset(Dataset):
             'num_edges': len(accessgraph.get('edges', [])),
         }
 
-        if self.include_bounds:
-            bounds_str = data.get('bounds', '{}')
-            item['bounds'] = json.loads(bounds_str) if isinstance(bounds_str, str) else bounds_str
-
         if self.include_ground_truth:
-            hypergraph_str = data.get('hypergraph', '')
-            item['ground_truth'] = (
-                json.loads(hypergraph_str) if isinstance(hypergraph_str, str) else hypergraph_str
-            )
+            h = data.get("hypergraph")
+            if h is None or (isinstance(h, str) and not h.strip()):
+                item["ground_truth"] = None
+            else:
+                item["ground_truth"] = json.loads(h) if isinstance(h, str) else h
 
         return item
 
