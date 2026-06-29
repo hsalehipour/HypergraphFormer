@@ -830,4 +830,4 @@ If you use this code or the WMR24 dataset, please cite:
 
 **Project**: HypergraphFormer
 **Last Updated**: 2026-06-25
-**Python**: 3.9+
+**Python**: 3.11
