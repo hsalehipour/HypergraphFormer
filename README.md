@@ -315,6 +315,10 @@ python scripts/data_preparation.py --mode train \
 This produces `train.jsonl`, `validation.jsonl`, and `test.jsonl` in
 `dataset/rplan/dataset_hypergraph_la0_fixed/sft/`.
 
+Add `--include_bounds` to also train the apartment footprint: it embeds the
+outer boundary as a `bounds` key (integer `X`/`Y` corners) on each target
+hypergraph's root node and appends a one-line note to the prompt.
+
 ### 3. Train with SFT (LoRA fine-tuning)
 
 ```bash
@@ -323,8 +327,8 @@ python scripts/sft_pipeline.py --gpu 0 \
     --epochs 5 --lora-r 128 --lora-alpha 256 \
     --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 
-# Multi-GPU with Accelerate
-accelerate launch --num_processes=2 scripts/sft_pipeline.py --multi-gpu \
+# Multi-GPU with Accelerate (8 GPUs)
+accelerate launch --num_processes=8 scripts/sft_pipeline.py --multi-gpu \
     --epochs 5 --lora-r 128 --lora-alpha 256 \
     --data-dir dataset/rplan/dataset_hypergraph_la0_fixed/sft
 ```

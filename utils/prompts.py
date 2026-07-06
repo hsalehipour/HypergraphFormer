@@ -285,6 +285,13 @@ _ANGLE_RULES = """\
 - This ensures axis-aligned splits typical of architectural floor plans"""
 
 
+# One short paragraph appended to the main prompt when bounds generation is
+# enabled (--include_bounds): asks the model to also emit the apartment footprint
+# as a top-level `bounds` key on the root node.
+_BOUNDS_APPENDIX_TEXT = """\
+Additionally, add the apartment's outer footprint as a top-level `bounds` key on the root node, formatted as `{"corners": [{"X": <int>, "Y": <int>}, ...]}` (an ordered polygon of the outline vertices, integer coordinates only)."""
+
+
 _SIMPLE_REQUIREMENTS = """\
 ## Requirements:
 1. Number of leaf nodes MUST equal number of nodes in access graph ({num_nodes})
@@ -303,11 +310,18 @@ _SIMPLE_REQUIREMENTS = """\
 10. Use final=false for internal nodes, final=true for room leaves"""
 
 
-def create_simple_prompt(target_accessgraph):
+def create_simple_prompt(target_accessgraph, include_bounds=False):
     """
     Create a prompt with BSP rules and target access graph but no few-shot examples.
     Used by evaluator.py (--mode trained) for fine-tuned model evaluation.
+
+    Args:
+        target_accessgraph: Access graph to generate a hypergraph for.
+        include_bounds: When True, append the same short bounds paragraph used at
+            training time so a bounds-trained model is prompted consistently.
     """
+    bounds_note = f"\n\n{_BOUNDS_APPENDIX_TEXT}" if include_bounds else ""
+
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
 Your task is to generate a hypergraph from an access graph. An access graph is a simple representation of room connectivity:
@@ -324,7 +338,7 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}
+Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}{bounds_note}
 
 ### Access Graph:
 ```json
@@ -389,10 +403,14 @@ Generate ONLY the hypergraph JSON structure, no additional text or explanation:"
     return prompt
 
 
-def create_instruction_prompt():
+def create_instruction_prompt(include_bounds=False):
     """
     Create the instruction prompt used for training data preparation.
     Contains BSP rules and task description but no examples or target access graph.
+
+    Args:
+        include_bounds: When True, append one short paragraph asking the model to
+            also emit a top-level ``bounds`` key on the root node.
     """
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
@@ -412,21 +430,29 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"""
 
+    if include_bounds:
+        prompt += f"\n\n{_BOUNDS_APPENDIX_TEXT}"
+
     return prompt
 
 
-def create_training_sample(accessgraph, hypergraph):
+def create_training_sample(accessgraph, hypergraph, *, bounds=None, include_bounds=False):
     """
     Create a single training sample in chat format for fine-tuning.
 
     Args:
         accessgraph: Access graph dictionary
         hypergraph: Ground truth hypergraph dictionary
+        bounds: Optional apartment-footprint dict (``{"corners": [{"X", "Y"}, ...]}``
+            with integer coordinates). Only used when ``include_bounds`` is True.
+        include_bounds: When True, the prompt asks for bounds and the target
+            hypergraph carries the footprint as a top-level ``bounds`` key on
+            the root node.
 
     Returns:
         dict: Training sample with 'messages' field in chat format
     """
-    instruction = create_instruction_prompt()
+    instruction = create_instruction_prompt(include_bounds=include_bounds)
     user_content = f"""{instruction}
 
 ### Access Graph:
@@ -438,7 +464,16 @@ def create_training_sample(accessgraph, hypergraph):
 
 Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
 
-    assistant_content = json.dumps(hypergraph, indent=2)
+    if include_bounds and bounds is not None:
+        # Attach the footprint as an extra top-level key on the root node so the
+        # BSP-tree structure itself is preserved (all existing consumers ignore
+        # unknown root keys; to_mesh knows how to strip/use it).
+        hypergraph_out = dict(hypergraph)
+        hypergraph_out["bounds"] = bounds
+    else:
+        hypergraph_out = hypergraph
+
+    assistant_content = json.dumps(hypergraph_out, indent=2)
 
     messages = [
         {"role": "system", "content": "You are an expert at generating structured hierarchical BSP tree data for floor plans in JSON format."},

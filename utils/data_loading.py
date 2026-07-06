@@ -127,27 +127,38 @@ def load_target_from_dataset(examples_dir, target_file=None):
         raise ValueError(f"Failed to load target from {target_path.name}: {e}")
 
 
-def save_training_data(samples, output_path, dataset_type="train"):
+def save_training_data(samples, output_path, dataset_type="train", include_bounds=False):
     """
     Save training data in JSONL format.
     Each line is a JSON object with 'messages' field.
 
     Args:
-        samples: List of (identifier, accessgraph, hypergraph) tuples.
-                 The first element (identifier) can be a filename or item id;
-                 it is not written to the output.
+        samples: List of sample tuples. Either
+                 ``(identifier, accessgraph, hypergraph)`` or, when bounds are
+                 included, ``(identifier, accessgraph, hypergraph, bounds)``.
+                 The first element (identifier) is not written to the output.
         output_path: Path to output .jsonl file
         dataset_type: Type of dataset (train/validation/test) — used only for logging
+        include_bounds: When True, embed the apartment footprint ``bounds`` on the
+                        root node of each target hypergraph and use the bounds-aware
+                        instruction prompt.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, 'w') as f:
         for sample in samples:
-            if len(sample) != 3:
+            if len(sample) == 4:
+                _identifier, accessgraph, hypergraph, bounds = sample
+            elif len(sample) == 3:
+                _identifier, accessgraph, hypergraph = sample
+                bounds = None
+            else:
                 raise ValueError(f"Unexpected sample tuple length: {len(sample)}")
-            _identifier, accessgraph, hypergraph = sample
-            training_sample = create_training_sample(accessgraph, hypergraph)
+            training_sample = create_training_sample(
+                accessgraph, hypergraph,
+                bounds=bounds, include_bounds=include_bounds,
+            )
             f.write(json.dumps(training_sample) + '\n')
 
     logger.info(f"Saved {len(samples)} {dataset_type} samples to {output_path}")

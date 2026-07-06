@@ -11,6 +11,10 @@ Usage:
     python scripts/data_preparation.py --mode train \\
         --dataset-dir dataset/hypergraph
 
+    # Same, but also train on the apartment footprint (bounds on root node)
+    python scripts/data_preparation.py --mode train --include_bounds \\
+        --dataset-dir dataset/hypergraph
+
     # Export eval .txt from dataset_access (room polygons + door adjacencies)
     python scripts/data_preparation.py --mode eval --data-format access \\
         --input-file dataset/rplan/dataset_access/data_test.json \\
@@ -44,7 +48,42 @@ logger = logging.getLogger(__name__)
 # Shared helper
 # ===================================================================
 
-def load_json_split(file_path):
+def _bounds_to_int_corners(bounds):
+    """Return a compact footprint dict with integer-only ``X``/``Y`` corners.
+
+    The dataset stores bounds as ``{"corners": [{"X", "Y", "Z", "Mag"}, ...]}``
+    with float coordinates.  For bounds-aware training we (a) drop ``Z``/``Mag``
+    (no mesh/plotting code reads them — only ``X``/``Y``) and (b) round
+    coordinates to the nearest integer to save tokens.  Consecutive duplicate
+    points created by rounding and a repeated closing vertex are removed.
+
+    Returns ``None`` when there are fewer than 3 usable corners.
+    """
+    if not isinstance(bounds, dict):
+        return None
+
+    int_pts = []
+    for c in bounds.get("corners") or []:
+        try:
+            x = int(round(float(c["X"])))
+            y = int(round(float(c["Y"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if int_pts and int_pts[-1] == (x, y):
+            continue  # drop consecutive duplicate introduced by rounding
+        int_pts.append((x, y))
+
+    # Drop a repeated closing vertex (polygon is implicitly closed).
+    if len(int_pts) >= 2 and int_pts[0] == int_pts[-1]:
+        int_pts.pop()
+
+    if len(int_pts) < 3:
+        return None
+
+    return {"corners": [{"X": x, "Y": y} for x, y in int_pts]}
+
+
+def load_json_split(file_path, include_bounds=False):
     """Load a hypergraph dataset split from a JSON file.
 
     Each item is expected to have a ``split`` field containing the
@@ -53,7 +92,12 @@ def load_json_split(file_path):
 
     Returns a list of tuples::
 
-        (item_id, accessgraph, hypergraph)
+        (item_id, accessgraph, hypergraph)                    # include_bounds=False
+        (item_id, accessgraph, hypergraph, int_bounds)        # include_bounds=True
+
+    When ``include_bounds`` is True, the item's ``bounds`` field is parsed and
+    converted to integer-only corners; items without usable bounds are skipped
+    so every emitted sample carries a footprint.
     """
     file_path = Path(file_path)
     if not file_path.exists():
@@ -88,7 +132,25 @@ def load_json_split(file_path):
                 continue
 
             item_id = item.get("id", f"item_{i}")
-            samples.append((item_id, accessgraph, hypergraph))
+
+            if include_bounds:
+                bounds_raw = item.get("bounds")
+                bounds = (
+                    json.loads(bounds_raw)
+                    if isinstance(bounds_raw, str)
+                    else bounds_raw
+                )
+                int_bounds = _bounds_to_int_corners(bounds)
+                if int_bounds is None:
+                    logger.warning(
+                        f"Skipping item {i}: missing/invalid bounds "
+                        f"(required by --include_bounds)"
+                    )
+                    skipped += 1
+                    continue
+                samples.append((item_id, accessgraph, hypergraph, int_bounds))
+            else:
+                samples.append((item_id, accessgraph, hypergraph))
 
         except Exception as e:
             logger.warning(f"Skipping item {i}: {e}")
@@ -238,6 +300,8 @@ def convert_to_jsonl(args) -> int:
     """Convert pre-split hypergraph JSON files to instruction JSONL."""
     from utils.data_loading import save_training_data
 
+    include_bounds = getattr(args, "include_bounds", False)
+
     dataset_dir = Path(args.dataset_dir)
     output_dir = dataset_dir / "sft"
 
@@ -246,6 +310,7 @@ def convert_to_jsonl(args) -> int:
     logger.info("=" * 80)
     logger.info(f"Dataset directory: {dataset_dir}")
     logger.info(f"Output directory:  {output_dir}")
+    logger.info(f"Include bounds:    {include_bounds}")
     logger.info("=" * 80)
 
     splits = ["train", "validation", "test"]
@@ -256,13 +321,16 @@ def convert_to_jsonl(args) -> int:
         path = dataset_dir / f"{split}.json"
         if not path.exists() and split == "validation":
             path = dataset_dir / "val.json"
-        samples = load_json_split(path)
+        samples = load_json_split(path, include_bounds=include_bounds)
 
         if not samples:
             logger.warning(f"No samples found for {split}")
             continue
 
-        save_training_data(samples, output_dir / f"{split}.jsonl", split)
+        save_training_data(
+            samples, output_dir / f"{split}.jsonl", split,
+            include_bounds=include_bounds,
+        )
         total += len(samples)
 
     logger.info(f"\nDone! {total} samples across {len(splits)} splits.")
@@ -519,6 +587,16 @@ def cli():
     # Shared
     parser.add_argument("--dataset-dir", type=str, default="dataset/hypergraph")
     parser.add_argument("--seed", type=int, default=42)
+
+    # train mode
+    parser.add_argument(
+        "--include-bounds", "--include_bounds",
+        dest="include_bounds",
+        action="store_true",
+        help="(train mode) Also emit the apartment footprint as a top-level "
+             "`bounds` key (integer corners) on the root of each target "
+             "hypergraph, and use the bounds-aware instruction prompt.",
+    )
 
     # eval mode
     parser.add_argument(
