@@ -291,6 +291,12 @@ _ANGLE_RULES = """\
 _BOUNDS_APPENDIX_TEXT = """\
 Additionally, add the apartment's outer footprint as a top-level `bounds` key on the root node, formatted as `{"corners": [{"X": <int>, "Y": <int>}, ...]}` (an ordered polygon of the outline vertices, integer coordinates only)."""
 
+# One short sentence added to the prompt when input bounds conditioning is
+# enabled (--input_bounds): tells the model that the apartment boundary is
+# provided as additional context to guide the spatial layout.
+_INPUT_BOUNDS_NOTE = """\
+Considering the apartment bounds provided below, generate a BSP-tree whose room layout fits within that footprint."""
+
 
 _SIMPLE_REQUIREMENTS = """\
 ## Requirements:
@@ -310,17 +316,33 @@ _SIMPLE_REQUIREMENTS = """\
 10. Use final=false for internal nodes, final=true for room leaves"""
 
 
-def create_simple_prompt(target_accessgraph, include_bounds=False):
+def create_simple_prompt(target_accessgraph, include_bounds=False,
+                         input_bounds=False, bounds=None):
     """
     Create a prompt with BSP rules and target access graph but no few-shot examples.
     Used by evaluator.py (--mode trained) for fine-tuned model evaluation.
 
     Args:
         target_accessgraph: Access graph to generate a hypergraph for.
-        include_bounds: When True, append the same short bounds paragraph used at
-            training time so a bounds-trained model is prompted consistently.
+        include_bounds: When True, append the bounds-generation paragraph so the
+            model also outputs a ``bounds`` key on the root node.
+        input_bounds: When True, include ``bounds`` as input context in the prompt
+            (the model should use it to inform room layout but does NOT output it).
+        bounds: Apartment bounds dict required when ``input_bounds`` is True.
     """
     bounds_note = f"\n\n{_BOUNDS_APPENDIX_TEXT}" if include_bounds else ""
+    task_prefix = _INPUT_BOUNDS_NOTE if input_bounds else (
+        f"Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"
+    )
+
+    bounds_section = ""
+    if input_bounds and bounds:
+        bounds_section = f"""
+### Apartment Bounds:
+```json
+{json.dumps(bounds, indent=2)}
+```
+"""
 
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
@@ -338,13 +360,13 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}{bounds_note}
+{task_prefix}{bounds_note}
 
 ### Access Graph:
 ```json
 {json.dumps(target_accessgraph, indent=2)}
 ```
-
+{bounds_section}
 {_SIMPLE_REQUIREMENTS.format(num_nodes=len(target_accessgraph.get('nodes', {})))}
 
 Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
@@ -403,7 +425,7 @@ Generate ONLY the hypergraph JSON structure, no additional text or explanation:"
     return prompt
 
 
-def create_instruction_prompt(include_bounds=False):
+def create_instruction_prompt(include_bounds=False, input_bounds=False):
     """
     Create the instruction prompt used for training data preparation.
     Contains BSP rules and task description but no examples or target access graph.
@@ -411,7 +433,13 @@ def create_instruction_prompt(include_bounds=False):
     Args:
         include_bounds: When True, append one short paragraph asking the model to
             also emit a top-level ``bounds`` key on the root node.
+        input_bounds: When True, use the input-bounds task prefix instead of the
+            standard one (bounds are given as input context, not generated).
     """
+    task_line = _INPUT_BOUNDS_NOTE if input_bounds else (
+        f"Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"
+    )
+
     prompt = f"""You are an expert at generating hierarchical Binary Space Partition (BSP) tree structures (hypergraphs) that represent floor plans.
 
 Your task is to generate a hypergraph from an access graph. An access graph is a simple representation of room connectivity:
@@ -428,7 +456,7 @@ Your task is to generate a hypergraph from an access graph. An access graph is a
 
 # YOUR TASK:
 
-Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES_TEXT_2}"""
+{task_line}"""
 
     if include_bounds:
         prompt += f"\n\n{_BOUNDS_APPENDIX_TEXT}"
@@ -436,7 +464,8 @@ Generate a hypergraph (BSP tree) for the following access graph. {_OUTSIDE_RULES
     return prompt
 
 
-def create_training_sample(accessgraph, hypergraph, *, bounds=None, include_bounds=False):
+def create_training_sample(accessgraph, hypergraph, *, bounds=None,
+                           include_bounds=False, input_bounds=False):
     """
     Create a single training sample in chat format for fine-tuning.
 
@@ -444,22 +473,37 @@ def create_training_sample(accessgraph, hypergraph, *, bounds=None, include_boun
         accessgraph: Access graph dictionary
         hypergraph: Ground truth hypergraph dictionary
         bounds: Optional apartment-footprint dict (``{"corners": [{"X", "Y"}, ...]}``
-            with integer coordinates). Only used when ``include_bounds`` is True.
+            with integer coordinates).
+            - ``include_bounds=True``: bounds are added to the assistant output.
+            - ``input_bounds=True``: bounds are added to the user prompt as input
+              context; the assistant output is the plain hypergraph (no bounds key).
         include_bounds: When True, the prompt asks for bounds and the target
             hypergraph carries the footprint as a top-level ``bounds`` key on
             the root node.
+        input_bounds: When True, bounds are injected into the user prompt as
+            conditioning context. The assistant output contains only the hypergraph.
 
     Returns:
         dict: Training sample with 'messages' field in chat format
     """
-    instruction = create_instruction_prompt(include_bounds=include_bounds)
+    instruction = create_instruction_prompt(include_bounds=include_bounds,
+                                            input_bounds=input_bounds)
+
+    bounds_section = ""
+    if input_bounds and bounds is not None:
+        bounds_section = f"""
+### Apartment Bounds:
+```json
+{json.dumps(bounds, indent=2)}
+```"""
+
     user_content = f"""{instruction}
 
 ### Access Graph:
 ```json
 {json.dumps(accessgraph, indent=2)}
 ```
-
+{bounds_section}
 {_SIMPLE_REQUIREMENTS.format(num_nodes=len(accessgraph.get('nodes', {})))}
 
 Generate ONLY the hypergraph JSON structure, no additional text or explanation:"""
@@ -471,6 +515,7 @@ Generate ONLY the hypergraph JSON structure, no additional text or explanation:"
         hypergraph_out = dict(hypergraph)
         hypergraph_out["bounds"] = bounds
     else:
+        # input_bounds: bounds are input context only — output is plain hypergraph
         hypergraph_out = hypergraph
 
     assistant_content = json.dumps(hypergraph_out, indent=2)

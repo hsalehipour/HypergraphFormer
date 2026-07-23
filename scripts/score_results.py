@@ -111,6 +111,7 @@ def _ged_worker_main() -> int:
     parser.add_argument("--test-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--correct-accessgraph", action="store_true")
+    parser.add_argument("--use-generated-bounds", action="store_true")
     args = parser.parse_args()
 
     def _parse_jsonish(val):
@@ -131,7 +132,11 @@ def _ged_worker_main() -> int:
         "bounds": _parse_jsonish(raw.get("bounds", "{}")),
     }
 
-    bounds = gt["bounds"] if args.correct_accessgraph else None
+    if args.use_generated_bounds:
+        raw_b = (results[sample_id] or {}).get("bounds", {})
+        bounds = _parse_jsonish(raw_b) if raw_b else None
+    else:
+        bounds = gt["bounds"] if args.correct_accessgraph else None
 
     start = time.perf_counter()
     ged, graph_len = compute_ged_from_hypergraph(
@@ -209,6 +214,7 @@ def _run_ged_subprocess(
     test_dir: Path,
     timeout_seconds: float,
     correct_accessgraph: bool,
+    use_generated_bounds: bool = False,
 ) -> dict:
     """Re-invoke this script in worker mode for a single sample."""
     wall_timeout = timeout_seconds + 30.0
@@ -222,6 +228,8 @@ def _run_ged_subprocess(
     ]
     if correct_accessgraph:
         cmd.append("--correct-accessgraph")
+    if use_generated_bounds:
+        cmd.append("--use-generated-bounds")
 
     try:
         proc = subprocess.run(
@@ -256,7 +264,8 @@ def _run_ged_subprocess(
 
 def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
               results_file: Path = None, test_dir: Path = None,
-              timeout_seconds: float = 20.0, workers: int = 64):
+              timeout_seconds: float = 20.0, workers: int = 64,
+              use_generated_bounds: bool = False):
     """Compute GED for every sample in *results*.
 
     Each sample runs in an isolated subprocess so timed-out GED threads never
@@ -277,6 +286,7 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
         for sid in tqdm(sample_ids, desc=desc, unit="sample"):
             per_sample.append(_run_ged_subprocess(
                 sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+                use_generated_bounds=use_generated_bounds,
             ))
     else:
         futures = {}
@@ -285,6 +295,7 @@ def score_ged(results, ground_truth, skip_ids, correct_accessgraph=False,
                 f = pool.submit(
                     _run_ged_subprocess,
                     sid, results_file, test_dir, timeout_seconds, correct_accessgraph,
+                    use_generated_bounds,
                 )
                 futures[f] = sid
 
@@ -348,7 +359,21 @@ def score_accuracy(results, ground_truth, skip_ids):
 # Metric: Delta
 # ===================================================================
 
-def score_delta(results, ground_truth, skip_ids):
+def _resolve_bounds(sample_id, gt, gen_hg_dict, use_generated_bounds: bool):
+    """Return bounds dict: from generated hypergraph root or from GT."""
+    if use_generated_bounds:
+        raw = (gen_hg_dict or {}).get("bounds", {})
+        bounds = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not bounds.get("corners"):
+            raise ValueError(
+                f"{sample_id}: generated hypergraph has no 'bounds' key — "
+                "was the model run with --include-bounds?"
+            )
+        return bounds
+    return gt["bounds"]
+
+
+def score_delta(results, ground_truth, skip_ids, use_generated_bounds: bool = False):
     """Compute delta (shape regularity) metric for every sample.
 
     Returns ``{"per_sample": [...], "summary": {...}}``.
@@ -366,7 +391,7 @@ def score_delta(results, ground_truth, skip_ids):
             continue
 
         try:
-            bounds = gt["bounds"]
+            bounds = _resolve_bounds(sample_id, gt, results[sample_id], use_generated_bounds)
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
             delta = compute_room_similarity_score(
                 produce_room_list(gen_mesh),
@@ -393,7 +418,8 @@ def score_delta(results, ground_truth, skip_ids):
 # Metric: Area proportion error
 # ===================================================================
 
-def score_area_proportion_error(results, ground_truth, skip_ids):
+def score_area_proportion_error(results, ground_truth, skip_ids,
+                                use_generated_bounds: bool = False):
     """Compute area-proportion error for every sample.
 
     Uses :func:`utils.metrics.compute_room_area_proportion_error`: each room's
@@ -414,7 +440,7 @@ def score_area_proportion_error(results, ground_truth, skip_ids):
             continue
 
         try:
-            bounds = gt["bounds"]
+            bounds = _resolve_bounds(sample_id, gt, results[sample_id], use_generated_bounds)
             gen_mesh = Hypergraph(results[sample_id]).to_mesh(bounds=bounds)
             result = compute_room_area_proportion_error(
                 produce_room_area_list(gen_mesh),
@@ -495,6 +521,14 @@ def cli():
         help="Newline-delimited file of sample IDs to exclude "
              "(default: no skipping)",
     )
+    parser.add_argument(
+        "--use-generated-bounds", "--use_generated_bounds",
+        dest="use_generated_bounds",
+        action="store_true",
+        help="Use the model-predicted 'bounds' key from the generated hypergraph "
+             "instead of GT bounds from --test-dir. Affects delta, "
+             "area_proportion_error, and GED access-graph correction.",
+    )
     args = parser.parse_args()
 
     results_path = Path(args.results_file)
@@ -528,16 +562,22 @@ def cli():
                 test_dir=Path(args.test_dir),
                 timeout_seconds=args.ged_timeout,
                 workers=args.ged_workers,
+                use_generated_bounds=args.use_generated_bounds,
             )
         elif metric == "accuracy":
             metric_results["accuracy"] = score_accuracy(
                 results, ground_truth, skip_ids,
             )
         elif metric == "delta":
-            metric_results["delta"] = score_delta(results, ground_truth, skip_ids)
+            metric_results["delta"] = score_delta(
+                results, ground_truth, skip_ids,
+                use_generated_bounds=args.use_generated_bounds,
+            )
         elif metric == "area_proportion_error":
             metric_results["area_proportion_error"] = score_area_proportion_error(
-                results, ground_truth, skip_ids)
+                results, ground_truth, skip_ids,
+                use_generated_bounds=args.use_generated_bounds,
+            )
 
     # ── Collect per-sample room counts from GT ─────────────────────────
     per_sample_room_counts = []

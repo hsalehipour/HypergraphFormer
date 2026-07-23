@@ -58,3 +58,6 @@ checkpoints/
 _debug/
 utils/visualization_helpers.py
 scripts/viz_rplan_qwen_meshes_and_adjacency_comparison.py
+
+# Local EC2 single-sample inference helper (untracked)
+ec2.py

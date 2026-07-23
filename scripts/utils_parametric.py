@@ -97,6 +97,7 @@ class OptimConfig:
     batch_output_dir: str | None = None
     merged_hypergraphs_json: str | None = None
     quiet: bool = False
+    use_generated_bounds: bool = False
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> tuple["OptimConfig", str | None, bool]:
@@ -156,6 +157,14 @@ class OptimConfig:
         )
         p.add_argument("--quiet", action="store_true",
                        help="Suppress per-sample verbose output; only show batch progress.")
+        p.add_argument(
+            "--use-generated-bounds", "--use_generated_bounds",
+            dest="use_generated_bounds",
+            action="store_true",
+            help="Use the model-predicted 'bounds' key from each generated hypergraph root "
+                 "instead of GT bounds from --test-dir. Use when inference was run with "
+                 "--include-bounds.",
+        )
         ns = p.parse_args(argv)
 
         if int(ns.batch_workers) < 1:
@@ -182,6 +191,7 @@ class OptimConfig:
             batch_output_dir=ns.batch_output_dir,
             merged_hypergraphs_json=ns.merged_hypergraphs_json,
             quiet=bool(ns.quiet),
+            use_generated_bounds=bool(ns.use_generated_bounds),
         )
 
         apt_id = _validate_apt_id(str(ns.apt_id)) if ns.apt_id and not ns.all else None

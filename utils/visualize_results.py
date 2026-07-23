@@ -1020,11 +1020,25 @@ def render_accessgraph_from_dict(ag: dict, *, save_path=None, title=None,
 # ---------------------------------------------------------------------------
 
 def visualize_generated(sample_id: str, hypergraph_json: Path, test_dir: Path, *,
-                        mesh_path=None, accessgraph_path=None):
+                        mesh_path=None, accessgraph_path=None,
+                        use_generated_bounds: bool = False):
     """Generated data: mesh + corrected AG from the generated hypergraph.
-    Bounds come from ``<test_dir>/<id>.txt``."""
+
+    Bounds source:
+    - default: GT bounds from ``<test_dir>/<id>.txt``
+    - ``use_generated_bounds=True``: the ``bounds`` key embedded in the
+      generated hypergraph root (model-predicted footprint).
+    """
     hg_dict, sid = load_hypergraph(hypergraph_json, sample_id)
-    bounds = load_txt(test_dir, sid)["bounds"]
+    if use_generated_bounds:
+        bounds = _parse_jsonish(hg_dict.get("bounds", "{}"))
+        if not bounds.get("corners"):
+            raise ValueError(
+                f"{sid}: generated hypergraph has no 'bounds' key — "
+                "was the model run with --include-bounds?"
+            )
+    else:
+        bounds = load_txt(test_dir, sid)["bounds"]
     plotter = HypergraphPlotter()
     pfx = f"{sid} " if sid else ""
     mesh = render_mesh(hg_dict, bounds, save_path=mesh_path,
@@ -1090,6 +1104,9 @@ def main() -> int:
                    help="Results JSON {id: hypergraph} (generated mode only).")
     p.add_argument("--output-dir", type=Path, default=Path("."),
                    help="Directory for the two output PNGs (default: cwd).")
+    p.add_argument("--use-generated-bounds", action="store_true",
+                   help="Use the model-predicted 'bounds' from the hypergraph JSON "
+                        "instead of GT bounds from --test-dir (generated mode only).")
     args = p.parse_args()
 
     tag = str(args.sample_id)
@@ -1109,7 +1126,8 @@ def main() -> int:
             p.error("--generated_data requires --hypergraph")
         mesh_res, ag_res = visualize_generated(
             args.sample_id, args.hypergraph, args.test_dir,
-            mesh_path=mesh_png, accessgraph_path=ag_png)
+            mesh_path=mesh_png, accessgraph_path=ag_png,
+            use_generated_bounds=args.use_generated_bounds)
 
     print(f"Saved mesh:        {Path(mesh_res).resolve()}")
     print(f"Saved accessgraph: {Path(ag_res).resolve()}")

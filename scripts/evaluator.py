@@ -230,7 +230,9 @@ class Evaluator(ABC):
                 _recover_cuda_after_oom()
         return result
 
-    def _apply_generation_to_result(self, sample: dict, result: dict, res, *, prompt: str) -> None:
+    def _apply_generation_to_result(
+        self, sample: dict, result: dict, res, *, prompt: str,
+    ) -> None:
         """Fill *result* from a ``GenerationResult`` (mutates in place)."""
         timeout = getattr(self.args, "timeout", None)
         result["num_input_tokens"] = res.input_tokens
@@ -245,37 +247,12 @@ class Evaluator(ABC):
         if res.generation_time > getattr(self.args, "slow_gen_threshold", 1e9):
             self._log_slow(sample, res)
 
-        hg = self.extract_hypergraph(res.text)
+        hg = self.extract_hypergraph(res.text) if res.text else None
 
         if hg is None:
-            # Optional second LLM call to recover from a JSON parse failure.
-            # OFF by default: at the high concurrencies we run these scripts at
-            # the marginal recovery rate doesn't justify the ~2x cost on
-            # retried samples (and retries tend to cluster, which amplifies
-            # rate-limit pressure). Pass --retry-on-json-fail to opt in.
-            # The error string still contains "Failed to extract JSON" so
-            # downstream summary code that filters on that substring keeps
-            # working unchanged in either branch.
-            if not getattr(self.args, "retry_on_json_fail", False):
-                result["error"] = "Failed to extract JSON from response"
-                return
-            logger.warning(f"JSON extraction failed for {sample['filename']}, retrying...")
-            res2 = self.generator.generate(
-                prompt,
-                max_tokens=self.args.max_tokens,
-                temperature=self.args.temperature,
-                timeout=timeout,
-            )
-            result["generation_time"] += res2.generation_time
-            if res2.timed_out:
-                result["error"] = f"Generation timed out after {timeout}s (retry)"
-                result["timed_out"] = True
-                return
-            hg = self.extract_hypergraph(res2.text)
-            if hg is None:
-                result["error"] = "Failed to extract JSON from response (after retry)"
-                return
-            result["retried"] = True
+            result["error"] = "Failed to extract JSON from response"
+            result["raw_generation"] = res.text
+            return
 
         is_valid, passed, failed, ged_info = hg.validate(accessgraph=None, debug=False)
         result["validation"] = {
@@ -288,10 +265,9 @@ class Evaluator(ABC):
         self.score_result(result, hg, sample)
 
     def _evaluate_samples_vllm_batch(self, samples: list[dict]) -> list[dict]:
-        """Run one vLLM batched ``generate``, then per-sample validation (retries stay single-shot).
+        """Run one vLLM batched generate, then per-sample validation.
 
-        If the batched engine call fails (e.g. CUDA OOM on a large batch), fall back to
-        one prompt at a time so other samples in the shard can still complete.
+        Falls back to per-sample generate if the batch call fails (e.g. CUDA OOM).
         """
         if not hasattr(self.generator, "generate_batch"):
             raise RuntimeError("vLLM prompt batching requires VllmQwenGenerator.generate_batch")
@@ -479,9 +455,11 @@ class Evaluator(ABC):
             logger.info(f"Distributed evaluation with {accelerator.num_processes} GPUs")
 
         include_gt = not isinstance(self, RoomsOnlyEvaluator)
+        load_bounds_for_input = getattr(args, "input_bounds", False)
         dataset = HypergraphDataset(
             files_to_process,
             include_ground_truth=include_gt,
+            include_bounds=load_bounds_for_input,
         )
         pb = max(1, int(getattr(args, "vllm_prompt_batch_size", 1)))
         use_vllm = not getattr(args, "no_vllm", False) and VLLM_AVAILABLE
@@ -940,10 +918,22 @@ class TrainedModelEvaluator(Evaluator):
 
     def create_prompt(self, sample):
         from utils.prompts import create_simple_prompt
-        return create_simple_prompt(sample["accessgraph"])
+        include_bounds = getattr(self.args, "include_bounds", False)
+        input_bounds = getattr(self.args, "input_bounds", False)
+        bounds = sample.get("bounds") if input_bounds else None
+        return create_simple_prompt(
+            sample["accessgraph"],
+            include_bounds=include_bounds,
+            input_bounds=input_bounds,
+            bounds=bounds,
+        )
 
     def extract_hypergraph(self, response):
-        return Hypergraph.from_qwen_response(response)
+        return Hypergraph.from_qwen_response(
+            response,
+            allow_raw_json_fallback=True,
+            repair_truncated=True,
+        )
 
     def score_result(self, result, hg, sample):
         result["generated_hypergraph"] = hg.data
@@ -1364,6 +1354,27 @@ def cli():
         ),
     )
     parser.add_argument("--noged", action="store_true")
+    parser.add_argument(
+        "--qwen35",
+        action="store_true",
+        help="Use Qwen3.5 mode: disables thinking/reasoning tokens in apply_chat_template "
+             "(pass enable_thinking=False). Use with models based on Qwen/Qwen3.5-4B or similar.",
+    )
+    parser.add_argument(
+        "--include-bounds", "--include_bounds",
+        dest="include_bounds",
+        action="store_true",
+        help="Use the bounds-aware prompt (for models trained with --include_bounds). "
+             "The generated bounds are preserved in the output hypergraph JSON.",
+    )
+    parser.add_argument(
+        "--input-bounds", "--input_bounds",
+        dest="input_bounds",
+        action="store_true",
+        help="Inject GT apartment bounds into the user prompt as input context "
+             "(for models trained with --input_bounds). "
+             "The model outputs a plain hypergraph (no bounds key).",
+    )
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--slow-gen-threshold", type=float, default=300.0)
     parser.add_argument("--timeout", type=int, default=300)

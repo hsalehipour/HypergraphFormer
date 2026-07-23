@@ -703,6 +703,22 @@ def load_eval_access_gt(test_dir: Path, sample_id: str) -> tuple[dict, dict, dic
     return bounds, hg, ag
 
 
+def _resolve_bounds_for_sid(sid: str, results: dict, test_dir: Path,
+                            use_generated_bounds: bool) -> dict:
+    """Return bounds dict from generated hypergraph root or GT test file."""
+    if use_generated_bounds:
+        raw_b = (results.get(sid) or {}).get("bounds", {})
+        if isinstance(raw_b, str):
+            try:
+                raw_b = json.loads(raw_b)
+            except Exception:
+                raw_b = {}
+        if raw_b and raw_b.get("corners"):
+            return raw_b
+    gt_bounds, _, _ = load_eval_access_gt(test_dir, sid)
+    return gt_bounds
+
+
 def run_orientation_mode(
     results: dict[str, dict],
     test_dir: Path,
@@ -711,6 +727,7 @@ def run_orientation_mode(
     max_samples: int | None,
     workers: int,
     show_progress: bool,
+    use_generated_bounds: bool = False,
 ) -> None:
 
     ids = sorted(results.keys(), key=lambda x: (len(str(x)), str(x)))
@@ -735,13 +752,13 @@ def run_orientation_mode(
         if show_progress:
             it = tqdm(ids, desc="Orientation", total=n_out, unit="sample")
         for sid in it:
-            b2, _gth, _ag = load_eval_access_gt(test_dir, sid)
+            b2 = _resolve_bounds_for_sid(sid, results, test_dir, use_generated_bounds)
             rec = orient_one_sample(sid, _hypergraph_from_results_value(results[sid]), b2)
             _record(sid, rec)
     else:
         packs: list[tuple[str, dict, dict]] = []
         for sid in ids:
-            b2, _gth, _ag = load_eval_access_gt(test_dir, sid)
+            b2 = _resolve_bounds_for_sid(sid, results, test_dir, use_generated_bounds)
             packs.append((sid, _hypergraph_from_results_value(results[sid]), b2))
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
@@ -785,6 +802,14 @@ def main() -> int:
     parser.add_argument("--output-orientation", type=Path, default=None,
         help="Orientation output (default: results_hypergraphs_orientation.json).")
     parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument(
+        "--use-generated-bounds", "--use_generated_bounds",
+        dest="use_generated_bounds",
+        action="store_true",
+        help="Use the model-predicted 'bounds' key from each generated hypergraph root "
+             "instead of GT bounds from --test-dir when applying procedural edits. "
+             "Use this when inference was run with --include-bounds.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(levelname)s: %(message)s")
@@ -795,7 +820,8 @@ def main() -> int:
     if args.pp_mode == "orientation":
         out_o = args.output_orientation or (args.results_hypergraphs.parent / "results_hypergraphs_orientation.json")
         run_orientation_mode(results, args.test_dir, out_path=out_o,
-            max_samples=args.max_samples, workers=int(args.workers), show_progress=not args.quiet)
+            max_samples=args.max_samples, workers=int(args.workers), show_progress=not args.quiet,
+            use_generated_bounds=args.use_generated_bounds)
         return 0
 
     # --- addremove mode ---
@@ -818,7 +844,16 @@ def main() -> int:
             output[sid] = {"command": None, "error": f"test_json: {exc}"}
             continue
         gt_accessgraph_by_id[sid] = rec["accessgraph"]
-        bounds_by_id[sid] = rec.get("bounds") or {}
+        if args.use_generated_bounds:
+            gen_b = (results.get(sid) or {}).get("bounds", {})
+            if isinstance(gen_b, str):
+                try:
+                    gen_b = json.loads(gen_b)
+                except Exception:
+                    gen_b = {}
+            bounds_by_id[sid] = gen_b if (gen_b and gen_b.get("corners")) else rec.get("bounds") or {}
+        else:
+            bounds_by_id[sid] = rec.get("bounds") or {}
         try:
             output[sid] = process_sample(sid, results[sid], rec["accessgraph"], rec["bounds"],
                 multiset_plan_max=args.procedural_steps)

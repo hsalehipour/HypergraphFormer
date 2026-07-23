@@ -174,6 +174,17 @@ def optimize_hypergraph(
     bounds, gt_hg, accessgraph, room_polygons = load_ground_truth_txt(test_dir, apt_id)
     gt_hg = copy.deepcopy(gt_hg)
 
+    # Override bounds with model-predicted footprint when requested
+    if getattr(config, "use_generated_bounds", False):
+        raw_b = original_hg.get("bounds", {})
+        if isinstance(raw_b, str):
+            try:
+                raw_b = json.loads(raw_b)
+            except Exception:
+                raw_b = {}
+        if isinstance(raw_b, dict) and raw_b.get("corners"):
+            bounds = raw_b
+
     ag_target = access_graph_from_prediction(
         original_hg,
         bounds=bounds,

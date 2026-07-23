@@ -15,6 +15,10 @@ Usage:
     python scripts/data_preparation.py --mode train --include_bounds \\
         --dataset-dir dataset/hypergraph
 
+    # Same, but bounds are input conditioning (model outputs only hypergraph)
+    python scripts/data_preparation.py --mode train --input_bounds \\
+        --dataset-dir dataset/hypergraph
+
     # Export eval .txt from dataset_access (room polygons + door adjacencies)
     python scripts/data_preparation.py --mode eval --data-format access \\
         --input-file dataset/rplan/dataset_access/data_test.json \\
@@ -83,7 +87,7 @@ def _bounds_to_int_corners(bounds):
     return {"corners": [{"X": x, "Y": y} for x, y in int_pts]}
 
 
-def load_json_split(file_path, include_bounds=False):
+def load_json_split(file_path, include_bounds=False, input_bounds=False):
     """Load a hypergraph dataset split from a JSON file.
 
     Each item is expected to have a ``split`` field containing the
@@ -92,13 +96,14 @@ def load_json_split(file_path, include_bounds=False):
 
     Returns a list of tuples::
 
-        (item_id, accessgraph, hypergraph)                    # include_bounds=False
-        (item_id, accessgraph, hypergraph, int_bounds)        # include_bounds=True
+        (item_id, accessgraph, hypergraph)                    # no bounds flags
+        (item_id, accessgraph, hypergraph, int_bounds)        # include_bounds or input_bounds
 
-    When ``include_bounds`` is True, the item's ``bounds`` field is parsed and
+    When either bounds flag is True, the item's ``bounds`` field is parsed and
     converted to integer-only corners; items without usable bounds are skipped
     so every emitted sample carries a footprint.
     """
+    load_bounds = include_bounds or input_bounds
     file_path = Path(file_path)
     if not file_path.exists():
         logger.warning(f"File not found: {file_path}")
@@ -133,7 +138,7 @@ def load_json_split(file_path, include_bounds=False):
 
             item_id = item.get("id", f"item_{i}")
 
-            if include_bounds:
+            if load_bounds:
                 bounds_raw = item.get("bounds")
                 bounds = (
                     json.loads(bounds_raw)
@@ -142,9 +147,10 @@ def load_json_split(file_path, include_bounds=False):
                 )
                 int_bounds = _bounds_to_int_corners(bounds)
                 if int_bounds is None:
+                    flag_name = "--include_bounds" if include_bounds else "--input_bounds"
                     logger.warning(
                         f"Skipping item {i}: missing/invalid bounds "
-                        f"(required by --include_bounds)"
+                        f"(required by {flag_name})"
                     )
                     skipped += 1
                     continue
@@ -301,16 +307,22 @@ def convert_to_jsonl(args) -> int:
     from utils.data_loading import save_training_data
 
     include_bounds = getattr(args, "include_bounds", False)
+    input_bounds = getattr(args, "input_bounds", False)
+
+    if include_bounds and input_bounds:
+        logger.error("--include-bounds and --input-bounds are mutually exclusive")
+        return 1
 
     dataset_dir = Path(args.dataset_dir)
-    output_dir = dataset_dir / "sft"
+    output_dir = Path(args.output_dir) if args.output_dir else dataset_dir / "sft"
 
     logger.info("=" * 80)
     logger.info("Hypergraph JSON -> Instruction JSONL")
     logger.info("=" * 80)
     logger.info(f"Dataset directory: {dataset_dir}")
     logger.info(f"Output directory:  {output_dir}")
-    logger.info(f"Include bounds:    {include_bounds}")
+    logger.info(f"Include bounds (output): {include_bounds}")
+    logger.info(f"Input bounds (input):    {input_bounds}")
     logger.info("=" * 80)
 
     splits = ["train", "validation", "test"]
@@ -321,7 +333,9 @@ def convert_to_jsonl(args) -> int:
         path = dataset_dir / f"{split}.json"
         if not path.exists() and split == "validation":
             path = dataset_dir / "val.json"
-        samples = load_json_split(path, include_bounds=include_bounds)
+        samples = load_json_split(
+            path, include_bounds=include_bounds, input_bounds=input_bounds
+        )
 
         if not samples:
             logger.warning(f"No samples found for {split}")
@@ -330,6 +344,7 @@ def convert_to_jsonl(args) -> int:
         save_training_data(
             samples, output_dir / f"{split}.jsonl", split,
             include_bounds=include_bounds,
+            input_bounds=input_bounds,
         )
         total += len(samples)
 
@@ -596,6 +611,15 @@ def cli():
         help="(train mode) Also emit the apartment footprint as a top-level "
              "`bounds` key (integer corners) on the root of each target "
              "hypergraph, and use the bounds-aware instruction prompt.",
+    )
+    parser.add_argument(
+        "--input-bounds", "--input_bounds",
+        dest="input_bounds",
+        action="store_true",
+        help="(train mode) Inject the apartment bounds (integer corners) into "
+             "the user prompt as conditioning context; the model output is the "
+             "plain hypergraph only (no bounds key). Mutually exclusive with "
+             "--include-bounds.",
     )
 
     # eval mode

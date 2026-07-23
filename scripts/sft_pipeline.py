@@ -46,18 +46,36 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
+# Monkey-patch for peft/transformers version incompatibility:
+# peft 0.19.x tries to import EmbeddingParallel from transformers.integrations.tensor_parallel
+# which doesn't exist in transformers 4.57.x. Wrap to suppress the ImportError.
+try:
+    import peft.utils.save_and_load as _peft_sal
+    _orig_maybe_shard = _peft_sal._maybe_shard_state_dict_for_tp
+
+    def _patched_maybe_shard(state_dict, *args, **kwargs):
+        try:
+            return _orig_maybe_shard(state_dict, *args, **kwargs)
+        except ImportError:
+            return state_dict
+
+    _peft_sal._maybe_shard_state_dict_for_tp = _patched_maybe_shard
+except Exception:
+    pass
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def format_chat_messages(example, tokenizer):
+def format_chat_messages(example, tokenizer, enable_thinking=True):
     """
     Format chat messages into tokenized input for training.
     
     Args:
         example: Dictionary with 'messages' field
         tokenizer: Tokenizer instance
+        enable_thinking: Pass False for Qwen3.5 to suppress reasoning tokens.
         
     Returns:
         dict: Tokenized input with 'input_ids', 'attention_mask', 'labels'
@@ -228,15 +246,25 @@ def main():
                        help='GPU device ID for single-GPU training (default: 0)')
     parser.add_argument('--multi-gpu', action='store_true',
                        help='Use multi-GPU training with DistributedDataParallel (launch with accelerate)')
-    parser.add_argument('--save-steps', type=int, default=100,
-                       help='Save checkpoint every N steps (default: 100)')
-    parser.add_argument('--eval-steps', type=int, default=100,
-                       help='Evaluate every N steps (default: 100)')
+    parser.add_argument('--save-steps', type=int, default=500,
+                       help='Save checkpoint every N steps (default: 500)')
+    parser.add_argument('--eval-steps', type=int, default=None,
+                       help='Evaluate every N steps (default: same as --save-steps)')
     parser.add_argument('--logging-steps', type=int, default=10,
                        help='Log every N steps (default: 10)')
-    
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume training from the latest checkpoint in --output-dir')
+    parser.add_argument('--bf16', action='store_true',
+                       help='Use bf16 mixed precision instead of fp16 (recommended for A100s)')
+
     args = parser.parse_args()
-    
+
+    if args.model is None:
+        args.model = "Qwen/Qwen3.5-4B" if args.qwen35 else "Qwen/Qwen3-4B-Instruct-2507"
+
+    if args.eval_steps is None:
+        args.eval_steps = args.save_steps
+
     # Set default output directory with dataset, epochs, and LoRA parameters in the name
     if args.output_dir is None:
         if args.use_lora:
@@ -343,7 +371,8 @@ def main():
         load_best_model_at_end=False,  # Disabled to avoid OOM during checkpoint loading in multi-GPU
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        fp16=True,  # Mixed precision training
+        fp16=not getattr(args, "bf16", False),
+        bf16=getattr(args, "bf16", False),
         gradient_checkpointing=True,  # Save memory by recomputing activations
         dataloader_pin_memory=True,
         remove_unused_columns=False,
@@ -364,11 +393,28 @@ def main():
         data_collator=data_collator,
     )
     
-    # Train from scratch
-    logger.info("\n🚀 Starting training from scratch...")
+    resume_from = True if getattr(args, "resume", False) else None
+    if resume_from:
+        logger.info("\n🔄 Resuming training from latest checkpoint...")
+        # peft 0.19.1 + transformers 4.57.x: _maybe_shard_state_dict_for_tp tries
+        # to import EmbeddingParallel which doesn't exist yet in this transformers
+        # version.  We use plain DDP (not tensor parallel), so skip that step safely.
+        try:
+            import peft.utils.save_and_load as _peft_sal
+            _orig_shard = _peft_sal._maybe_shard_state_dict_for_tp
+            def _patched_shard(model, state_dict, adapter_name):
+                try:
+                    return _orig_shard(model, state_dict, adapter_name)
+                except ImportError:
+                    pass  # tensor-parallel sharding not needed for DDP
+            _peft_sal._maybe_shard_state_dict_for_tp = _patched_shard
+        except Exception:
+            pass
+    else:
+        logger.info("\n🚀 Starting training from scratch...")
     logger.info("="*80)
-    
-    train_result = trainer.train()
+
+    train_result = trainer.train(resume_from_checkpoint=resume_from)
     
     # Save final model
     logger.info("\n💾 Saving final model...")

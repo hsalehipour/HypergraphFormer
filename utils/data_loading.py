@@ -20,6 +20,32 @@ from torch.utils.data import Dataset
 
 from utils.prompts import create_training_sample
 
+
+def _bounds_to_int_corners(bounds):
+    """Normalise a raw bounds dict to integer-only X/Y corners (drop Z/Mag).
+
+    Mirrors the same helper in scripts/data_preparation.py so that inference
+    time bounds match the format seen during --input_bounds training.
+    Returns None when fewer than 3 usable corners remain.
+    """
+    if not isinstance(bounds, dict):
+        return None
+    int_pts = []
+    for c in bounds.get("corners") or []:
+        try:
+            x = int(round(float(c["X"])))
+            y = int(round(float(c["Y"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if int_pts and int_pts[-1] == (x, y):
+            continue
+        int_pts.append((x, y))
+    if len(int_pts) >= 2 and int_pts[0] == int_pts[-1]:
+        int_pts.pop()
+    if len(int_pts) < 3:
+        return None
+    return {"corners": [{"X": x, "Y": y} for x, y in int_pts]}
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,7 +153,8 @@ def load_target_from_dataset(examples_dir, target_file=None):
         raise ValueError(f"Failed to load target from {target_path.name}: {e}")
 
 
-def save_training_data(samples, output_path, dataset_type="train", include_bounds=False):
+def save_training_data(samples, output_path, dataset_type="train",
+                       include_bounds=False, input_bounds=False):
     """
     Save training data in JSONL format.
     Each line is a JSON object with 'messages' field.
@@ -140,8 +167,9 @@ def save_training_data(samples, output_path, dataset_type="train", include_bound
         output_path: Path to output .jsonl file
         dataset_type: Type of dataset (train/validation/test) — used only for logging
         include_bounds: When True, embed the apartment footprint ``bounds`` on the
-                        root node of each target hypergraph and use the bounds-aware
-                        instruction prompt.
+                        root node of each target hypergraph (model outputs bounds).
+        input_bounds: When True, inject bounds into the user prompt as input
+                      context; the model outputs only the hypergraph (no bounds key).
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +185,9 @@ def save_training_data(samples, output_path, dataset_type="train", include_bound
                 raise ValueError(f"Unexpected sample tuple length: {len(sample)}")
             training_sample = create_training_sample(
                 accessgraph, hypergraph,
-                bounds=bounds, include_bounds=include_bounds,
+                bounds=bounds,
+                include_bounds=include_bounds,
+                input_bounds=input_bounds,
             )
             f.write(json.dumps(training_sample) + '\n')
 
@@ -175,12 +205,13 @@ class HypergraphDataset(Dataset):
                               ``None`` (e.g. access-only eval files).
                               Set to False to omit the key (rooms-only).
         include_bounds: If True, each item includes 'bounds' parsed from the
-                        file's 'bounds' field (apartment footprint).
+                        file's 'bounds' field (apartment footprint, as a dict).
     """
 
-    def __init__(self, file_paths, include_ground_truth=True):
+    def __init__(self, file_paths, include_ground_truth=True, include_bounds=False):
         self.file_paths = file_paths
         self.include_ground_truth = include_ground_truth
+        self.include_bounds = include_bounds
 
     def __len__(self):
         return len(self.file_paths)
@@ -206,6 +237,16 @@ class HypergraphDataset(Dataset):
                 item["ground_truth"] = None
             else:
                 item["ground_truth"] = json.loads(h) if isinstance(h, str) else h
+
+        if self.include_bounds:
+            b = data.get("bounds")
+            if b is None or (isinstance(b, str) and not b.strip()):
+                item["bounds"] = None
+            else:
+                raw = json.loads(b) if isinstance(b, str) else b
+                # Normalise to integer-only corners (drop Z/Mag, round floats) so
+                # the format matches what the model saw during --input_bounds training.
+                item["bounds"] = _bounds_to_int_corners(raw)
 
         return item
 
