@@ -852,6 +852,8 @@ class TrainedModelEvaluator(Evaluator):
                 max_model_len=self.args.vllm_max_model_len,
                 tensor_parallel_size=self.args.tensor_parallel,
                 enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+                enable_thinking=not getattr(self.args, "qwen35", False),
+                language_model_only=getattr(self.args, "qwen35", False),
             )
             self._raw_model = None
             return
@@ -877,6 +879,8 @@ class TrainedModelEvaluator(Evaluator):
                     max_model_len=self.args.vllm_max_model_len,
                     tensor_parallel_size=self.args.tensor_parallel,
                     enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+                    enable_thinking=not getattr(self.args, "qwen35", False),
+                    language_model_only=getattr(self.args, "qwen35", False),
                 )
             else:
                 self.generator = VllmQwenGenerator(
@@ -888,6 +892,8 @@ class TrainedModelEvaluator(Evaluator):
                     max_model_len=self.args.vllm_max_model_len,
                     tensor_parallel_size=self.args.tensor_parallel,
                     enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+                    enable_thinking=not getattr(self.args, "qwen35", False),
+                    language_model_only=getattr(self.args, "qwen35", False),
                 )
             self._raw_model = None
             logger.info("vLLM generator ready (one engine per process / GPU)")
@@ -1025,6 +1031,8 @@ class RoomsOnlyEvaluator(Evaluator):
                 max_model_len=self.args.vllm_max_model_len,
                 tensor_parallel_size=self.args.tensor_parallel,
                 enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+                enable_thinking=not getattr(self.args, "qwen35", False),
+                language_model_only=getattr(self.args, "qwen35", False),
             )
             self._raw_model = None
             logger.info("vLLM generator ready (one engine per process / GPU)")
@@ -1122,6 +1130,8 @@ class FewShotQwenEvaluator(Evaluator):
                 max_model_len=self.args.vllm_max_model_len,
                 tensor_parallel_size=tp,
                 enforce_eager=not getattr(self.args, "vllm_no_enforce_eager", False),
+                enable_thinking=not getattr(self.args, "qwen35", False),
+                language_model_only=getattr(self.args, "qwen35", False),
             )
             logger.info("vLLM generator loaded")
             return

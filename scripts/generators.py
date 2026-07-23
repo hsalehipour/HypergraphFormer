@@ -246,6 +246,8 @@ class VllmQwenGenerator(HypergraphGenerator):
         tensor_parallel_size: int = 1,
         max_lora_rank: int | None = None,
         enforce_eager: bool = True,
+        enable_thinking: bool = True,
+        language_model_only: bool = False,
     ):
         if not VLLM_AVAILABLE:
             raise RuntimeError("vLLM is not installed. Install with: pip install vllm")
@@ -291,8 +293,20 @@ class VllmQwenGenerator(HypergraphGenerator):
             _llm_kw["enable_lora"] = True
             _llm_kw["max_lora_rank"] = max_lora_rank or 64
         # Default True: CUDA graph capture/warmup can OOM on 40GB cards with long max_model_len.
-        _llm_kw["enforce_eager"] = enforce_eager
+        # Qwen3.5 text-only: skip vision encoder + prefix caching (vLLM recipe); keep eager mode on
+        # 40GB A100s — CUDA graph capture OOMs even without the vision encoder.
+        if language_model_only:
+            _llm_kw["language_model_only"] = True
+            _llm_kw["enable_prefix_caching"] = True
+            _llm_kw["enforce_eager"] = enforce_eager
+            logger.info(
+                "Qwen3.5 text-only: language_model_only + prefix caching "
+                f"(enforce_eager={enforce_eager})"
+            )
+        else:
+            _llm_kw["enforce_eager"] = enforce_eager
         self._llm = _VLLM_LLM(**_llm_kw)
+        self._enable_thinking = enable_thinking
 
     @property
     def tokenizer(self):
@@ -326,6 +340,7 @@ class VllmQwenGenerator(HypergraphGenerator):
         ]
         text = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
         num_input = len(self._tokenizer.encode(text))
 
@@ -393,6 +408,7 @@ class VllmQwenGenerator(HypergraphGenerator):
             ]
             text = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=self._enable_thinking,
             )
             texts.append(text)
             input_counts.append(len(self._tokenizer.encode(text)))

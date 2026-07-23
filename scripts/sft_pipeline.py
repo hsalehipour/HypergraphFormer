@@ -84,7 +84,8 @@ def format_chat_messages(example, tokenizer, enable_thinking=True):
     text = tokenizer.apply_chat_template(
         example['messages'],
         tokenize=False,
-        add_generation_prompt=False
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
     )
     
     # Tokenize
@@ -208,8 +209,10 @@ def main():
     )
     
     # Model arguments
-    parser.add_argument('--model', type=str, default='Qwen/Qwen3-4B-Instruct-2507',
-                       help='Base model to fine-tune (default: Qwen/Qwen3-4B-Instruct-2507)')
+    parser.add_argument('--model', type=str, default=None,
+                       help='Base model to fine-tune (default: Qwen/Qwen3-4B-Instruct-2507, or Qwen/Qwen3.5-4B with --qwen35)')
+    parser.add_argument('--qwen35', action='store_true',
+                       help='Use Qwen3.5-4B as base model with thinking disabled (enable_thinking=False)')
     parser.add_argument('--data-dir', type=str, default='dataset/hypergraph/sft',
                        help='Directory with training data')
     parser.add_argument('--output-dir', type=str, default=None,
@@ -336,9 +339,10 @@ def main():
     )
     
     # Tokenize datasets
+    enable_thinking = not getattr(args, "qwen35", False)
     logger.info("\n🔤 Tokenizing datasets...")
     tokenized_dataset = dataset.map(
-        lambda x: format_chat_messages(x, tokenizer),
+        lambda x: format_chat_messages(x, tokenizer, enable_thinking=enable_thinking),
         remove_columns=dataset['train'].column_names,
         desc="Tokenizing"
     )

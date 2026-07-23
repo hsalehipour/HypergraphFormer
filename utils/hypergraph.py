@@ -36,6 +36,224 @@ def _parse_first_json_object(s: str):
     return obj if isinstance(obj, dict) else None
 
 
+def _unwrap_root_wrapper(obj: dict) -> dict:
+    if isinstance(obj, dict) and "root" in obj and isinstance(obj["root"], dict):
+        obj = dict(obj["root"])
+        obj.setdefault("name", "root")
+    return obj
+
+
+def _strip_generation_preamble(s: str) -> str:
+    """Drop thinking blocks and any leading prose before the hypergraph JSON."""
+    s = re.sub(
+        r"<\|im_start\|>think\s*\n.*?(?=<\|im_start\|>assistant|\{)",
+        "",
+        s,
+        flags=re.DOTALL,
+    )
+    i = s.find("{")
+    if i > 0:
+        s = s[i:]
+    return s.strip()
+
+
+def _close_truncated_json(s: str) -> str:
+    """Best-effort repair of max-token-truncated JSON.
+
+    Walks the text as a JSON stream and remembers the last offset where the
+    document can be validly terminated (end of a complete value or key/value
+    pair), then truncates back to that offset and appends the closing brackets
+    for whatever containers were still open there.
+
+    Unlike naively appending brackets, this discards a trailing *incomplete*
+    element -- a dangling ``"key":``, a half-written number, or a trailing
+    comma -- which is exactly what makes the truncated tail unparseable. The
+    result is always valid JSON (or the empty string if nothing completed).
+    """
+    closer = {"{": "}", "[": "]"}
+    stack: list[str] = []          # open container chars: '{' or '['
+    phase: list[str] = []          # per container: 'start'|'key'|'colon'|'value'|'busy'|'after'
+    in_string = False
+    escape = False
+    is_key = False
+    in_prim = False
+
+    safe_len = 0
+    safe_stack: list[str] = []
+
+    def mark_safe(idx: int) -> None:
+        nonlocal safe_len, safe_stack
+        if not stack or phase[-1] in ("start", "after"):
+            safe_len = idx
+            safe_stack = list(stack)
+
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+                if is_key:
+                    phase[-1] = "colon"
+                else:
+                    if stack:
+                        phase[-1] = "after"
+                    mark_safe(i + 1)
+            i += 1
+            continue
+
+        if in_prim:
+            if c in " \t\r\n,{}[]":
+                in_prim = False
+                if stack:
+                    phase[-1] = "after"
+                mark_safe(i)
+                # fall through to process the delimiter char below
+            else:
+                i += 1
+                continue
+
+        if c == '"':
+            in_string = True
+            escape = False
+            is_key = bool(stack) and stack[-1] == "{" and phase[-1] in ("start", "key")
+            if stack:
+                phase[-1] = "busy"
+        elif c in closer:
+            if stack:
+                phase[-1] = "busy"
+            stack.append(c)
+            phase.append("start")
+        elif c in ("}", "]"):
+            if stack:
+                clean = phase[-1] in ("start", "after")
+                stack.pop()
+                phase.pop()
+                if stack:
+                    phase[-1] = "after"
+                if clean:
+                    mark_safe(i + 1)
+        elif c == ":":
+            if stack and stack[-1] == "{":
+                phase[-1] = "value"
+        elif c == ",":
+            if stack:
+                phase[-1] = "key" if stack[-1] == "{" else "value"
+        elif c in " \t\r\n":
+            pass
+        else:
+            in_prim = True
+            if stack:
+                phase[-1] = "busy"
+        i += 1
+
+    if safe_len <= 0:
+        return s
+    return s[:safe_len] + "".join(closer[c] for c in reversed(safe_stack))
+
+
+def _hypergraph_candidate_score(obj: dict) -> tuple:
+    """Prefer root BSP trees over accidental leaf/corner dict matches."""
+
+    def count_nodes(d: dict) -> int:
+        return 1 + sum(
+            count_nodes(c) for c in d.get("children", []) if isinstance(c, dict)
+        )
+
+    return (obj.get("name") == "root", count_nodes(obj), len(json.dumps(obj)))
+
+
+def _pick_best_hypergraph_candidate(candidates: list[dict]) -> dict | None:
+    if not candidates:
+        return None
+    return max(candidates, key=_hypergraph_candidate_score)
+
+
+def _iter_hypergraph_dict_candidates(s: str) -> list[dict]:
+    """Scan *s* for all ``{...}`` spans and return valid hypergraph dicts, best first."""
+    potential_jsons: list[str] = []
+    stack: list[str] = []
+    start_idx: int | None = None
+    for i, char in enumerate(s):
+        if char == "{":
+            if not stack:
+                start_idx = i
+            stack.append(char)
+        elif char == "}":
+            if stack:
+                stack.pop()
+                if not stack and start_idx is not None:
+                    potential_jsons.append(s[start_idx : i + 1])
+                    start_idx = None
+
+    potential_jsons.sort(key=len, reverse=True)
+    out: list[dict] = []
+    for candidate in potential_jsons:
+        try:
+            obj = _unwrap_root_wrapper(json.loads(candidate))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "name" in obj and "children" in obj:
+            out.append(obj)
+    out.sort(key=_hypergraph_candidate_score, reverse=True)
+    return out
+
+
+def _extract_hypergraph_dict_from_text(
+    text: str,
+    *,
+    repair_truncated: bool = False,
+) -> dict | None:
+    """Best-effort hypergraph JSON extraction from raw model text."""
+    if not text or not text.strip():
+        return None
+
+    sections: list[str] = []
+    for match in re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL):
+        sections.append(match.strip())
+    sections.append(_strip_generation_preamble(text))
+
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+
+        try:
+            obj = _unwrap_root_wrapper(json.loads(section))
+            if isinstance(obj, dict) and "name" in obj and "children" in obj:
+                return obj
+        except json.JSONDecodeError:
+            obj = _parse_first_json_object(section)
+            if isinstance(obj, dict) and "name" in obj and "children" in obj:
+                return _unwrap_root_wrapper(obj)
+
+        candidates = _iter_hypergraph_dict_candidates(section)
+        best = _pick_best_hypergraph_candidate(candidates)
+        if best is not None:
+            return best
+
+        if repair_truncated:
+            repaired = _close_truncated_json(section)
+            if repaired != section:
+                try:
+                    obj = _unwrap_root_wrapper(json.loads(repaired))
+                    if isinstance(obj, dict) and "name" in obj and "children" in obj:
+                        return obj
+                except json.JSONDecodeError:
+                    pass
+                candidates = _iter_hypergraph_dict_candidates(repaired)
+                best = _pick_best_hypergraph_candidate(candidates)
+                if best is not None:
+                    return best
+
+    return None
+
+
 def repair_bsp_tree_names(hypergraph: dict) -> dict:
     """Reassign every node ``name`` from tree layout (``root``, ``rootL``, ``rootR``, …).
 
@@ -992,7 +1210,7 @@ class Hypergraph:
 
     @classmethod
     def from_qwen_response(cls, response, *, allow_raw_json_fallback=False,
-                           silent=False) -> "Optional[Hypergraph]":
+                           silent=False, repair_truncated=False) -> "Optional[Hypergraph]":
         """Extract a Hypergraph from a Qwen model response string.
 
         Returns None if no valid hypergraph JSON is found.
@@ -1010,6 +1228,7 @@ class Hypergraph:
         assistant_marker = "<|im_start|>assistant"
         assistant_idx = response.find(assistant_marker)
 
+        search_texts: list[str] = []
         if assistant_idx != -1:
             json_start = assistant_idx + len(assistant_marker)
             json_section = response[json_start:]
@@ -1017,42 +1236,17 @@ class Hypergraph:
             end_idx = json_section.find(end_marker)
             if end_idx != -1:
                 json_section = json_section[:end_idx]
-            json_section = _strip_fences(json_section)
-            obj = None
-            used_first_object_only = False
-            try:
-                obj = json.loads(json_section)
-            except json.JSONDecodeError as e:
-                obj = _parse_first_json_object(json_section)
-                if obj is not None:
-                    used_first_object_only = True
-                elif not silent:
-                    logger.warning(f"Found assistant section but failed to parse JSON: {e}")
-                    logger.debug(f"Attempted to parse: {json_section[:200]}...")
-
-            if obj is not None and isinstance(obj, dict) and "name" in obj and "children" in obj:
-                if not silent:
-                    if used_first_object_only:
-                        logger.info(
-                            "✅ Extracted hypergraph JSON from assistant section "
-                            "(first JSON object only; trailing model text ignored)"
-                        )
-                    else:
-                        logger.info("✅ Successfully extracted JSON from assistant section")
-                return cls(obj)
-            if obj is not None and isinstance(obj, dict) and not silent:
-                logger.warning("Parsed JSON but missing required fields ('name' or 'children')")
-
+            search_texts.append(_strip_fences(json_section))
         if allow_raw_json_fallback:
-            json_section = _strip_fences(response)
-            obj = None
-            try:
-                obj = json.loads(json_section)
-            except json.JSONDecodeError:
-                obj = _parse_first_json_object(json_section)
-            if isinstance(obj, dict) and "name" in obj and "children" in obj:
+            search_texts.append(_strip_fences(response))
+
+        for section in search_texts:
+            obj = _extract_hypergraph_dict_from_text(
+                section, repair_truncated=repair_truncated,
+            )
+            if obj is not None:
                 if not silent:
-                    logger.info("✅ Successfully extracted JSON from raw response")
+                    logger.info("✅ Extracted hypergraph JSON from model response")
                 return cls(obj)
 
         if not silent:
