@@ -18,7 +18,7 @@ Evaluated on the **WMR24** dataset (~1,000 architect-designed floor
 plans from Zurich, New York, and Singapore), and **RPLAN** dataset (Converted to the Hypergraph format), HypergraphFormer outperforms HouseDiffusion
 and HouseGAN++ while requiring significantly less training data and allowing controllable edits of generated floorplans.
 
-> **Paper:** Submitted to NeurIPS 2026.  Preprint available on
+> **Paper:** Submitted to *Automation in Construction*.  Preprint available on
 > [arXiv](https://arxiv.org/abs/2605.18932).
 
 ---
@@ -817,12 +817,12 @@ hypergraph using the pipeline described in
 If you use this code or the WMR24 dataset, please cite:
 
 ```bibtex
-@inproceedings{hypergraphformer2026,
-  title     = {HypergraphFormer: Learning Hypergraphs from LLMs for Editable Floor Plan Generation},
-  author    = {Anonymous},
-  booktitle = {Submitted to the Conference on Neural Information Processing Systems (NeurIPS)},
-  year      = {2026},
-  note      = {Under review. Preprint available on arXiv:2605.18932.}
+@article{hypergraphformer2026,
+  title   = {HypergraphFormer: Learning Hypergraphs from LLMs for Editable Floor Plan Generation},
+  author  = {Anonymous},
+  journal = {Automation in Construction},
+  year    = {2026},
+  note    = {Submitted. Preprint available on arXiv:2605.18932.}
 }
 ```
 
